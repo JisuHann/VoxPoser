@@ -26,9 +26,6 @@ class LMP_interface():
     print('#' * 50)
     print(f'## voxel resolution: {self._resolution}')
     print('#' * 50)
-    print()
-    print()
-  
   # ======================================================
   # == functions exposed to LLM
   # ======================================================
@@ -71,8 +68,11 @@ class LMP_interface():
       obs_dict['_position_world'] = np.mean(obj_pc, axis=0)  # in world frame
       obs_dict['_point_cloud_world'] = obj_pc  # in world frame
       obs_dict['normal'] = normalize_vector(obj_normal.mean(axis=0))
-
     object_obs = Observation(obs_dict)
+    breakpoint()
+    if object_obs is None:
+      print("objects are {}".format(self._env.name2ids))
+      breakpoint()
     return object_obs
   
   def execute(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,
@@ -203,7 +203,8 @@ class LMP_interface():
         gripper_state = _gripper_map[ee_pos_voxel[0], ee_pos_voxel[1], ee_pos_voxel[2]]
       # move to the final target
       self._env.apply_action(np.concatenate([ee_pose_world, [gripper_state]]))
-
+    if execute_info is None:
+      breakpoint()
     return execute_info
   
   def cm2index(self, cm, direction):

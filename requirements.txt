@@ -1,5 +1,9 @@
 jupyter
-openai
+requests
 plotly
 transforms3d
 open3d
+pyyaml
+pygments
+scipy
+numpy

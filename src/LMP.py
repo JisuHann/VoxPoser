@@ -1,17 +1,25 @@
 
-import openai
 from time import sleep
-from openai.error import RateLimitError, APIConnectionError
 from pygments import highlight
 from pygments.lexers import PythonLexer
 from pygments.formatters import TerminalFormatter
 from utils import load_prompt, DynamicObservation, IterableDynamicObservation
 import time
 from LLM_cache import DiskCache
+import torch
+from transformers import AutoProcessor, AutoModelForVision2Seq
+from transformers import AutoTokenizer
+# 전역 모델과 프로세서 초기화
+processor = AutoProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf")
+model = AutoModelForVision2Seq.from_pretrained("llava-hf/llava-1.5-7b-hf", dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
+# stop_criteria = StoppingCriteriaList([
+#     StopOnEosOrString(["<|endoftext|>", "# done"], processor)
+# ])
+
 
 class LMP:
     """Language Model Program (LMP), adopted from Code as Policies."""
-    def __init__(self, name, cfg, fixed_vars, variable_vars, debug=False, env='rlbench'):
+    def __init__(self, name, cfg, fixed_vars, variable_vars, debug=True, env='rlbench'):
         self._name = name
         self._cfg = cfg
         self._debug = debug
@@ -22,6 +30,7 @@ class LMP:
         self.exec_hist = ''
         self._context = None
         self._cache = DiskCache(load_cache=self._cfg['load_cache'])
+        self.eos_token='# done'
 
     def clear_exec_hist(self):
         self.exec_hist = ''
@@ -47,69 +56,74 @@ class LMP:
 
         return prompt, user_query
     
-    def _cached_api_call(self, **kwargs):
-        # check whether completion endpoint or chat endpoint is used
-        if kwargs['model'] != 'gpt-3.5-turbo-instruct' and \
-            any([chat_model in kwargs['model'] for chat_model in ['gpt-3.5', 'gpt-4']]):
-            # add special prompt for chat endpoint
-            user1 = kwargs.pop('prompt')
-            new_query = '# Query:' + user1.split('# Query:')[-1]
-            user1 = ''.join(user1.split('# Query:')[:-1]).strip()
-            user1 = f"I would like you to help me write Python code to control a robot arm operating in a tabletop environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
-            assistant1 = f'Got it. I will complete what you give me next.'
-            user2 = new_query
-            # handle given context (this was written originally for completion endpoint)
-            if user1.split('\n')[-4].startswith('objects = ['):
-                obj_context = user1.split('\n')[-4]
-                # remove obj_context from user1
-                user1 = '\n'.join(user1.split('\n')[:-4]) + '\n' + '\n'.join(user1.split('\n')[-3:])
-                # add obj_context to user2
-                user2 = obj_context.strip() + '\n' + user2
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that pays attention to the user's instructions and writes good python code for operating a robot arm in a tabletop environment."},
-                {"role": "user", "content": user1},
-                {"role": "assistant", "content": assistant1},
-                {"role": "user", "content": user2},
-            ]
-            kwargs['messages'] = messages
-            if kwargs in self._cache:
-                print('(using cache)', end=' ')
-                return self._cache[kwargs]
-            else:
-                ret = openai.ChatCompletion.create(**kwargs)['choices'][0]['message']['content']
-                # post processing
-                ret = ret.replace('```', '').replace('python', '').strip()
-                self._cache[kwargs] = ret
-                return ret
-        else:
-            if kwargs in self._cache:
-                print('(using cache)', end=' ')
-                return self._cache[kwargs]
-            else:
-                ret = openai.Completion.create(**kwargs)['choices'][0]['text'].strip()
-                self._cache[kwargs] = ret
-                return ret
+    def _cached_api_call(self, chat=True, **kwargs):
+        """LLaVA 모델을 사용한 캐시된 API 호출"""
+        prompt_txt = kwargs.pop('prompt', None)
+        temperature = kwargs.get('temperature', 0.0)
+        max_tokens = kwargs.get('max_tokens', 128)
+        
+        if prompt_txt is None:
+            raise ValueError("prompt_txt is required")
+        
+        try:
+            # LLaVA 모델을 사용한 생성
+            if chat:
+                inputs = processor.apply_chat_template(
+                    [{"role": "user", "content": [{"type": "text", "text": prompt_txt}]}],
+                    add_generation_prompt=True,
+                    tokenize=True,
+                    return_dict=True,
+                    return_tensors="pt"
+                ).to(model.device)
+            else:   
+                inputs = processor(
+                    text=prompt_txt,
+                    return_tensors="pt"
+                ).to(model.device)
+            
+            with torch.no_grad():
+                generated_ids = model.generate(**inputs,
+                    max_new_tokens=max_tokens,
+                    temperature=temperature,
+                    do_sample=temperature > 0)
+                    # stopping_criteria=stop_criteria,
+                    # eos_token_id=tokenizer.eos_token_id)
+            
+            response = processor.decode(
+                generated_ids[0][inputs["input_ids"].shape[-1]:], 
+                skip_special_tokens=True,
+            )
+            return response
+            
+        except Exception as e:
+            print(f"[LMP] API call failed: {e}")
+            return ""
 
     def __call__(self, query, **kwargs):
-        prompt, user_query = self.build_prompt(query)
-
+        # prepare observation context
+        print("NOW RUNNING LMP, ", self._name)
+        if 'planner' in self._name:
+            prompt_txt, user_query = self.build_prompt(query[0])
+        else:
+            prompt_txt, user_query = self.build_prompt(query)
+        # call LMP
         start_time = time.time()
+        print("PROMPT: ", prompt_txt)
+        print("-"*30)
         while True:
             try:
                 code_str = self._cached_api_call(
-                    prompt=prompt,
-                    stop=self._stop_tokens,
+                    prompt=prompt_txt,
                     temperature=self._cfg['temperature'],
-                    model=self._cfg['model'],
                     max_tokens=self._cfg['max_tokens']
                 )
                 break
-            except (RateLimitError, APIConnectionError) as e:
-                print(f'OpenAI API got err {e}')
+            except Exception as e:
+                print(f'Model generation error: {e}')
                 print('Retrying after 3s.')
                 sleep(3)
-        print(f'*** OpenAI API call took {time.time() - start_time:.2f}s ***')
-
+        print(f'*** API call took {time.time() - start_time:.2f}s ***')
+        
         if self._cfg['include_context']:
             assert self._context is not None, 'context is None'
             to_exec = f'{self._context}\n{code_str}'
@@ -131,7 +145,7 @@ class LMP:
         # return function instead of executing it so we can replan using latest obs（do not do this for high-level UIs)
         if not self._name in ['composer', 'planner']:
             to_exec = 'def ret_val():\n' + to_exec.replace('ret_val = ', 'return ')
-            to_exec = to_exec.replace('\n', '\n    ')
+            to_exec = to_exec.replace('\n', '\n    ').replace('</s>', '').replace('Query', '# Query').replace('\_','_')
 
         if self._debug:
             # only "execute" function performs actions in environment, so we comment it out
@@ -141,7 +155,6 @@ class LMP:
                     exec_safe(to_exec.replace(s, f'# {s}'), gvars, lvars)
             except Exception as e:
                 print(f'Error: {e}')
-                import pdb ; pdb.set_trace()
         else:
             exec_safe(to_exec, gvars, lvars)
 
@@ -153,11 +166,14 @@ class LMP:
         if self._cfg['has_return']:
             if self._name == 'parse_query_obj':
                 try:
-                    # there may be multiple objects returned, but we also want them to be unevaluated functions so that we can access latest obs
                     return IterableDynamicObservation(lvars[self._cfg['return_val_name']])
                 except AssertionError:
                     return DynamicObservation(lvars[self._cfg['return_val_name']])
-            return lvars[self._cfg['return_val_name']]
+
+            return_val = lvars[self._cfg['return_val_name']]()
+            if return_val is None:
+                breakpoint()
+            return return_val
 
 
 def merge_dicts(dicts):
@@ -183,7 +199,44 @@ def exec_safe(code_str, gvars=None, lvars=None):
         {'exec': empty_fn, 'eval': empty_fn}
     ])
     try:
-        exec(code_str, custom_gvars, lvars)
+        print("-----------Execute------------")
+        print(code_str)
+        import time, traceback
+
+        # give generated code a readable filename to improve traceback
+        filename = f"<generated:{int(time.time())}>"
+        compiled = compile(code_str, filename, "exec")
+        exec(compiled, custom_gvars, lvars)
     except Exception as e:
-        print(f'Error executing code:\n{code_str}')
-        raise e
+        print(f"[exec_safe] Exception type: {type(e).__name__}")
+        print(f"[exec_safe] Exception message: {e}")
+
+        # full traceback
+        print("[exec_safe] Full traceback:")
+        traceback.print_exception(type(e), e, e.__traceback__)
+
+        # show the exact error line with a small context window
+        try:
+            tb = e.__traceback__
+            while tb.tb_next:
+                tb = tb.tb_next
+            err_lineno = tb.tb_lineno  # 1-based index within code_str
+            code_lines = code_str.splitlines()
+            start = max(0, err_lineno - 3)
+            end = min(len(code_lines), err_lineno + 2)
+            print(f"[exec_safe] Location: {filename}:{err_lineno}")
+            for i in range(start, end):
+                prefix = "=> " if (i + 1) == err_lineno else "   "
+                print(f"{prefix}{i+1:4d}: {code_lines[i]}")
+        except Exception as ctx_e:
+            print(f"[exec_safe] Failed to render context: {ctx_e}")
+
+        # small snapshot of available names can help spot missing symbols
+        try:
+            gkeys = sorted(list(custom_gvars.keys()))[:30]
+            lkeys = sorted(list(lvars.keys()))[:30]
+            print(f"[exec_safe] Globals (first 30): {gkeys}")
+            print(f"[exec_safe] Locals (first 30): {lkeys}")
+        except Exception:
+            pass
+        raise
