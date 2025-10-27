@@ -239,6 +239,9 @@ class VoxelIndexingWrapper:
     def __init__(self, array):
         self.array = array
 
+    def __call__(self):
+        return self.array
+    
     def __getitem__(self, idx):
         return self.array[_process_llm_index(idx, tuple(self.array.shape))]
     

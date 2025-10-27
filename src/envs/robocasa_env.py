@@ -227,6 +227,10 @@ class VoxPoserRobocasa:
                 cx = cy = self.map_size / 2
                 
                 # 점군 생성
+                try:
+                    depth_img = depth_img.squeeze()
+                except:
+                    breakpoint()
                 h, w = depth_img.shape
                 y, x = np.mgrid[0:h, 0:w]
                 
@@ -290,7 +294,19 @@ class VoxPoserRobocasa:
         descriptions = [f"Complete the {self.current_env_name} task"]
         
         return descriptions, obs
-    
+    def reset_to_default_pose(self):
+        """
+        Resets the robot arm to its default pose.
+
+        Returns:
+            tuple: A tuple containing the latest observations, reward, and termination flag.
+        """
+        if self.latest_action is None:
+            action = np.concatenate([self.init_obs['robo0_eef_pos'], [1.0]]) # default gripper open
+        else:
+            action = np.concatenate([self.init_obs['robot0_eef_pos'], [self.latest_action[-1]]])
+        return self.apply_action(action)
+
     def apply_action(self, action):
         """
         환경에서 액션 적용 및 상태 업데이트
@@ -301,6 +317,9 @@ class VoxPoserRobocasa:
         Returns:
             tuple: (최신 관찰, 보상, 종료 플래그)
         """
+        # TODO(jshan): add navigation action (zero for now)
+        print("[WARNING] We are now applying navigation action as zero for now")
+        action = np.concatenate((np.zeros(4),np.array(action)))
         obs, reward, done, info = self.env.step(action)
         self.latest_obs = obs
         self.latest_reward = reward

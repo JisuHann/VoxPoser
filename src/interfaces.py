@@ -104,11 +104,27 @@ class LMP_interface():
         step_info = dict()
         # evaluate voxel maps such that we use latest information
         movable_obs = movable_obs_func()
-        _affordance_map = affordance_map()
-        _avoidance_map = avoidance_map()
-        _rotation_map = rotation_map()
-        _velocity_map = velocity_map()
-        _gripper_map = gripper_map()
+        # jshan: changed affordance_map() -> affordance_map.array
+        try:
+          _affordance_map = affordance_map()
+        except:
+          _affordance_map = affordance_map.array
+        try:
+          _avoidance_map = avoidance_map()
+        except:
+          _avoidance_map = avoidance_map.array
+        try:
+          _rotation_map = rotation_map()
+        except:
+          _rotation_map = rotation_map.array
+        try:
+          _velocity_map = velocity_map()
+        except:
+          _velocity_map = velocity_map.array
+        try:
+          _gripper_map = gripper_map()
+        except:
+          _gripper_map = gripper_map.array
         # preprocess avoidance map
         _avoidance_map = self._preprocess_avoidance_map(_avoidance_map, _affordance_map, movable_obs)
         # start planning
@@ -335,6 +351,7 @@ class LMP_interface():
         voxel_map[:, :, :] = self._env.get_ee_quat()
       else:
         raise ValueError('Unknown voxel map type: {}'.format(type))
+      from utils import VoxelIndexingWrapper
       voxel_map = VoxelIndexingWrapper(voxel_map)
       return voxel_map
     return fn_wrapper
