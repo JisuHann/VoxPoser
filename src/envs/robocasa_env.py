@@ -37,6 +37,7 @@ class VoxPoserRobocasa:
                 self.task_object_names = json.load(f)
         self.current_env_name = env_name
         self._reset_task_variables()
+        self.map_size = 128
         
         print(f"✅ VoxPoser RoboCasa 환경 초기화 완료: {env_name} with {robot}")
 
@@ -62,18 +63,16 @@ class VoxPoserRobocasa:
             self.lookat_vectors[cam_name] = normalize_vector(lookat_world)
     
     def get_visible_object_names(self):
-        cam = self.env.sim.model.camera_name2id("robot0_agentview_center")
-        img = self.env.sim.render(camera_name="robot0_agentview_center", height=256, width=256)
-        seg = self.env.sim.render(camera_name="robot0_agentview_center", height=256, width=256, segmentation=True)[1]
-        
-        visible_geom_ids = np.unique(seg)
         visible_objects = []
-        for geom_id in visible_geom_ids:
-            name = self.env.sim.model.geom_id2name(geom_id)
-            if name is not None:
-                visible_objects.append(name)
-        print("Visible objects:", visible_objects)
-        breakpoint()
+        for cam in self.env.camera_names:
+            cam_id = self.env.sim.model.camera_name2id(cam)
+            seg = self.env.sim.render(camera_name=cam, height=self.map_size, width=self.map_size, segmentation=True)[:,:,1]
+            visible_geom_ids = np.unique(seg)
+            visible_objs = set([self.env.sim.model.body_id2name(self.env.sim.model.geom_bodyid[int(gid)]).split("_")[0] for gid in visible_geom_ids if gid >= 0 and self.env.sim.model.geom_id2name(int(gid)) is not None])
+            visible_objects.extend(visible_objs)
+        visible_objects = list(set(visible_objects))
+        visible_objects = [obj for obj in visible_objects if obj not in ["table","gripper0", 'right', "cutting", "light", "window",'counter', "floor", 'cab', 'stack', 'wall', 'mobilebase0', 'utensil',"robot0"]]
+        print("All visible objects:", visible_objects)
         return visible_objects
     
     def load_task(self, task_name):
@@ -98,8 +97,8 @@ class VoxPoserRobocasa:
             control_freq=20,
             horizon=1000,
             reward_shaping=True,
-            camera_heights=256,
-            camera_widths=256,
+            camera_heights=self.map_size,
+            camera_widths=self.map_size,
             camera_depths=True
         )
         # 환경 카메라 이름을 최신 상태로 반영하고 lookat 벡터 갱신
@@ -111,7 +110,21 @@ class VoxPoserRobocasa:
         self._init_lookat_vectors()
         # 객체 ID 매핑 업데이트
         self._update_object_mappings()
-    
+
+    def fetch_obj_segmentation(self, cam_name, query_name):
+        seg = self.env.sim.render(camera_name=cam_name, height=self.map_size, width=self.map_size, segmentation=True)[:,:,1]
+        geom_ids = [self.env.sim.model.geom_name2id(geom_name) \
+                                for geom_name in self.env.sim.model.geom_names \
+                                if query_name in geom_name]
+        obj_geom_mask = np.isin(seg, geom_ids)
+        # obj_body_mask = np.isin(seg[..., 1], body_id)
+        # Debug
+        # from PIL import Image
+        # rgb_img = self.env.sim.render(camera_name=cam_name, height=256, width=256)
+        # Image.fromarray(rgb_img).save("rgb_img.png")
+        # Image.fromarray(obj_geom_mask).save("obj_geom_mask.png")
+        return obj_geom_mask
+
     def get_3d_obs_by_name(self, query_name):
         """
         객체 이름으로 3D 점군 관찰 및 법선 벡터 추출
@@ -122,13 +135,7 @@ class VoxPoserRobocasa:
         Returns:
             tuple: (객체 점들, 객체 법선들)
         """
-        self._update_object_mappings()
-        if query_name not in self.name2ids:
-            print(f"⚠️ 알 수 없는 객체 이름: {query_name}")
-            # 기본 위치 반환
-            default_pos = np.array([[0.3, -0.4, 0.9]])
-            default_normals = np.array([[0.0, 0.0, 1.0]])
-            return default_pos, default_normals
+        # self._update_object_mappings()
         
         # 모든 카메라에서 점군과 마스크 수집
         points, masks, normals = [], [], []
@@ -137,18 +144,19 @@ class VoxPoserRobocasa:
             if f"{cam}_depth" in self.latest_obs:
                 # 깊이 이미지에서 점군 생성
                 depth_img = self.latest_obs[f"{cam}_depth"].squeeze()
+                seg = self.fetch_obj_segmentation(cam, query_name)
                 rgb_img = self.latest_obs[f"{cam}_image"]
                 
                 # 카메라 내재 매개변수 (가정값)
-                fx = fy = 256  # 이미지 크기와 동일하게 가정
-                cx = cy = 128  # 이미지 중심
+                fx = fy = self.map_size  # 이미지 크기와 동일하게 가정
+                cx = cy = self.map_size / 2  # 이미지 중심
                 
                 # 점군 생성
                 h, w = depth_img.shape
                 y, x = np.mgrid[0:h, 0:w]
                 
                 # 유효한 깊이 값만 사용
-                valid_mask = depth_img > 0
+                valid_mask = depth_img > 0 & seg
                 z = depth_img[valid_mask]
                 y_valid = y[valid_mask]
                 x_valid = x[valid_mask]
@@ -214,11 +222,10 @@ class VoxPoserRobocasa:
                 rgb_img = self.latest_obs[f"{cam}_image"]
                 
                 # 카메라 내재 매개변수
-                fx = fy = 256
-                cx = cy = 128
+                fx = fy = self.map_size
+                cx = cy = self.map_size / 2
                 
                 # 점군 생성
-                breakpoint()
                 h, w = depth_img.shape
                 y, x = np.mgrid[0:h, 0:w]
                 

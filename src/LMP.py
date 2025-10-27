@@ -7,15 +7,19 @@ from utils import load_prompt, DynamicObservation, IterableDynamicObservation
 import time
 from LLM_cache import DiskCache
 import torch
-from transformers import AutoProcessor, AutoModelForVision2Seq
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor,AutoModelForCausalLM, AutoModelForImageTextToText
 # 전역 모델과 프로세서 초기화
-processor = AutoProcessor.from_pretrained("llava-hf/llava-1.5-7b-hf")
-model = AutoModelForVision2Seq.from_pretrained("llava-hf/llava-1.5-7b-hf", dtype=torch.bfloat16).to("cuda" if torch.cuda.is_available() else "cpu")
-# stop_criteria = StoppingCriteriaList([
-#     StopOnEosOrString(["<|endoftext|>", "# done"], processor)
-# ])
-
+model_name = "llava-hf/llava-1.5-7b-hf"
+# model_name = "Qwen/Qwen3-8B"
+# model_name = "Qwen/Qwen2.5-3B-Instruct"
+if 'llava' in model_name:
+    processor = AutoProcessor.from_pretrained(model_name)
+    model = AutoModelForImageTextToText.from_pretrained(model_name, dtype=torch.bfloat16).to("cuda")
+elif 'Qwen' in model_name:
+    processor = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16).to("cuda")
+else:
+    raise ValueError(f"Invalid model name: {model_name}")
 
 class LMP:
     """Language Model Program (LMP), adopted from Code as Policies."""
@@ -60,7 +64,7 @@ class LMP:
         """LLaVA 모델을 사용한 캐시된 API 호출"""
         prompt_txt = kwargs.pop('prompt', None)
         temperature = kwargs.get('temperature', 0.0)
-        max_tokens = kwargs.get('max_tokens', 128)
+        max_tokens = kwargs.get('max_tokens', 256)
         
         if prompt_txt is None:
             raise ValueError("prompt_txt is required")
@@ -68,27 +72,34 @@ class LMP:
         try:
             # LLaVA 모델을 사용한 생성
             if chat:
-                inputs = processor.apply_chat_template(
-                    [{"role": "user", "content": [{"type": "text", "text": prompt_txt}]}],
-                    add_generation_prompt=True,
-                    tokenize=True,
-                    return_dict=True,
-                    return_tensors="pt"
-                ).to(model.device)
+                split_name = "\nExamples are as follows:\n\n"
+                if split_name in prompt_txt:
+                    inputs = processor.apply_chat_template(
+                        [{"role": "user", "content": [{"type": "text", "text": prompt_txt.split(split_name)[0]},\
+                            {"type": "text", "text": prompt_txt.split(split_name)[1]}]}],
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        return_dict=True,
+                        return_tensors="pt"
+                    ).to(model.device)
+                else:
+                    inputs = processor.apply_chat_template(
+                        [{"role": "user", "content": [{"type": "text", "text": prompt_txt}]}],
+                        add_generation_prompt=True,
+                        tokenize=True,
+                        return_dict=True,
+                        return_tensors="pt"
+                    ).to(model.device)
             else:   
                 inputs = processor(
                     text=prompt_txt,
                     return_tensors="pt"
                 ).to(model.device)
-            
-            with torch.no_grad():
-                generated_ids = model.generate(**inputs,
-                    max_new_tokens=max_tokens,
-                    temperature=temperature,
-                    do_sample=temperature > 0)
-                    # stopping_criteria=stop_criteria,
-                    # eos_token_id=tokenizer.eos_token_id)
-            
+            generated_ids = model.generate(**inputs,
+                max_new_tokens=max_tokens,
+                temperature=temperature,
+                # use_cache=False,
+                do_sample=temperature > 0)        
             response = processor.decode(
                 generated_ids[0][inputs["input_ids"].shape[-1]:], 
                 skip_special_tokens=True,
@@ -97,6 +108,7 @@ class LMP:
             
         except Exception as e:
             print(f"[LMP] API call failed: {e}")
+            breakpoint()
             return ""
 
     def __call__(self, query, **kwargs):
@@ -108,7 +120,9 @@ class LMP:
             prompt_txt, user_query = self.build_prompt(query)
         # call LMP
         start_time = time.time()
-        print("PROMPT: ", prompt_txt)
+        if 'parse_query_obj' in self._name:
+            print("PROMPT: ", prompt_txt)
+        # print("PROMPT: ", prompt_txt)
         print("-"*30)
         while True:
             try:
@@ -123,7 +137,12 @@ class LMP:
                 print('Retrying after 3s.')
                 sleep(3)
         print(f'*** API call took {time.time() - start_time:.2f}s ***')
-        
+        if 'composer' in self._name:
+            print('-'*30)
+            print('prompt: ', prompt_txt)
+            print('-'*30)
+        if 'parse_query_obj' in self._name:
+            print("CODE: ", code_str)
         if self._cfg['include_context']:
             assert self._context is not None, 'context is None'
             to_exec = f'{self._context}\n{code_str}'
@@ -145,8 +164,8 @@ class LMP:
         # return function instead of executing it so we can replan using latest obs（do not do this for high-level UIs)
         if not self._name in ['composer', 'planner']:
             to_exec = 'def ret_val():\n' + to_exec.replace('ret_val = ', 'return ')
-            to_exec = to_exec.replace('\n', '\n    ').replace('</s>', '').replace('Query', '# Query').replace('\_','_')
-
+            to_exec = to_exec.replace('\n', '\n    ').replace('</s>', '').replace('Query', '# Query').replace("objects", "# objects").replace("\_","_")
+        to_exec = to_exec.replace("Query", "# Query").replace("\_","_")
         if self._debug:
             # only "execute" function performs actions in environment, so we comment it out
             action_str = ['execute(']
@@ -214,6 +233,7 @@ def exec_safe(code_str, gvars=None, lvars=None):
         # full traceback
         print("[exec_safe] Full traceback:")
         traceback.print_exception(type(e), e, e.__traceback__)
+        breakpoint()
 
         # show the exact error line with a small context window
         try:

@@ -40,21 +40,21 @@ class LMP_interface():
       obs_dict['position'] = self.get_ee_pos()
       obs_dict['aabb'] = np.array([self.get_ee_pos(), self.get_ee_pos()])
       obs_dict['_position_world'] = self._env.get_ee_pos()
-    elif obj_name.lower() in TABLE_ALIAS:
-      offset_percentage = 0.1
-      x_min = self._env.workspace_bounds_min[0] + offset_percentage * (self._env.workspace_bounds_max[0] - self._env.workspace_bounds_min[0])
-      x_max = self._env.workspace_bounds_max[0] - offset_percentage * (self._env.workspace_bounds_max[0] - self._env.workspace_bounds_min[0])
-      y_min = self._env.workspace_bounds_min[1] + offset_percentage * (self._env.workspace_bounds_max[1] - self._env.workspace_bounds_min[1])
-      y_max = self._env.workspace_bounds_max[1] - offset_percentage * (self._env.workspace_bounds_max[1] - self._env.workspace_bounds_min[1])
-      table_max_world = np.array([x_max, y_max, 0])
-      table_min_world = np.array([x_min, y_min, 0])
-      table_center = (table_max_world + table_min_world) / 2
-      obs_dict = dict()
-      obs_dict['name'] = obj_name
-      obs_dict['position'] = self._world_to_voxel(table_center)
-      obs_dict['_position_world'] = table_center
-      obs_dict['normal'] = np.array([0, 0, 1])
-      obs_dict['aabb'] = np.array([self._world_to_voxel(table_min_world), self._world_to_voxel(table_max_world)])
+    # elif obj_name.lower() in TABLE_ALIAS:
+    #   offset_percentage = 0.1
+    #   x_min = self._env.workspace_bounds_min[0] + offset_percentage * (self._env.workspace_bounds_max[0] - self._env.workspace_bounds_min[0])
+    #   x_max = self._env.workspace_bounds_max[0] - offset_percentage * (self._env.workspace_bounds_max[0] - self._env.workspace_bounds_min[0])
+    #   y_min = self._env.workspace_bounds_min[1] + offset_percentage * (self._env.workspace_bounds_max[1] - self._env.workspace_bounds_min[1])
+    #   y_max = self._env.workspace_bounds_max[1] - offset_percentage * (self._env.workspace_bounds_max[1] - self._env.workspace_bounds_min[1])
+    #   table_max_world = np.array([x_max, y_max, 0])
+    #   table_min_world = np.array([x_min, y_min, 0])
+    #   table_center = (table_max_world + table_min_world) / 2
+    #   obs_dict = dict()
+    #   obs_dict['name'] = obj_name
+    #   obs_dict['position'] = self._world_to_voxel(table_center)
+    #   obs_dict['_position_world'] = table_center
+    #   obs_dict['normal'] = np.array([0, 0, 1])
+    #   obs_dict['aabb'] = np.array([self._world_to_voxel(table_min_world), self._world_to_voxel(table_max_world)])
     else:
       obs_dict = dict()
       obj_pc, obj_normal = self._env.get_3d_obs_by_name(obj_name)
@@ -69,10 +69,11 @@ class LMP_interface():
       obs_dict['_point_cloud_world'] = obj_pc  # in world frame
       obs_dict['normal'] = normalize_vector(obj_normal.mean(axis=0))
     object_obs = Observation(obs_dict)
-    breakpoint()
     if object_obs is None:
       print("objects are {}".format(self._env.name2ids))
       breakpoint()
+    else:
+      print(f"{object_obs} found")
     return object_obs
   
   def execute(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,

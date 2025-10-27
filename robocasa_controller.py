@@ -225,7 +225,7 @@ def main():
     # 컨트롤러 생성
     controller = None
     parser = argparse.ArgumentParser()
-    parser.add_argument("--env_name", type=str, default="OpenDrawer")
+    parser.add_argument("--env_name", type=str, default="ArrangeVegetables")
     args = parser.parse_args()
     controller = RoboCasaController(
         env_name=args.env_name,
