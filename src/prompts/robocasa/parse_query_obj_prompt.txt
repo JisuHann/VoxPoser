@@ -5,6 +5,7 @@ objects = ['green block', 'cardboard box']
 # Query: gripper.
 gripper = detect('gripper')
 ret_val = gripper
+# done
 
 objects = ['handle1', 'handle2', 'egg1', 'egg2', 'plate']
 # Query: topmost handle.
@@ -15,21 +16,25 @@ if handle1.position[2] > handle2.position[2]:
 else:
     top_handle = handle2
 ret_val = top_handle
+# done
 
 objects = ['vase', 'napkin box', 'mask']
 # Query: table.
 table = detect('table')
 ret_val = table
+# done
 
 objects = ['brown line', 'red block', 'monitor']
 # Query: brown line.
 brown_line = detect('brown line')
 ret_val = brown_line
+# done
 
 objects = ['green block', 'cup holder', 'black block']
 # Query: any block.
 block = detect('green block')
 ret_val = block
+# done
 
 objects = ['mouse', 'yellow bowl', 'brown bowl', 'sticker']
 # Query: bowl closest to the sticker.
@@ -41,6 +46,7 @@ if np.linalg.norm(yellow_bowl.position - sticker.position) < np.linalg.norm(brow
 else:
     closest_bowl = brown_bowl
 ret_val = closest_bowl
+# done
 
 objects = ['grape', 'wood tray', 'strawberry', 'white tray', 'blue tray', 'bread']
 # Query: tray that contains the bread.
@@ -52,6 +58,7 @@ if np.linalg.norm(wood_tray.position - bread.position) < np.linalg.norm(white_tr
 else:
     tray_with_bread = white_tray
 ret_val = tray_with_bread
+# done
 
 objects = ['glass', 'vase', 'plastic bottle', 'block', 'phone case']
 # Query: anything fragile.
@@ -60,7 +67,9 @@ for obj in ['glass', 'vase']:
     item = detect(obj)
     fragile_items.append(item)
 ret_val = fragile_items
+# done
 
 objects = ['blue block', 'red block']
 # Query: green block.
 ret_val = None
+# done

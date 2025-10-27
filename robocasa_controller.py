@@ -229,7 +229,7 @@ def main():
     args = parser.parse_args()
     controller = RoboCasaController(
         env_name=args.env_name,
-        debug=True
+        debug=False
     )
     controller.run_demo()
     

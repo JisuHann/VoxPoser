@@ -34,7 +34,7 @@ lmp_config:
     planner:
       prompt_fname: planner_prompt
       model: qwen2.5vl
-      max_tokens: 1024
+      max_tokens: 256
       temperature: 0.2
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -49,7 +49,7 @@ lmp_config:
     composer:
       prompt_fname: composer_prompt
       model: qwen2.5vl
-      max_tokens: 1024
+      max_tokens: 256
       temperature: 0.2
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -64,7 +64,7 @@ lmp_config:
     parse_query_obj:
       prompt_fname: parse_query_obj_prompt
       model: qwen2.5vl
-      max_tokens: 1024
+      max_tokens: 256
       temperature: 0.2
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -79,7 +79,7 @@ lmp_config:
     get_affordance_map:
       prompt_fname: get_affordance_map_prompt
       model: qwen2.5vl
-      max_tokens: 1024
+      max_tokens: 256
       temperature: 0.2
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -94,7 +94,7 @@ lmp_config:
     get_avoidance_map:
       prompt_fname: get_avoidance_map_prompt
       model: qwen2.5vl
-      max_tokens: 1024
+      max_tokens: 256
       temperature: 0.2
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -109,7 +109,7 @@ lmp_config:
     get_velocity_map:
       prompt_fname: get_velocity_map_prompt
       model: qwen2.5vl
-      max_tokens: 1024
+      max_tokens: 256
       temperature: 0.2
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -124,7 +124,7 @@ lmp_config:
     get_rotation_map:
       prompt_fname: get_rotation_map_prompt
       model: qwen2.5vl
-      max_tokens: 1024
+      max_tokens: 256
       temperature: 0.2
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -139,7 +139,7 @@ lmp_config:
     get_gripper_map:
       prompt_fname: get_gripper_map_prompt
       model: qwen2.5vl
-      max_tokens: 1024
+      max_tokens: 256
       temperature: 0.2
       query_prefix: '# Query: '
       query_suffix: '.'

@@ -7,6 +7,7 @@ from robosuite import load_composite_controller_config
 from robocasa.utils.env_utils import create_env
 from utils import normalize_vector, bcolors
 
+TABLE_ALIAS =["table","gripper0", 'right', "cutting", "light", "window", 'counter', "floor", 'cab', 'stack', 'wall', 'mobilebase0', 'utensil',"robot0"]
 
 class VoxPoserRobocasa:
     def __init__(self, env_name="PnPCounterToCab", camera_names=["robot0_agentview_center", "robot0_eye_in_hand"], robot="Panda"):
@@ -71,7 +72,7 @@ class VoxPoserRobocasa:
             visible_objs = set([self.env.sim.model.body_id2name(self.env.sim.model.geom_bodyid[int(gid)]).split("_")[0] for gid in visible_geom_ids if gid >= 0 and self.env.sim.model.geom_id2name(int(gid)) is not None])
             visible_objects.extend(visible_objs)
         visible_objects = list(set(visible_objects))
-        visible_objects = [obj for obj in visible_objects if obj not in ["table","gripper0", 'right', "cutting", "light", "window",'counter', "floor", 'cab', 'stack', 'wall', 'mobilebase0', 'utensil',"robot0"]]
+        visible_objects = [obj for obj in visible_objects if obj not in TABLE_ALIAS]
         print("All visible objects:", visible_objects)
         return visible_objects
     

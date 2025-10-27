@@ -72,8 +72,6 @@ class LMP_interface():
     if object_obs is None:
       print("objects are {}".format(self._env.name2ids))
       breakpoint()
-    else:
-      print(f"{object_obs} found")
     return object_obs
   
   def execute(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,

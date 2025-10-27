@@ -1,4 +1,3 @@
-
 from time import sleep
 from pygments import highlight
 from pygments.lexers import PythonLexer
@@ -7,19 +6,9 @@ from utils import load_prompt, DynamicObservation, IterableDynamicObservation
 import time
 from LLM_cache import DiskCache
 import torch
-from transformers import AutoTokenizer, AutoProcessor,AutoModelForCausalLM, AutoModelForImageTextToText
-# 전역 모델과 프로세서 초기화
-model_name = "llava-hf/llava-1.5-7b-hf"
-# model_name = "Qwen/Qwen3-8B"
-# model_name = "Qwen/Qwen2.5-3B-Instruct"
-if 'llava' in model_name:
-    processor = AutoProcessor.from_pretrained(model_name)
-    model = AutoModelForImageTextToText.from_pretrained(model_name, dtype=torch.bfloat16).to("cuda")
-elif 'Qwen' in model_name:
-    processor = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=torch.bfloat16).to("cuda")
-else:
-    raise ValueError(f"Invalid model name: {model_name}")
+import os
+from llm import *
+from transformers import StoppingCriteriaList
 
 class LMP:
     """Language Model Program (LMP), adopted from Code as Policies."""
@@ -60,50 +49,19 @@ class LMP:
 
         return prompt, user_query
     
-    def _cached_api_call(self, chat=True, **kwargs):
+    def _cached_api_call(self, prompt_txt="", **kwargs):
         """LLaVA 모델을 사용한 캐시된 API 호출"""
-        prompt_txt = kwargs.pop('prompt', None)
-        temperature = kwargs.get('temperature', 0.0)
-        max_tokens = kwargs.get('max_tokens', 256)
-        
-        if prompt_txt is None:
-            raise ValueError("prompt_txt is required")
-        
+        max_tokens = kwargs.get('max_tokens', 128)
+        prompt_template = refactor_prompt(prompt_txt)
         try:
-            # LLaVA 모델을 사용한 생성
-            if chat:
-                split_name = "\nExamples are as follows:\n\n"
-                if split_name in prompt_txt:
-                    inputs = processor.apply_chat_template(
-                        [{"role": "user", "content": [{"type": "text", "text": prompt_txt.split(split_name)[0]},\
-                            {"type": "text", "text": prompt_txt.split(split_name)[1]}]}],
-                        add_generation_prompt=True,
-                        tokenize=True,
-                        return_dict=True,
-                        return_tensors="pt"
-                    ).to(model.device)
-                else:
-                    inputs = processor.apply_chat_template(
-                        [{"role": "user", "content": [{"type": "text", "text": prompt_txt}]}],
-                        add_generation_prompt=True,
-                        tokenize=True,
-                        return_dict=True,
-                        return_tensors="pt"
-                    ).to(model.device)
-            else:   
-                inputs = processor(
-                    text=prompt_txt,
-                    return_tensors="pt"
-                ).to(model.device)
-            generated_ids = model.generate(**inputs,
-                max_new_tokens=max_tokens,
-                temperature=temperature,
-                # use_cache=False,
-                do_sample=temperature > 0)        
-            response = processor.decode(
-                generated_ids[0][inputs["input_ids"].shape[-1]:], 
-                skip_special_tokens=True,
-            )
+            inputs = processor.apply_chat_template(prompt_template,
+                                                     add_generation_prompt=False, 
+                                                     tokenize=True, 
+                                                     return_dict=True, 
+                                                     return_tensors="pt").to(model.device)
+            generated_ids = model.generate(**inputs, max_new_tokens=max_tokens)
+            response = processor.decode(generated_ids[0][inputs["input_ids"].shape[-1]:], skip_special_tokens=True)
+            response = response.split("# done")[0]
             return response
             
         except Exception as e:
@@ -113,36 +71,31 @@ class LMP:
 
     def __call__(self, query, **kwargs):
         # prepare observation context
-        print("NOW RUNNING LMP, ", self._name)
+        print("="*40)
+        print("NOW RUNNING LMP: ", self._name)
         if 'planner' in self._name:
             prompt_txt, user_query = self.build_prompt(query[0])
         else:
             prompt_txt, user_query = self.build_prompt(query)
         # call LMP
         start_time = time.time()
-        if 'parse_query_obj' in self._name:
-            print("PROMPT: ", prompt_txt)
-        # print("PROMPT: ", prompt_txt)
-        print("-"*30)
         while True:
             try:
                 code_str = self._cached_api_call(
-                    prompt=prompt_txt,
-                    temperature=self._cfg['temperature'],
+                    prompt_txt=prompt_txt,
                     max_tokens=self._cfg['max_tokens']
                 )
-                break
+                if not self._name in ['composer', 'planner'] and 'ret_val' not in code_str:
+                    print("Seems the VLM ouput not works. Retrying after 3s.")
+                    sleep(3)
+                else:
+                    break
             except Exception as e:
                 print(f'Model generation error: {e}')
                 print('Retrying after 3s.')
                 sleep(3)
-        print(f'*** API call took {time.time() - start_time:.2f}s ***')
-        if 'composer' in self._name:
-            print('-'*30)
-            print('prompt: ', prompt_txt)
-            print('-'*30)
-        if 'parse_query_obj' in self._name:
-            print("CODE: ", code_str)
+        print(f' API call took {time.time() - start_time:.2f}s ***')
+
         if self._cfg['include_context']:
             assert self._context is not None, 'context is None'
             to_exec = f'{self._context}\n{code_str}'
@@ -154,9 +107,9 @@ class LMP:
         to_log_pretty = highlight(to_log, PythonLexer(), TerminalFormatter())
 
         if self._cfg['include_context']:
-            print('#'*40 + f'\n## "{self._name}" generated code\n' + f'## context: "{self._context}"\n' + '#'*40 + f'\n{to_log_pretty}\n')
+            print('-'*40 + f'\n## "{self._name}" generated code\n' + f'## context: "{self._context}"\n' + '-'*40 + f'\n{to_log_pretty}\n')
         else:
-            print('#'*40 + f'\n## "{self._name}" generated code\n' + '#'*40 + f'\n{to_log_pretty}\n')
+            print('-'*40 + f'\n## "{self._name}" generated code\n' + '-'*40 + f'\n{to_log_pretty}\n')
 
         gvars = merge_dicts([self._fixed_vars, self._variable_vars])
         lvars = kwargs
@@ -233,7 +186,6 @@ def exec_safe(code_str, gvars=None, lvars=None):
         # full traceback
         print("[exec_safe] Full traceback:")
         traceback.print_exception(type(e), e, e.__traceback__)
-        breakpoint()
 
         # show the exact error line with a small context window
         try:
@@ -260,3 +212,4 @@ def exec_safe(code_str, gvars=None, lvars=None):
         except Exception:
             pass
         raise
+
