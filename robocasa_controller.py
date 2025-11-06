@@ -22,7 +22,7 @@ class RoboCasaController:
     RoboCasa 환경에서 VoxPoser를 사용한 문 열기 컨트롤러
     """
     
-    def __init__(self, env_name="OpenSingleDoor", visualize=True, debug=False):
+    def __init__(self, env_name="OpenSingleDoor", visualize=True, debug=False, execute_task_with_lmp=True):
         print(f"   환경: {env_name}")
         print(f"   시각화: {visualize}")
         print(f"   디버그: {debug}")
@@ -43,10 +43,16 @@ class RoboCasaController:
             camera_names=["robot0_agentview_center", "robot0_eye_in_hand"],
             robot="Panda"
         )
+        self.debug = debug
+        self._execute_task_with_lmp = execute_task_with_lmp
+
+        if self._execute_task_with_lmp:
+            self.execute_task_with_lmp()
         
+    def execute_task_with_lmp(self):
         # VoxPoser LMP 설정
         print("🧠 VoxPoser LMP 설정 중...")
-        self.lmps, self.lmp_env = setup_LMP(self.env, self.config, debug=debug)
+        self.lmps, self.lmp_env = setup_LMP(self.env, self.config, debug=self.debug)
         self.voxposer_ui = self.lmps['plan_ui']
         
         # 작업 상태 변수
@@ -60,13 +66,12 @@ class RoboCasaController:
         descriptions, obs = self.env.reset()
         available_objects = self.env.get_visible_object_names()
         # LMP 객체 설정
-        set_lmp_objects(self.lmps, available_objects)
+        if self._execute_task_with_lmp:
+            set_lmp_objects(self.lmps, available_objects)
         return obs
 
     def execute_task(self, task_instruction="Open the door"):
-        # 작업 로드
         obs = self.load_task()
-        
         # 비디오 기록기 초기화 (간결 버전)
         def select_image_key(d):
             for k in ("robot0_robotview_image", "robot0_eye_in_hand_image"):
@@ -115,7 +120,7 @@ class RoboCasaController:
             # LMP를 통한 작업 계획
             plan_result = self.voxposer_ui((task_instruction, obs))
             # _obs, _, _ = self.env.apply_action(np.zeros(7))
-            
+
             if self.debug:
                 print(f"📋 계획 결과: {plan_result}")
             
@@ -204,6 +209,7 @@ class RoboCasaController:
                 import traceback
                 traceback.print_exc()
         imageio.mimsave(video_path, video_writer, fps=10.0)
+        print(f"Video saved to {video_path}")
 
         """작업 결과 출력"""
         print("\n" + "="*60)
@@ -226,10 +232,12 @@ def main():
     controller = None
     parser = argparse.ArgumentParser()
     parser.add_argument("--env_name", type=str, default="ArrangeVegetables")
+    parser.add_argument("--debug", type=bool, default=False)
+    parser.add_argument("--visualize", type=bool, default=True)
+    parser.add_argument("--execute_task_with_lmp", type=bool, default=True)
     args = parser.parse_args()
     controller = RoboCasaController(
         env_name=args.env_name,
-        debug=False
     )
     controller.run_demo()
     
