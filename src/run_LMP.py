@@ -14,6 +14,7 @@ def run_LMP(args):
                             task_config=config['task'])
     lmps, lmp_env = setup_LMP(env, config, debug=False)
     voxposer_ui = lmps['plan_ui']
+    env.load_task()
     obs = env.reset()
     set_lmp_objects(lmps, env.get_visible_object_names()) 
     voxposer_ui(env.env.get_ep_meta()['lang'])

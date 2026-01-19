@@ -6,6 +6,7 @@ from utils.utils import normalize_vector, bcolors
 import robosuite
 import robocasa
 from robosuite import load_composite_controller_config
+import time
 
 TABLE_ALIAS =["table","gripper0", 'right', "cutting", "light", "window", 'counter', "floor", 'cab', 'stack', 'wall', 'mobilebase0', 'utensil',"robot0"]
 
@@ -66,15 +67,18 @@ class VoxPoserRobocasa():
             self.lookat_vectors[cam_name] = normalize_vector(lookat)
         self._reset_task_variables()
 
-        # workspace variable
-        print("TODO(jshan): set workspace bounds")
-        # self.workspace_bounds_min = np.array([self.rlbench_env._scene._workspace_minx, self.rlbench_env._scene._workspace_miny, self.rlbench_env._scene._workspace_minz])
-        # self.workspace_bounds_max = np.array([self.rlbench_env._scene._workspace_maxx, self.rlbench_env._scene._workspace_maxy, self.rlbench_env._scene._workspace_maxz])
-
         self.cam_height = task_config['camera_heights']
         self.cam_width = task_config['camera_widths']
-        self.map_size = 512
-        self._reset_task_variables()
+        self.map_size = 100
+        self.get_3d_obs_by_name()
+        
+        # workspace variable
+        self.visualizer = visualizer
+        if self.visualizer is not None:
+            print("TODO(jshan): manually set workspace bounds")
+            points, colors = self.get_scene_3d_obs()
+            self.visualizer.update_bounds(self.workspace_bounds_min, self.workspace_bounds_max)
+            self.visualizer.update_scene_points(points, colors)
 
     def get_visible_object_names(self):
         if self.offscreen_render:
@@ -94,7 +98,6 @@ class VoxPoserRobocasa():
     def load_task(self):
         self._reset_task_variables()
         self.reset()
-
         self.objects = self.get_visible_object_names()
         self.name2ids = {k:[] for k in self.objects}
         for i in range(self.env.sim.model.ngeom):
@@ -149,14 +152,24 @@ class VoxPoserRobocasa():
         cy = height / 2
 
         # Render
-        rgb, depth_raw = self.env.sim.render(camera_name=cam_name, **cam_config)
-        
+        RETRY_ITER = 10
+        while RETRY_ITER > 0:
+            rgb, depth_raw = self.env.sim.render(camera_name=cam_name, **cam_config)
+            if len(np.unique(depth_raw)) > 2: # 1, nan value
+                break
+            else:
+                time.sleep(0.1)
+                print("Retry point cloud...", len(np.unique(depth_raw)))
+            RETRY_ITER -= 1
+            if RETRY_ITER <= 0:
+                exit
+
         extent = model.stat.extent
         near = model.vis.map.znear * extent
         far = model.vis.map.zfar * extent
+        # Clipping nan values
+        depth_raw = np.clip(depth_raw, 0, 1)
         depth = far * near / (far - depth_raw * (far - near))
-        
-        # 상하 뒤집기
         rgb = rgb[::-1]
         depth = depth[::-1]
 
@@ -189,8 +202,10 @@ class VoxPoserRobocasa():
         
         # 월드 좌표로 변환
         points_world = (cam_rot @ points_cam.T).T + cam_pos
-        
-        return np.hstack([points_world, colors])
+        point_cloud = np.hstack([points_world, colors])
+        if len(point_cloud) ==0:
+            breakpoint()
+        return point_cloud
     
     def fetch_obj_segmentation(self, cam_name, query_name):
         seg = self.env.sim.render(camera_name=cam_name, height=self.cam_height, width=self.cam_width, segmentation=True)[:,:,1]
@@ -200,7 +215,7 @@ class VoxPoserRobocasa():
         obj_geom_mask = np.isin(seg, geom_ids)
         return obj_geom_mask
 
-    def get_3d_obs_by_name(self, query_name):
+    def get_3d_obs_by_name(self, query_name=None):
         """
         Retrieves 3D point cloud observations and normals of an object by its name.
 
@@ -210,21 +225,20 @@ class VoxPoserRobocasa():
         Returns:
             tuple: A tuple containing object points and object normals.
         """
-        assert query_name in self.name2ids, f"Unknown object name: {query_name}"
-        obj_ids = self.name2ids[query_name]
-        # print(query_name, obj_ids)
+        print(f"get_3d_obs_by_name: {query_name}")
         # gather points and masks from all cameras
         self.update_latest_obs()
         points, colors, masks, normals = [], [], [], []
         for cam in self.camera_names:
             points.append(self.latest_obs[f"{cam}_point_cloud"][:,:3].reshape(-1, 3))
-            colors.append(self.latest_obs[f"{cam}_point_cloud"][:,3:].reshape(-1, 3))
+            colors.append(self.latest_obs[f"{cam}_image"].reshape(-1, 3))
             masks.append(self.latest_obs[f"{cam}_mask"][:,:,1][::-1].reshape(-1))
             # estimate normals using o3d
             pcd = o3d.geometry.PointCloud()
             pcd.points = o3d.utility.Vector3dVector(points[-1])
             pcd.colors = o3d.utility.Vector3dVector(colors[-1])
             pcd.estimate_normals()
+            
             cam_normals = np.asarray(pcd.normals)
             # use lookat vector to adjust normal vectors TODO(jshan) not sur
             flip_indices = np.dot(cam_normals, self.lookat_vectors[cam]) > 0
@@ -236,18 +250,25 @@ class VoxPoserRobocasa():
         masks = np.concatenate(masks, axis=0)
         normals = np.concatenate(normals, axis=0)
     
-        dist = np.array([points[:,0].max() - points[:,0].min(), 
-                         points[:,1].max() - points[:,1].min(),
-                         points[:, 2].max()- points[:,2].min(),]).min()
-        self.workspace_bounds_min = self.latest_obs['robot0_eef_pos'] - dist/2
-        self.workspace_bounds_max = self.latest_obs['robot0_eef_pos'] + dist/2
+        if query_name is None:
+            self.workspace_bounds_min = np.array([points[:,0].min(), points[:,1].min(), points[:,2].min()])
+            self.workspace_bounds_max = np.array([points[:,0].max(), points[:,1].max(), points[:,2].max()])
+            return
 
         # get object points
-        obj_points = points[np.isin(masks, obj_ids)]
-        if len(obj_points) == 0:
-            raise ValueError(f"Object {query_name} not found in the scene")
-        obj_colors = colors[np.isin(masks, obj_ids)]
-        obj_normals = normals[np.isin(masks, obj_ids)]
+        assert query_name in self.name2ids, f"Unknown object name: {query_name}"
+        obj_ids = self.name2ids[query_name]
+        try:
+            obj_points = points[np.isin(masks, obj_ids)]
+            if len(obj_points) == 0:
+                raise ValueError(f"Object {query_name} not found in the scene")
+            obj_colors = colors[np.isin(masks, obj_ids)]
+            obj_normals = normals[np.isin(masks, obj_ids)]
+        except Exception as e:
+            print(e)
+        obj_points, obj_colors, obj_normals = self.remove_obj_pc_outlier(obj_points, obj_colors, obj_normals)
+        # breakpoint()
+        # self.visualize_3d_space(obj_points)
         # voxel downsample using o3d
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(obj_points)
@@ -257,6 +278,17 @@ class VoxPoserRobocasa():
         obj_points = np.asarray(pcd_downsampled.points)
         obj_normals = np.asarray(pcd_downsampled.normals)
         return (points, normals), (obj_points, obj_normals)
+
+    def remove_obj_pc_outlier(self, points, colors, normals):
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        pcd.normals = o3d.utility.Vector3dVector(normals)
+        pcd, _ = pcd.remove_statistical_outlier(nb_neighbors=20, std_ratio=1.0)
+        points = np.asarray(pcd.points)
+        colors = np.asarray(pcd.colors)
+        normals = np.asarray(pcd.normals)
+        return points, colors, normals
 
     def visualize_image(rgb):
         plt.imshow(rgb)
@@ -289,16 +321,15 @@ class VoxPoserRobocasa():
             tuple: A tuple containing scene points and colors.
         """
         points, colors, masks = [], [], []
+        self.update_latest_obs()
         for cam in self.camera_names:
-            points.append(getattr(self.latest_obs, f"{cam}_point_cloud").reshape(-1, 3))
-            colors.append(getattr(self.latest_obs, f"{cam}_rgb").reshape(-1, 3))
-            masks.append(getattr(self.latest_obs, f"{cam}_mask").reshape(-1))
+            points.append(self.latest_obs[f"{cam}_point_cloud"][:,:3].reshape(-1, 3))
+            colors.append(self.latest_obs[f"{cam}_image"].reshape(-1, 3))
+            masks.append(self.latest_obs[f"{cam}_mask"][:,:,1][::-1].reshape(-1))
         points = np.concatenate(points, axis=0)
         colors = np.concatenate(colors, axis=0)
         masks = np.concatenate(masks, axis=0)
-
-        breakpoint()
-
+        
         # only keep points within workspace
         chosen_idx_x = (points[:, 0] > self.workspace_bounds_min[0]) & (points[:, 0] < self.workspace_bounds_max[0])
         chosen_idx_y = (points[:, 1] > self.workspace_bounds_min[1]) & (points[:, 1] < self.workspace_bounds_max[1])
@@ -344,18 +375,21 @@ class VoxPoserRobocasa():
         Returns:
             tuple: A tuple containing the latest observations, reward, and termination flag.
         """
-        assert self.task is not None, "Please load a task first"
-        action = self._process_action(action)
-        obs, reward, terminate = self.task.step(action)
-        obs = self._process_obs(obs)
+        # action = self._process_action(action)
+        print("TODO(jshan): only considering non-mobile cases")
+        print("TODO(jshan): Not sure about the robot action space")
+        action = np.concatenate([action, [0.0,0.0,0.0]])
+        obs, reward, terminate, _ = self.env.step(action)
+        # obs = self._process_obs(obs)
         self.latest_obs = obs
         self.latest_reward = reward
         self.latest_terminate = terminate
         self.latest_action = action
         self._update_visualizer()
-        grasped_objects = self.rlbench_env._scene.robot.gripper.get_grasped_objects()
-        if len(grasped_objects) > 0:
-            self.grasped_obj_ids = [obj.get_handle() for obj in grasped_objects]
+        grasped_objects = self.get_grasped_object(self.env.robots[0].gripper['right'])
+        if grasped_objects != None:
+            print("TODO(jshan): load grapsed obj ids")
+            self.grasped_obj_ids = grasped_objects.get_handle()
         return obs, reward, terminate
 
     def move_to_pose(self, pose, speed=None):
@@ -425,6 +459,27 @@ class VoxPoserRobocasa():
     def get_ee_quat(self):
         return self.latest_obs['robot0_eef_quat']
 
+    def get_grasped_object(self, gripper):
+        gripper_contacts = set(gripper.contact_geoms)
+        
+        # 환경 내의 모든 물체에 대해 확인
+        for obj_name, obj in self.env.objects.items():
+            # 물체의 충돌체와 그리퍼 충돌체 간의 접촉 확인
+            touching_left = False
+            touching_right = False
+            
+            for contact in self.env.sim.data.contact[:self.env.sim.data.ncon]:
+                geom1 = self.env.sim.model.geom_id2name(contact.geom1)
+                geom2 = self.env.sim.model.geom_id2name(contact.geom2)
+                
+                # 한쪽이 그리퍼고 다른 한쪽이 물체인 경우
+                if (geom1 in gripper_contacts and geom2 in obj.contact_geoms) or \
+                (geom2 in gripper_contacts and geom1 in obj.contact_geoms):
+                    # 구체적으로 어느 손가락인지 체크 로직을 추가하여 
+                    # 양쪽 손가락 사이(grasp)에 있는지 판별 가능
+                    return obj_name
+        return None
+
     def get_last_gripper_action(self):
         """
         Returns the last gripper action.
@@ -432,10 +487,10 @@ class VoxPoserRobocasa():
         Returns:
             float: The last gripper action.
         """
-        if self.latest_action is not None:
-            return self.latest_action[-1]
-        else:
-            return self.init_obs.gripper_open
+        print("TODO(jshan): Gripper open is 1, if not -1")
+        gripper_qpos = self.latest_obs['robot0_gripper_qpos']
+        gripper_open = gripper_qpos[0]>0.04
+        return 1 if gripper_open else -1
 
     def _reset_task_variables(self):
         """

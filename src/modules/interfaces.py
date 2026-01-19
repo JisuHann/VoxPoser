@@ -22,8 +22,7 @@ class LMP_interface():
     self._controller = Controller(self._env, controller_config)
 
     # calculate size of each voxel (resolution)
-    print("TODO(jshan): Need to caluculate resolution")
-    # self._resolution = (self._env.workspace_bounds_max - self._env.workspace_bounds_min) / self._map_size
+    self._resolution = (self._env.workspace_bounds_max - self._env.workspace_bounds_min) / self._map_size
 
   # ======================================================
   # == functions exposed to LLM
@@ -56,7 +55,7 @@ class LMP_interface():
       obs_dict['aabb'] = np.array([self._world_to_voxel(table_min_world), self._world_to_voxel(table_max_world)])
     else:
       obs_dict = dict()
-      obj_pc, obj_normal = self._env.get_3d_obs_by_name(obj_name)
+      (workspace_pc, _), (obj_pc, obj_normal) = self._env.get_3d_obs_by_name(obj_name)
       voxel_map = self._points_to_voxel_map(obj_pc)
       aabb_min = self._world_to_voxel(np.min(obj_pc, axis=0))
       aabb_max = self._world_to_voxel(np.max(obj_pc, axis=0))
@@ -67,10 +66,30 @@ class LMP_interface():
       obs_dict['_position_world'] = np.mean(obj_pc, axis=0)  # in world frame
       obs_dict['_point_cloud_world'] = obj_pc  # in world frame
       obs_dict['normal'] = normalize_vector(obj_normal.mean(axis=0))
-
     object_obs = Observation(obs_dict)
     return object_obs
-  
+
+  def save_3d_point_cloud(self, pc, save_name="tmp.ply"):
+      import open3d as o3d
+      pcd = o3d.geometry.PointCloud()
+      pcd.points = o3d.utility.Vector3dVector(obj_pc)
+      o3d.io.write_point_cloud(save_name, pcd)
+
+  def visualize_voxel(self, voxel_maps,voxel_size=0.1):
+      vis = o3d.visualization.Visualizer()
+      vis.create_window()
+      vis.get_render_option().background_color = [1,1,1]
+      for voxel_map in voxel_maps:
+        indices = np.argwhere(voxel_map)
+        points = indices.astype(float) * voxel_size
+        
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points)
+        
+        voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size)
+        vis.add_geometry(voxel_grid)
+      vis.run()
+      
   def execute(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,
               velocity_map=None, gripper_map=None):
     """
@@ -165,7 +184,9 @@ class LMP_interface():
             print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] completed waypoint {i+1} (wp: {waypoint[0].round(3)}, actual: {movable_obs["_position_world"].round(3)}, target: {traj_world[-1][0].round(3)}, start: {traj_world[0][0].round(3)}, dist2target: {dist2target.round(3)}){bcolors.ENDC}')
           controller_info['controller_step'] = i
           controller_info['target_waypoint'] = waypoint
+          controller_info['robot0_agentview_left_image'] = controller_info['mp_info'][0]['robot0_agentview_left_image'][::-1]
           controller_infos[i] = controller_info
+          save_video_images(controller_infos)
         step_info['controller_infos'] = controller_infos
         execute_info.append(step_info)
         # check whether we need to replan
@@ -393,6 +414,24 @@ class LMP_interface():
     avoidance_map += scene_collision_map
     avoidance_map = np.clip(avoidance_map, 0, 1)
     return avoidance_map
+
+def save_video_images(controller_infos, save_path ="tmp.mp4", verbose=True):
+  images = []
+  for controller_info in controller_infos:
+    images.append(controller_infos[controller_info]['robot0_agentview_left_image'])
+  height, width, _ = images[0].shape
+
+  import cv2, os
+  fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+  video = cv2.VideoWriter(save_path, fourcc, 24, (width, height))
+  for img in images:
+      img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+      video.write(img_bgr)
+  video.release()
+  if verbose:
+    print(f"Video saved to {save_path} (len(): {len(images)}")
+  return
+
 
 def setup_LMP(env, general_config, debug=False):
   controller_config = general_config['controller']
