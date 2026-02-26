@@ -1,13 +1,16 @@
 from core.LMP import LMP
 from utils.utils import get_clock_time, normalize_vector, pointat2quat, bcolors, Observation, VoxelIndexingWrapper
+from utils.visualization import save_image, save_array, visualize_voxel, save_map_to_image, save_video_images
 import numpy as np
 from modules.planners import PathPlanner
 import time
 from scipy.ndimage import distance_transform_edt
 import transforms3d
-from modules.controllers import Controller
-
-# creating some aliases for end effector and table in case LLMs refer to them differently (but rarely this happens)
+from modules.controllers import NavigationController, ManipulationController
+from tqdm import tqdm
+from transforms3d.euler import quat2euler
+YAW_THRESHOLD = 0.35
+DIST_THRESHOLD = 0.05
 EE_ALIAS = ['ee', 'endeffector', 'end_effector', 'end effector', 'gripper', 'hand']
 TABLE_ALIAS = ['table', 'desk', 'workstation', 'work_station', 'work station', 'workspace', 'work_space', 'work space']
 
@@ -19,7 +22,8 @@ class LMP_interface():
     self._cfg = lmp_config
     self._map_size = self._cfg['map_size']
     self._planner = PathPlanner(planner_config, map_size=self._map_size)
-    self._controller = Controller(self._env, controller_config)
+    self._nav_controller = NavigationController(self._env, controller_config)
+    self._manip_controller = ManipulationController(self._env, controller_config)
 
     # calculate size of each voxel (resolution)
     self._resolution = (self._env.workspace_bounds_max - self._env.workspace_bounds_min) / self._map_size
@@ -69,27 +73,108 @@ class LMP_interface():
     object_obs = Observation(obs_dict)
     return object_obs
 
-  def save_3d_point_cloud(self, pc, save_name="tmp.ply"):
-      import open3d as o3d
-      pcd = o3d.geometry.PointCloud()
-      pcd.points = o3d.utility.Vector3dVector(obj_pc)
-      o3d.io.write_point_cloud(save_name, pcd)
+  def save_image(self, array, save_path="tmp.png"):
+      save_image(array, save_path)
 
-  def visualize_voxel(self, voxel_maps,voxel_size=0.1):
-      vis = o3d.visualization.Visualizer()
-      vis.create_window()
-      vis.get_render_option().background_color = [1,1,1]
-      for voxel_map in voxel_maps:
-        indices = np.argwhere(voxel_map)
-        points = indices.astype(float) * voxel_size
-        
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points)
-        
-        voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size)
-        vis.add_geometry(voxel_grid)
-      vis.run()
-      
+  def save_array(self, array, save_name="tmp.npy"):
+      save_array(array, save_name)
+
+  def visualize_voxel(self, voxel_maps, voxel_size=0.1):
+      visualize_voxel(voxel_maps, voxel_size)
+
+  def execute_navigation(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,
+              velocity_map=None):
+    """
+    Plan a navigation path then follow it with the controller.
+
+    Args:
+      movable_obs_func: callable returning observation of the body to be moved
+      affordance_map: callable returning 2D target pixel map
+      avoidance_map: callable returning 2D obstacle pixel map
+      rotation_map: callable returning 2D rotation map
+      velocity_map: callable returning 2D velocity map
+    """
+    if rotation_map is None:
+      rotation_map = self._get_default_voxel_map('rotation', task='navigation')
+    if velocity_map is None:
+      velocity_map = self._get_default_voxel_map('velocity', task='navigation')
+    if avoidance_map is None:
+      avoidance_map = self._get_default_voxel_map('obstacle', task='navigation')
+    object_centric = False
+    execute_info = []
+    if affordance_map is not None:
+      for plan_iter in range(self._cfg['max_plan_iter']):
+        step_info = dict()
+        movable_obs = movable_obs_func()
+        _affordance_map = affordance_map()
+        _avoidance_map = avoidance_map()
+        _rotation_map = rotation_map()
+        _velocity_map = velocity_map()
+        _avoidance_map = self._preprocess_avoidance_pixel_map(_avoidance_map, _affordance_map, movable_obs)
+        start_pos = movable_obs['position'][:2]
+        start_time = time.time()
+        path_pixel, planner_info = self._planner.navigation_optimize(start_pos, _affordance_map, _avoidance_map,
+                                                                      object_centric=object_centric)
+        print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] planner time: {time.time() - start_time:.3f}s{bcolors.ENDC}')
+        assert len(path_pixel) > 0, 'path_pixel is empty'
+        step_info['path_pixel'] = path_pixel
+        step_info['planner_info'] = planner_info
+        traj_world = self._path2traj_navigation(path_pixel, _avoidance_map, _rotation_map, _velocity_map)
+        traj_world = traj_world[:self._cfg['num_waypoints_per_plan']]
+        step_info['start_pos'] = start_pos
+        step_info['plan_iter'] = plan_iter
+        step_info['movable_obs'] = movable_obs
+        step_info['traj_world'] = traj_world
+        step_info['affordance_map'] = _affordance_map
+        step_info['rotation_map'] = _rotation_map
+        step_info['velocity_map'] = _velocity_map
+        step_info['avoidance_map'] = _avoidance_map
+
+        if self._cfg.get('visualize', False):
+          save_map_to_image(_avoidance_map, path_pixel, save_path=f"plan_iter_{plan_iter}.png")
+
+        print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] start executing path via controller ({len(traj_world)} waypoints){bcolors.ENDC}')
+        controller_infos = dict()
+        step_idx = 0
+        for i, waypoint in tqdm(enumerate(traj_world)):
+          waypoint_reach = False
+          is_last = i == len(traj_world) - 1
+          dist_threshold = 0.02 if is_last else DIST_THRESHOLD
+          while not waypoint_reach:
+            if is_last:
+              traj_action, dist_to_yaw = self._navigate_to_trajectory(traj_world[i], traj_world[i])
+            else:
+              traj_action, dist_to_yaw = self._navigate_to_trajectory(traj_world[i], traj_world[i+1])
+            controller_info = self._nav_controller.execute(traj_action)
+            cur_pos = self._env.env._get_observations()['robot0_base_pos']
+            cur_yaw = quat2euler(self._env.env._get_observations()['robot0_base_quat'])[0]
+            dxy = cur_pos[:2] - waypoint[0]
+
+            if np.linalg.norm(dxy) <= dist_threshold:
+              print(f"{bcolors.OKBLUE}[interfaces.py] REACHED waypoint {i}{bcolors.ENDC}")
+              waypoint_reach = True
+              break
+            else:
+              print(f"{bcolors.OKBLUE}[interfaces.py] Action ({traj_action[0]:.4f},{traj_action[1]:.4f},{traj_action[2]:.4f})  curr=({cur_pos[0]:.4f},{cur_pos[1]:.4f},{cur_yaw:.4f}), target=({waypoint[0][0]:.4f},{waypoint[0][1]:.4f},{waypoint[1]:.4f}) dist=({dxy[0]:.4f},{dxy[1]:.4f},{dist_to_yaw:.4f}){bcolors.ENDC}")
+            controller_info['controller_step'] = step_idx
+            controller_info['target_waypoint'] = waypoint
+            controller_info['robot0_agentview_left_image'] = controller_info['mp_info'][0]['robot0_agentview_left_image'][::-1]
+            controller_info['topview_image'] = controller_info['mp_info'][0]['topview_image'][::-1]
+            controller_info['posed_person_main_group_1stview_image'] = controller_info['mp_info'][0]['posed_person_main_group_1stview_image'][::-1]
+            controller_infos[step_idx] = controller_info
+            save_video_images(controller_infos, keyword='posed_person_main_group_1stview_image', save_path="posed_person_main_group_1stview_image.mp4", verbose=False)
+            save_video_images(controller_infos, keyword='robot0_agentview_left_image', save_path="robot0_agentview_left_image.mp4", verbose=False)
+            save_video_images(controller_infos, keyword='topview_image', save_path="topview_image.mp4", verbose=False)
+            step_idx += 1
+        step_info['controller_infos'] = controller_infos
+        execute_info.append(step_info)
+        curr_pos = movable_obs['position']
+        if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
+          print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] reached target; terminating{bcolors.ENDC}')
+          break
+    print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] finished executing navigation{bcolors.ENDC}')
+    return execute_info
+  
   def execute(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,
               velocity_map=None, gripper_map=None):
     """
@@ -126,7 +211,7 @@ class LMP_interface():
         _velocity_map = velocity_map()
         _gripper_map = gripper_map()
         # preprocess avoidance map
-        _avoidance_map = self._preprocess_avoidance_map(_avoidance_map, _affordance_map, movable_obs)
+        _avoidance_map = self._preprocess_avoidance_voxel_map(_avoidance_map, _affordance_map, movable_obs)
         # start planning
         start_pos = movable_obs['position']
         start_time = time.time()
@@ -150,14 +235,6 @@ class LMP_interface():
         step_info['gripper_map'] = _gripper_map
         step_info['avoidance_map'] = _avoidance_map
 
-        # visualize
-        if self._cfg['visualize']:
-          assert self._env.visualizer is not None
-          step_info['start_pos_world'] = self._voxel_to_world(start_pos)
-          step_info['targets_world'] = self._voxel_to_world(planner_info['targets_voxel'])
-          self._env.visualizer.visualize(step_info)
-
-        # execute path
         print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] start executing path via controller ({len(traj_world)} waypoints){bcolors.ENDC}')
         controller_infos = dict()
         for i, waypoint in enumerate(traj_world):
@@ -173,9 +250,8 @@ class LMP_interface():
             if np.dot(movable2target, movable2waypoint).round(3) <= 0:
               print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] skip waypoint {i+1} because it is moving in opposite direction of the final target{bcolors.ENDC}')
               continue
-          # execute waypoint
-          controller_info = self._controller.execute(movable_obs, waypoint)
-          # loggging
+          controller_info = self._manip_controller.execute(movable_obs, waypoint)
+          # logging
           movable_obs = movable_obs_func()
           dist2target = np.linalg.norm(movable_obs['_position_world'] - traj_world[-1][0])
           if not object_centric and controller_info['mp_info'] == -1:
@@ -282,20 +358,34 @@ class LMP_interface():
       voxel_map[min_x:max_x, min_y:max_y, min_z:max_z] = value
     return voxel_map
   
-  def get_empty_affordance_map(self):
-    return self._get_default_voxel_map('target')()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
+  def set_pixel_by_radius(self, pixel_map, pixel_xy, radius_cm=0, value=1):
+    """given a 2D np array, set the value of the pixel at pixel_xy to value. If radius is specified, set the value of all pixels within the radius to value."""
+    pixel_map[pixel_xy[0], pixel_xy[1]] = value
+    if radius_cm > 0:
+      radius_x = self.cm2index(radius_cm, 'x')
+      radius_y = self.cm2index(radius_cm, 'y')
+      # simplified version - use rectangle instead of circle (because it is faster)
+      min_x = max(0, pixel_xy[0] - radius_x)
+      max_x = min(self._map_size, pixel_xy[0] + radius_x + 1)
+      min_y = max(0, pixel_xy[1] - radius_y)
+      max_y = min(self._map_size, pixel_xy[1] + radius_y + 1)
+      pixel_map[min_x:max_x, min_y:max_y] = value
+    return pixel_map
 
-  def get_empty_avoidance_map(self):
-    return self._get_default_voxel_map('obstacle')()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
+  def get_empty_affordance_map(self, task='manipulation'):
+    return self._get_default_voxel_map('target', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
+
+  def get_empty_avoidance_map(self, task='manipulation'):
+    return self._get_default_voxel_map('obstacle', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
   
-  def get_empty_rotation_map(self):
-    return self._get_default_voxel_map('rotation')()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
+  def get_empty_rotation_map(self, task='manipulation'):
+    return self._get_default_voxel_map('rotation', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
   
-  def get_empty_velocity_map(self):
-    return self._get_default_voxel_map('velocity')()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
+  def get_empty_velocity_map(self, task='manipulation'):
+    return self._get_default_voxel_map('velocity', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
   
-  def get_empty_gripper_map(self):
-    return self._get_default_voxel_map('gripper')()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
+  def get_empty_gripper_map(self, task='manipulation'):
+    return self._get_default_voxel_map('gripper', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
   
   def reset_to_default_pose(self):
      self._env.reset_to_default_pose()
@@ -336,22 +426,48 @@ class LMP_interface():
     collision_voxel = self._points_to_voxel_map(collision_points_world)
     return collision_voxel
 
-  def _get_default_voxel_map(self, type='target'):
+  def _get_scene_collision_pixel_map(self):
+    collision_points_world, _ = self._env.get_scene_3d_obs(ignore_robot=True)
+    collision_pixel = self._points_to_pixel_map(collision_points_world)
+    return collision_pixel
+
+  def _points_to_pixel_map(self, points):
+    """convert points in world frame to voxel frame, voxelize, and return the voxelized points"""
+    _points = points.astype(np.float32)
+    _pixel_bounds_robot_min = self._env.workspace_bounds_min.astype(np.float32)[:2]
+    _pixel_bounds_robot_max = self._env.workspace_bounds_max.astype(np.float32)[:2]
+    _map_size = self._map_size
+    return pc2pixel_map(_points, _pixel_bounds_robot_min, _pixel_bounds_robot_max, _map_size)
+
+
+  def _get_default_voxel_map(self, type='target', task='manipulation'):
     """returns default voxel map (defaults to current state)"""
     def fn_wrapper():
-      if type == 'target':
-        voxel_map = np.zeros((self._map_size, self._map_size, self._map_size))
-      elif type == 'obstacle':  # for LLM to do customization
-        voxel_map = np.zeros((self._map_size, self._map_size, self._map_size))
-      elif type == 'velocity':
-        voxel_map = np.ones((self._map_size, self._map_size, self._map_size))
-      elif type == 'gripper':
-        voxel_map = np.ones((self._map_size, self._map_size, self._map_size)) * self._env.get_last_gripper_action()
-      elif type == 'rotation':
-        voxel_map = np.zeros((self._map_size, self._map_size, self._map_size, 4))
-        voxel_map[:, :, :] = self._env.get_ee_quat()
+      if task == 'manipulation':
+        if type == 'target':
+          voxel_map = np.zeros((self._map_size, self._map_size, self._map_size))
+        elif type == 'obstacle':  # for LLM to do customization
+          voxel_map = np.zeros((self._map_size, self._map_size, self._map_size))
+        elif type == 'velocity':
+          voxel_map = np.ones((self._map_size, self._map_size, self._map_size))
+        elif type == 'gripper':
+          voxel_map = np.ones((self._map_size, self._map_size, self._map_size)) * self._env.get_last_gripper_action()
+        elif type == 'rotation':
+          voxel_map = np.zeros((self._map_size, self._map_size, self._map_size, 4))
+          voxel_map[:, :, :] = self._env.get_ee_quat()
+      elif task == 'navigation':
+        if type == 'target':
+          voxel_map = np.zeros((self._map_size, self._map_size))
+        elif type == 'obstacle':
+          voxel_map = np.zeros((self._map_size, self._map_size))
+        elif type == 'velocity':
+          voxel_map = np.ones((self._map_size, self._map_size))
+        elif type == 'rotation':
+          voxel_map = np.zeros((self._map_size, self._map_size))
+        else:
+          raise ValueError('Unknown voxel map type: {}'.format(type))
       else:
-        raise ValueError('Unknown voxel map type: {}'.format(type))
+        raise ValueError('Unknown task type: {}'.format(type))
       voxel_map = VoxelIndexingWrapper(voxel_map)
       return voxel_map
     return fn_wrapper
@@ -394,16 +510,66 @@ class LMP_interface():
       traj.append((world_xyz, rotation, velocity, gripper))
     return traj
   
-  def _preprocess_avoidance_map(self, avoidance_map, affordance_map, movable_obs):
+  def _path2traj_navigation(self, path, avoidance_map, rotation_map, velocity_map):
+    """Convert pixel path to navigation trajectory with rotation and velocity."""
+    traj = []
+    cur_xy = self._env.env._get_observations()['robot0_base_pos'][:2]
+    initial_filtering = True
+    for path_idx in path:
+      world_xy = self._voxel_to_world(np.array([path_idx[0], path_idx[1], 0]))[:2]
+      if initial_filtering:
+          if np.linalg.norm(world_xy - cur_xy) < 0.4:
+            print(f"Filtered {world_xy}")
+            continue
+          else:
+            print(f"Filtering stop at {world_xy}")
+            initial_filtering = False
+      voxel_xy = np.round(path_idx).astype(int)
+      rotation = rotation_map[voxel_xy[0], voxel_xy[1]]
+      velocity = velocity_map[voxel_xy[0], voxel_xy[1]]
+      traj.append((world_xy, rotation, velocity))
+    return traj
+  
+  def _navigate_to_trajectory(self, waypoint, to_waypoint, kp=10):
+    goal_xy, goal_yaw, goal_vel = waypoint
+    to_goal_xy = to_waypoint[0]
+    direction_vector = to_goal_xy - goal_xy
+    cur_xy = self._env.env._get_observations()['robot0_base_pos']
+    cur_yaw = quat2euler(self._env.env._get_observations()['robot0_base_quat'])[0]
+    
+    # lookahead smoothing
+    seg_len = np.linalg.norm(direction_vector) + 1e-8
+    seg_dir = direction_vector / seg_len
+    L = 0.3
+    target_xy = goal_xy + seg_dir * min(L, seg_len)
+    is_last = np.array_equal(goal_xy, target_xy)
+    if not is_last or (is_last and goal_yaw == 0):
+      goal_yaw = np.arctan2(seg_dir[1], seg_dir[0])
+
+    dx = goal_xy[0] - cur_xy[0]
+    dy = goal_xy[1] - cur_xy[1]
+    delta_yaw = (goal_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi
+
+    v_x = dx * np.cos(cur_yaw) + dy * np.sin(cur_yaw)
+    v_y = -dx * np.sin(cur_yaw) + dy * np.cos(cur_yaw)
+    action = np.zeros(3)
+    if abs(delta_yaw)  < YAW_THRESHOLD:
+      action[0] = v_x * goal_vel * kp
+      action[1] = v_y * goal_vel * kp
+    action[2] = delta_yaw * goal_vel * kp
+    action = np.clip(action, -1.0, 1.0)
+    return action, delta_yaw
+
+  def _preprocess_avoidance_voxel_map(self, avoidance_map, affordance_map, movable_obs):
     # collision avoidance
     scene_collision_map = self._get_scene_collision_voxel_map()
     # anywhere within 15/100 indices of the target is ignored (to guarantee that we can reach the target)
     ignore_mask = distance_transform_edt(1 - affordance_map)
-    scene_collision_map[ignore_mask < int(0.15 * self._map_size)] = 0
+    scene_collision_map[ignore_mask < int(0.2 * self._map_size)] = 0
     # anywhere within 15/100 indices of the start is ignored
     try:
       ignore_mask = distance_transform_edt(1 - movable_obs['occupancy_map'])
-      scene_collision_map[ignore_mask < int(0.15 * self._map_size)] = 0
+      scene_collision_map[ignore_mask < int(0.1 * self._map_size)] = 0
     except KeyError:
       start_pos = movable_obs['position']
       ignore_mask = np.ones_like(avoidance_map)
@@ -415,23 +581,23 @@ class LMP_interface():
     avoidance_map = np.clip(avoidance_map, 0, 1)
     return avoidance_map
 
-def save_video_images(controller_infos, save_path ="tmp.mp4", verbose=True):
-  images = []
-  for controller_info in controller_infos:
-    images.append(controller_infos[controller_info]['robot0_agentview_left_image'])
-  height, width, _ = images[0].shape
-
-  import cv2, os
-  fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-  video = cv2.VideoWriter(save_path, fourcc, 24, (width, height))
-  for img in images:
-      img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-      video.write(img_bgr)
-  video.release()
-  if verbose:
-    print(f"Video saved to {save_path} (len(): {len(images)}")
-  return
-
+  def _preprocess_avoidance_pixel_map(self, avoidance_map, affordance_map, movable_obs, robot_radius=0.35):
+    scene_collision_map = self._get_scene_collision_pixel_map()
+    # clear collision around robot start position so it can move out
+    start_pos = movable_obs['position']
+    ignore_mask = np.ones_like(avoidance_map)
+    xy = self._compute_pixel_resolution()
+    margin = np.ceil(robot_radius/xy)+1
+    ignore_mask[start_pos[0] - int(margin[0]):start_pos[0] + int(margin[0]),
+                start_pos[1] - int(margin[1]):start_pos[1] + int(margin[1])] = 0
+    scene_collision_map *= ignore_mask
+    avoidance_map += scene_collision_map
+    avoidance_map = np.clip(avoidance_map, 0, 1)
+    return avoidance_map
+  
+  def _compute_pixel_resolution(self):
+    world_xy = self._voxel_to_world(np.array([1,1,0]))[:2] - self._voxel_to_world(np.array([0,0,0]))[:2]
+    return world_xy
 
 def setup_LMP(env, general_config, debug=False):
   controller_config = general_config['controller']
@@ -525,3 +691,32 @@ def pc2voxel_map(points, voxel_bounds_robot_min, voxel_bounds_robot_max, map_siz
   for i in range(points_vox.shape[0]):
       voxel_map[points_vox[i, 0], points_vox[i, 1], points_vox[i, 2]] = 1
   return voxel_map
+
+def pc2pixel_map(points, pixel_bounds_robot_min, pixel_bounds_robot_max, map_size, \
+                 z_min=None, z_max=None):
+  """given point cloud, create a fixed size pixel map, and fill in the voxels"""
+  points = points.astype(np.float32)
+  # z-range filtering
+  z_min = points[:, 2].min() + 0.05 if z_min is None else z_min
+  print("z min:", z_min)
+  points = points[points[:, 2] >= z_min]
+  if z_max is not None:
+      points = points[points[:, 2] <= z_max]
+      
+  if len(points) == 0:
+      return np.zeros((map_size, map_size))
+  points_xy = points[:, :2]  # only keep x, y
+  pixel_bounds_robot_min = pixel_bounds_robot_min.astype(np.float32)[:2]
+  pixel_bounds_robot_max = pixel_bounds_robot_max.astype(np.float32)[:2]
+  # make sure the point is within the pixel bounds
+  points_xy = np.clip(points_xy, pixel_bounds_robot_min, pixel_bounds_robot_max)
+  # convert to pixel coordinates (x, y only)
+  pixel_xy = (points_xy - pixel_bounds_robot_min) / (pixel_bounds_robot_max - pixel_bounds_robot_min) * (map_size - 1)
+  # to integer
+  points_pix = np.round(pixel_xy).astype(np.int32)
+  # clip to valid range
+  points_pix = np.clip(points_pix, 0, map_size - 1)
+  # create 2D pixel map
+  pixel_map = np.zeros((map_size, map_size))
+  pixel_map[points_pix[:, 0], points_pix[:, 1]] = 1
+  return pixel_map

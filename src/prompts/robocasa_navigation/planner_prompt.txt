@@ -1,0 +1,15 @@
+import numpy as np
+from env_utils import execute
+from perception_utils import parse_query_obj
+import action_utils import composer
+
+objects = ['fridge', 'hot soup']
+# Query: Navigate to the fridge door and be careful around the hot soup.
+composer("grasp the fridge handle and keep at least 15cm away from the hot soup")
+composer("move away from the fridge handle by 25cm and keep at least 15cm away from the hot soup")
+# done
+
+objects = ['cyan bowl', 'yellow bowl', 'box', 'ice cream']
+# Query: move to the top of the cyan bowl.
+composer("move to the top of the cyan bowl")
+# done

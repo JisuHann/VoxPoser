@@ -7,9 +7,14 @@ import robosuite
 import robocasa
 from robosuite import load_composite_controller_config
 import time
-
-TABLE_ALIAS =["table","gripper0", 'right', "cutting", "light", "window", 'counter', "floor", 'cab', 'stack', 'wall', 'mobilebase0', 'utensil',"robot0"]
-
+MAX_DEPTH = 20.0
+DONTKNOWWHATISTHIS = ['cab', 'left','right','main', 'obstacle', "light", "floor", "wall", "cab", "outlet", "stack", "robot0", "gripper0"]
+TABLE_ALIAS =["table", "cutting", "window",'stack', 'wall', 'utensil']
+MOBILE_ALIAS = {
+    "posed": "person",
+    "mobilebase0": "robot_mobile_base",
+    "coffee": "coffee_machine"
+}
 class VoxPoserRobocasa():
     def __init__(self, task_name = "", task_config=None, visualizer=None):
         """
@@ -20,6 +25,10 @@ class VoxPoserRobocasa():
         """
         
         self.task_name = task_name
+        if 'Navigate' in self.task_name:
+            self.navigate_task = True
+        else:
+            self.navigate_task = False
         self.controller_config = load_composite_controller_config(
             controller="BASIC",
             robot=task_config['robot'],
@@ -59,6 +68,7 @@ class VoxPoserRobocasa():
             )
 
         self.camera_names = [self.env.sim.model.camera_id2name(i) for i in range(self.env.sim.model.ncam)]
+        print("Camera names are ", self.camera_names)
         forward_vector = np.array([0, 0, 1])
         self.lookat_vectors = {}
         for cam_idx, cam_name in enumerate(self.camera_names):
@@ -80,7 +90,7 @@ class VoxPoserRobocasa():
             self.visualizer.update_bounds(self.workspace_bounds_min, self.workspace_bounds_max)
             self.visualizer.update_scene_points(points, colors)
 
-    def get_visible_object_names(self):
+    def get_visible_object_names(self, mapping_ids=False):
         if self.offscreen_render:
             visible_objects = []
             for cam in self.camera_names:
@@ -89,16 +99,26 @@ class VoxPoserRobocasa():
                 visible_objs = set([self.env.sim.model.body_id2name(self.env.sim.model.geom_bodyid[int(gid)]).split("_")[0] for gid in visible_geom_ids if gid >= 0 and self.env.sim.model.geom_id2name(int(gid)) is not None])
                 visible_objects.extend(visible_objs)
             visible_objects = list(set(visible_objects))
-            visible_objects = [obj for obj in visible_objects if obj not in TABLE_ALIAS]
         else:
             visible_objects = list(self.env.objects.keys())
-        print("Visible objects:", visible_objects)
-        return visible_objects
+        print("TODO(jshan): Manually putting objects")
+        visible_objects = [obj for obj in visible_objects if obj not in DONTKNOWWHATISTHIS]
+        final_visible_objects = visible_objects.copy()
+        if mapping_ids == False:
+            print("Original visible objects: \t", visible_objects)
+            for idx, obj in enumerate(visible_objects):
+                for k, v in MOBILE_ALIAS.items():
+                    if k in obj:
+                        final_visible_objects[idx] = v
+            print("Filtered Visible objects: \t", final_visible_objects)
+        else:
+            print("Visible objects: \t", final_visible_objects)
+        return final_visible_objects
     
     def load_task(self):
         self._reset_task_variables()
         self.reset()
-        self.objects = self.get_visible_object_names()
+        self.objects = self.get_visible_object_names(mapping_ids=True)
         self.name2ids = {k:[] for k in self.objects}
         for i in range(self.env.sim.model.ngeom):
             name = self.env.sim.model.geom_id2name(i)
@@ -117,26 +137,30 @@ class VoxPoserRobocasa():
         """
         self.latest_obs = self.env._get_observations()
         for cam_name in self.camera_names:
-            point_cloud = self.fetch_cam_info(cam_name, require_pc=True, require_mask=False)
+            point_cloud = self.fetch_cam_info(cam_name, require_pc=True)
             self.latest_obs[f"{cam_name}_point_cloud"] = point_cloud
-            mask = self.fetch_cam_info(cam_name, require_pc=False, require_mask=True)
+            mask = self.fetch_cam_info(cam_name, require_mask=True)
             self.latest_obs[f"{cam_name}_mask"] = mask
+            rgb = self.fetch_cam_info(cam_name, require_rgb=True)
+            self.latest_obs[f"{cam_name}_image"] = rgb
             
-    def fetch_cam_info(self, cam_name, require_pc=True, require_mask=False):
+    def fetch_cam_info(self, cam_name, require_rgb=False, require_pc=False, require_mask=False):
         cam_config = {
             "height": self.cam_height,
             "width": self.cam_width,
             "depth": require_pc,
             "segmentation": require_mask
         }
+        self.env.sim.forward()
         if require_pc:
             output = self.fetch_3d_point_cloud(cam_name, cam_config)
         if require_mask:
             output = self.env.sim.render(camera_name=cam_name, **cam_config)
+        if require_rgb:
+            output = self.env.sim.render(camera_name=cam_name, **cam_config)
         return output
     
     def fetch_3d_point_cloud(self, cam_name, cam_config):
-        
         cam_id = self.env.sim.model.cam(cam_name).id
         width = cam_config["width"]
         height = cam_config["height"]
@@ -168,21 +192,21 @@ class VoxPoserRobocasa():
         near = model.vis.map.znear * extent
         far = model.vis.map.zfar * extent
         # Clipping nan values
-        depth_raw = np.clip(depth_raw, 0, 1)
+        depth_raw = np.clip(depth_raw, 0, MAX_DEPTH)
         depth = far * near / (far - depth_raw * (far - near))
+        depth = np.clip(depth, 0, MAX_DEPTH)
+
         rgb = rgb[::-1]
         depth = depth[::-1]
-
         # Open3D로 point cloud 생성
         rgb_o3d = o3d.geometry.Image(rgb.astype(np.uint8))
         depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
             rgb_o3d, depth_o3d, 
             depth_scale=1.0, 
-            depth_trunc=20.0, 
+            depth_trunc=MAX_DEPTH + 1.0, 
             convert_rgb_to_intensity=False
         )
-        
         intrinsic = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic)
         
@@ -193,7 +217,7 @@ class VoxPoserRobocasa():
         # Open3D -> MuJoCo 카메라 좌표계 변환
         # Open3D: X-right, Y-down, Z-forward
         # MuJoCo: X-right, Y-down, -Z-forward
-        points_cam[:, 1] = -points_cam[:, 1]  # Y 반전 추가
+        points_cam[:, 1] = -points_cam[:, 1]
         points_cam[:, 2] = -points_cam[:, 2]
         
         # Extrinsic: camera to world
@@ -231,7 +255,7 @@ class VoxPoserRobocasa():
         points, colors, masks, normals = [], [], [], []
         for cam in self.camera_names:
             points.append(self.latest_obs[f"{cam}_point_cloud"][:,:3].reshape(-1, 3))
-            colors.append(self.latest_obs[f"{cam}_image"].reshape(-1, 3))
+            colors.append(self.latest_obs[f"{cam}_image"][::-1].reshape(-1, 3))
             masks.append(self.latest_obs[f"{cam}_mask"][:,:,1][::-1].reshape(-1))
             # estimate normals using o3d
             pcd = o3d.geometry.PointCloud()
@@ -250,24 +274,37 @@ class VoxPoserRobocasa():
         masks = np.concatenate(masks, axis=0)
         normals = np.concatenate(normals, axis=0)
     
+        # Set workspace bound min/max at initial stage
         if query_name is None:
-            self.workspace_bounds_min = np.array([points[:,0].min(), points[:,1].min(), points[:,2].min()])
-            self.workspace_bounds_max = np.array([points[:,0].max(), points[:,1].max(), points[:,2].max()])
+            if not self.navigate_task: # Manipulation
+                self.workspace_bounds_min = np.array([points[:,0].min(), points[:,1].min(), points[:,2].min()])
+                self.workspace_bounds_max = np.array([points[:,0].max(), points[:,1].max(), points[:,2].max()])
+            else: # Navigation
+                bbox_min = self.env.sim.data.xpos.min(axis=0)
+                bbox_max = self.env.sim.data.xpos.max(axis=0)
+                center = (bbox_min + bbox_max) / 2
+                half_size = (bbox_max - bbox_min).max() / 2
+                self.workspace_bounds_min = center - half_size
+                self.workspace_bounds_max = center + half_size
             return
 
         # get object points
-        assert query_name in self.name2ids, f"Unknown object name: {query_name}"
-        obj_ids = self.name2ids[query_name]
+        try:
+            obj_ids = self.name2ids[query_name]
+        except Exception as e:
+            # use mapped name from MOBILE_ALIAS
+            mapped_name = dict(map(reversed, MOBILE_ALIAS.items()))[query_name]
+            obj_ids = self.name2ids[mapped_name]
         try:
             obj_points = points[np.isin(masks, obj_ids)]
-            if len(obj_points) == 0:
+            if len(obj_points) == 0 or len(obj_ids) == 0:
                 raise ValueError(f"Object {query_name} not found in the scene")
             obj_colors = colors[np.isin(masks, obj_ids)]
             obj_normals = normals[np.isin(masks, obj_ids)]
+            obj_points, obj_colors, obj_normals = self.remove_obj_pc_outlier(obj_points, obj_colors, obj_normals)
         except Exception as e:
             print(e)
-        obj_points, obj_colors, obj_normals = self.remove_obj_pc_outlier(obj_points, obj_colors, obj_normals)
-        # breakpoint()
+            breakpoint()
         # self.visualize_3d_space(obj_points)
         # voxel downsample using o3d
         pcd = o3d.geometry.PointCloud()
@@ -290,10 +327,11 @@ class VoxPoserRobocasa():
         normals = np.asarray(pcd.normals)
         return points, colors, normals
 
-    def visualize_image(rgb):
-        plt.imshow(rgb)
-        plt.axis('off')
-        plt.show()
+    def save_image(self, rgb, save_path='tmp.png'):
+        from PIL import Image
+        import numpy as np
+        Image.fromarray(rgb).save(save_path)
+        print(f"Saved {save_path}")
         return 
     
     def visualize_3d_space(self, xyz, rgb=None):
@@ -324,7 +362,7 @@ class VoxPoserRobocasa():
         self.update_latest_obs()
         for cam in self.camera_names:
             points.append(self.latest_obs[f"{cam}_point_cloud"][:,:3].reshape(-1, 3))
-            colors.append(self.latest_obs[f"{cam}_image"].reshape(-1, 3))
+            colors.append(self.latest_obs[f"{cam}_image"][::-1].reshape(-1, 3))
             masks.append(self.latest_obs[f"{cam}_mask"][:,:,1][::-1].reshape(-1))
         points = np.concatenate(points, axis=0)
         colors = np.concatenate(colors, axis=0)
@@ -376,8 +414,8 @@ class VoxPoserRobocasa():
             tuple: A tuple containing the latest observations, reward, and termination flag.
         """
         # action = self._process_action(action)
-        print("TODO(jshan): only considering non-mobile cases")
-        print("TODO(jshan): Not sure about the robot action space")
+        # print("TODO(jshan): only considering non-mobile cases")
+        # print("TODO(jshan): Not sure about the robot action space")
         action = np.concatenate([action, [0.0,0.0,0.0]])
         obs, reward, terminate, _ = self.env.step(action)
         # obs = self._process_obs(obs)
@@ -390,6 +428,28 @@ class VoxPoserRobocasa():
         if grasped_objects != None:
             print("TODO(jshan): load grapsed obj ids")
             self.grasped_obj_ids = grasped_objects.get_handle()
+        return obs, reward, terminate
+
+    def apply_navigation_action(self, action):
+        """
+        Applies an action in the environment and updates the state.
+
+        Args:
+            action: The action to apply.
+
+        Returns:
+            tuple: A tuple containing the latest observations, reward, and termination flag.
+        """
+        # action = self._process_action(action)
+        # print("TODO(jshan): only considering non-mobile cases")
+        # print("TODO(jshan): Not sure about the robot action space")
+        manipulation_action = np.zeros((7,))
+        action = np.concatenate((manipulation_action, action, [0.0]))
+        obs, reward, terminate, _ = self.env.step(action)
+        self.latest_obs = obs
+        self.latest_reward = reward
+        self.latest_terminate = terminate
+        self.latest_action = action
         return obs, reward, terminate
 
     def move_to_pose(self, pose, speed=None):

@@ -65,11 +65,14 @@ def normalize_map(map):
 def calc_curvature(path):
     dx = np.gradient(path[:, 0])
     dy = np.gradient(path[:, 1])
-    dz = np.gradient(path[:, 2])
     ddx = np.gradient(dx)
     ddy = np.gradient(dy)
-    ddz = np.gradient(dz)
-    curvature = np.sqrt((ddy * dx - ddx * dy)**2 + (ddz * dx - ddx * dz)**2 + (ddz * dy - ddy * dz)**2) / np.power(dx**2 + dy**2 + dz**2, 3/2)
+    if path.shape[1] == 3:
+        dz = np.gradient(path[:, 2])
+        ddz = np.gradient(dz)
+        curvature = np.sqrt((ddy * dx - ddx * dy)**2 + (ddz * dx - ddx * dz)**2 + (ddz * dy - ddy * dz)**2) / np.power(dx**2 + dy**2 + dz**2, 3/2)
+    else:
+        curvature = np.abs(ddy * dx - ddx * dy) / np.power(dx**2 + dy**2, 3/2)
     # convert any nan to 0
     curvature[np.isnan(curvature)] = 0
     return curvature

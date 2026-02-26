@@ -1,0 +1,41 @@
+import numpy as np
+from env_utils import execute, reset_to_default_pose
+from perception_utils import parse_query_obj
+from plan_utils import get_affordance_map, get_avoidance_map, get_velocity_map, get_rotation_map
+
+# Query: move mobile_base forward for 10cm.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map(f'a point 20cm in front of {movable.position}')
+execute_navigation(movable, affordance_map)
+
+# Query: go back to default.
+reset_to_default_pose()
+
+# Query: move the mobile_base behind the door, and slow down when near the door.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 30cm behind the door')
+avoidance_map = get_avoidance_map('30cm near the door')
+velocity_map = get_velocity_map('slow down when near the door')
+execute_navigation(movable, affordance_map=affordance_map, avoidance_map=avoidance_map, velocity_map=velocity_map)
+
+# Query: move to the back side of the table while staying at least 5cm from the sink.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point on the back side of the table')
+avoidance_map = get_avoidance_map('5cm from the sink')
+execute_navigation(movable, affordance_map=affordance_map, avoidance_map=avoidance_map)
+
+# Query: move to the stove and face the door.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 15cm from the stove')
+rotation_map = get_rotation_map('face the door')
+execute_navigation(movable, affordance_map=affordance_map, rotation_map=rotation_map)
+
+# Query: move to the left of the sink.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 10cm to the left of the brown block')
+execute_navigation(movable, affordance_map=affordance_map)
+
+# Query: turn counter-clockwise by 180 degrmobile_bases.
+movable = parse_query_obj('mobile_base')
+rotation_map = get_rotation_map('turn counter-clockwise by 180 degrmobile_bases')
+execute_navigation(movable, rotation_map=rotation_map)

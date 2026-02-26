@@ -1,0 +1,109 @@
+import numpy as np
+from perception_utils import parse_query_obj
+from plan_utils import get_empty_affordance_map, set_pixel_by_radius, cm2index
+
+# Query: a point 10cm in front of [10, 15, 60].
+affordance_map = get_empty_affordance_map(task='navigation')
+# 10cm in front of so we add to x-axis
+x = 10 + cm2index(10, 'x')
+y = 15
+affordance_map[x, y] = 1
+ret_val = affordance_map
+
+# Query: a point on the right side of the table.
+affordance_map = get_empty_affordance_map(task='navigation')
+table = parse_query_obj('table')
+(min_x, min_y, min_z), (max_x, max_y, max_z) = table.aabb
+center_x, center_y, center_z = table.position
+# right side so y = max_y
+x = center_x
+y = max_y
+affordance_map[x, y] = 1
+ret_val = affordance_map
+
+# Query: a point 1cm to the left of the brown block.
+affordance_map = get_empty_affordance_map(task='navigation')
+brown_block = parse_query_obj('brown block')
+(min_x, min_y, min_z), (max_x, max_y, max_z) = brown_block.aabb
+center_x, center_y, center_z = brown_block.position
+# 1cm to the left of so we subtract from y-axis
+x = center_x
+y = min_y - cm2index(1, 'y')
+affordance_map[x, y] = 1
+ret_val = affordance_map
+
+# Query: anywhere within 20cm of the right most block.
+affordance_map = get_empty_affordance_map(task='navigation')
+right_most_block = parse_query_obj('the right most block')
+set_pixel_by_radius(affordance_map, right_most_block.position, radius_cm=20, value=1)
+
+# Query: a point on the back side of the table.
+affordance_map = get_empty_affordance_map(task='navigation')
+table = parse_query_obj('table')
+(min_x, min_y, min_z), (max_x, max_y, max_z) = table.aabb
+center_x, center_y, center_z = table.position
+# back side so x = min_x
+x = min_x
+y = center_y
+affordance_map[x, y] = 1
+ret_val = affordance_map
+
+# Query: a point on the front right corner of the table.
+affordance_map = get_empty_affordance_map(task='navigation')
+table = parse_query_obj('table')
+(min_x, min_y, min_z), (max_x, max_y, max_z) = table.aabb
+center_x, center_y, center_z = table.position
+# front right corner so x = max_x and y = max_y
+x = max_x
+y = max_y
+affordance_map[x, y] = 1
+ret_val = affordance_map
+
+# Query: a point 20cm away from the leftmost block.
+affordance_map = get_empty_affordance_map(task='navigation')
+leftmost_block = parse_query_obj('leftmost block')
+# positive normal because we are moving away from the block.
+moving_dir = leftmost_block.normal
+affordance_xyz = leftmost_block.position + cm2index(20, moving_dir)
+affordance_map[affordance_xyz[0], affordance_xyz[1]] = 1
+ret_val = affordance_map
+
+# Query: a point 15cm from the coffee machine.
+affordance_map = get_empty_affordance_map(task='navigation')
+coffee_machine = parse_query_obj('coffee machine')
+moving_dir = -coffee_machine.normal
+affordance_xyz = coffee_machine.position + cm2index(20, moving_dir)
+affordance_map[affordance_xyz[0], affordance_xyz[1]] = 1
+ret_val = affordance_map
+
+# Query: a point 10cm to the right of [45 49 66].
+affordance_map = get_empty_affordance_map(task='navigation')
+# 10cm to the right of so we add to y-axis
+x = 45
+y = 49 + cm2index(10, 'y')
+affordance_map[x, y] = 1
+ret_val = affordance_map
+
+# Query: the blue circle.
+affordance_map = get_empty_affordance_map(task='navigation')
+blue_circle = parse_query_obj('blue circle')
+affordance_map = blue_circle.occupancy_map
+ret_val = affordance_map
+
+# Query: a point at the center of the blue circle.
+affordance_map = get_empty_affordance_map(task='navigation')
+blue_circle = parse_query_obj('blue circle')
+x, y, z = blue_block.position
+affordance_map[x, y] = 1
+ret_val = affordance_map
+
+# Query: a point 5cm to the left of the yellow bowl.
+affordance_map = get_empty_affordance_map(task='navigation')
+yellow_bowl = parse_query_obj('yellow bowl')
+(min_x, min_y, min_z), (max_x, max_y, max_z) = yellow_bowl.aabb
+center_x, center_y, center_z = yellow_bowl.position
+# 5cm to the left of so we subtract from y-axis
+x = center_x
+y = min_y - cm2index(5, 'y')
+affordance_map[x, y] = 1
+ret_val = affordance_mapS

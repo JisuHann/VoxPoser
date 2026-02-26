@@ -2,18 +2,39 @@
 import os
 import yaml
 
+
 def load_config(config_path):
     with open(config_path, 'r') as f:
         config = yaml.load(f, Loader=yaml.FullLoader)
     return config
 
-def get_config(env=None, config_path=None):
-    assert env is None or config_path is None, 'env and config_path cannot be both specified'
+
+def _deep_merge(base, override):
+    """Recursively merge override into base dict (override wins)."""
+    merged = base.copy()
+    for key, value in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(value, dict):
+            merged[key] = _deep_merge(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def get_config(config_path=None, task_type=None):
     if config_path is None:
-        config_path = './configs/robocasa_config.yaml'
+        config_path = 'src/configs/robocasa_config.yaml'
     assert config_path and os.path.exists(config_path), f'config file does not exist ({config_path})'
     config = load_config(config_path)
-    # wrap dict such that we can access config through attribute
+
+    # merge task-type specific overrides into base config
+    if task_type is not None and task_type in config:
+        overrides = config.pop(task_type)
+        config = _deep_merge(config, overrides)
+
+    # remove other task-type sections
+    for key in ['navigation', 'manipulation']:
+        config.pop(key, None)
+
     class ConfigDict(dict):
         def __init__(self, config):
             """recursively build config"""
@@ -38,8 +59,3 @@ def get_config(env=None, config_path=None):
             self.__init__(state)
     config = ConfigDict(config)
     return config
-
-def main():
-    config = get_config(config_path='./configs/rlbench_config.yaml')
-    print(config)
-

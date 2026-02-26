@@ -1,23 +1,39 @@
-env_name: robocasa
 task:
   robot: "PandaOmron"
-  camera_names: ['robot0_robotview', 'robot0_agentview_center', 'robot0_agentview_left', 'robot0_agentview_right', 'robot0_frontview', 'robot0_eye_in_hand']
   camera_widths: 640
   camera_heights: 480
   layout_ids: 0
   style_ids: 0
   offscreen_render: True
+
+# task-type specific overrides
+navigation:
+  env_name: robocasa_navigation
+  task:
+    camera_names: ['robot0_robotview', 'robot0_agentview_center', 'robot0_agentview_left', 'robot0_agentview_right', 'robot0_frontview', 'robot0_eye_in_hand', 'topview', 'sideview', 'posed_person_main_group_1stview']
+  planner:
+    stop_threshold: 0.01
+    obstacle_map_gaussian_sigma: 5
+    max_curvature: 5
+
+manipulation:
+  env_name: robocasa_manipulation
+  task:
+    camera_names: ['robot0_robotview', 'robot0_agentview_center', 'robot0_agentview_left', 'robot0_agentview_right', 'robot0_frontview', 'robot0_eye_in_hand']
+  planner:
+    stop_threshold: 0.001
+    obstacle_map_gaussian_sigma: 10
+    max_curvature: 3
+
+# shared defaults
 planner:
-  stop_threshold: 0.001
   savgol_polyorder: 3
   savgol_window_size: 20
   obstacle_map_weight: 1
   max_steps: 300
-  obstacle_map_gaussian_sigma: 10
   target_map_weight: 2
   stop_criteria: no_nearby_equal
   target_spacing: 1
-  max_curvature: 3
   pushing_skip_per_k: 5
 
 controller:
@@ -34,7 +50,7 @@ visualizer:
 lmp_config:
   env:
     map_size: 100
-    num_waypoints_per_plan: 10000  # set to a large number since we only do open loop for sim
+    num_waypoints_per_plan: 10000
     max_plan_iter: 1
     visualize: True
   lmps:

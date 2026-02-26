@@ -1,3 +1,15 @@
 *.pyc
 *.pkl
 *.html
+
+benchmark/robocasa/models/*
+# Logging
+*.png
+*.mp4
+*.md
+*.json
+*.npy
+LMP.txt
+*claude*
+*CLAUDE*
+*cache*
