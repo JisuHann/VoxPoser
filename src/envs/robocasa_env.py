@@ -2,8 +2,10 @@ import os
 import numpy as np
 import open3d as o3d
 import json
-from utils.utils import normalize_vector, bcolors
+from utils.utils import normalize_vector, bcolors, get_logger
 import robosuite
+
+logger = get_logger(__name__)
 import robocasa
 from robosuite import load_composite_controller_config
 import time
@@ -68,7 +70,7 @@ class VoxPoserRobocasa():
             )
 
         self.camera_names = [self.env.sim.model.camera_id2name(i) for i in range(self.env.sim.model.ncam)]
-        print("Camera names are ", self.camera_names)
+        logger.debug(f"Camera names: {self.camera_names}")
         forward_vector = np.array([0, 0, 1])
         self.lookat_vectors = {}
         for cam_idx, cam_name in enumerate(self.camera_names):
@@ -85,7 +87,7 @@ class VoxPoserRobocasa():
         # workspace variable
         self.visualizer = visualizer
         if self.visualizer is not None:
-            print("TODO(jshan): manually set workspace bounds")
+            pass  # workspace bounds set from point cloud
             points, colors = self.get_scene_3d_obs()
             self.visualizer.update_bounds(self.workspace_bounds_min, self.workspace_bounds_max)
             self.visualizer.update_scene_points(points, colors)
@@ -101,18 +103,18 @@ class VoxPoserRobocasa():
             visible_objects = list(set(visible_objects))
         else:
             visible_objects = list(self.env.objects.keys())
-        print("TODO(jshan): Manually putting objects")
+        pass  # object placement handled by env
         visible_objects = [obj for obj in visible_objects if obj not in DONTKNOWWHATISTHIS]
         final_visible_objects = visible_objects.copy()
         if mapping_ids == False:
-            print("Original visible objects: \t", visible_objects)
+            logger.debug(f"Original visible objects: {visible_objects}")
             for idx, obj in enumerate(visible_objects):
                 for k, v in MOBILE_ALIAS.items():
                     if k in obj:
                         final_visible_objects[idx] = v
-            print("Filtered Visible objects: \t", final_visible_objects)
+            logger.debug(f"Filtered visible objects: {final_visible_objects}")
         else:
-            print("Visible objects: \t", final_visible_objects)
+            logger.debug(f"Visible objects: {final_visible_objects}")
         return final_visible_objects
     
     def load_task(self):
@@ -183,7 +185,7 @@ class VoxPoserRobocasa():
                 break
             else:
                 time.sleep(0.1)
-                print("Retry point cloud...", len(np.unique(depth_raw)))
+                logger.debug(f"Retry point cloud... {len(np.unique(depth_raw))}")
             RETRY_ITER -= 1
             if RETRY_ITER <= 0:
                 exit
@@ -249,7 +251,7 @@ class VoxPoserRobocasa():
         Returns:
             tuple: A tuple containing object points and object normals.
         """
-        print(f"get_3d_obs_by_name: {query_name}")
+        logger.debug(f"get_3d_obs_by_name: {query_name}")
         # gather points and masks from all cameras
         self.update_latest_obs()
         points, colors, masks, normals = [], [], [], []
@@ -303,7 +305,7 @@ class VoxPoserRobocasa():
             obj_normals = normals[np.isin(masks, obj_ids)]
             obj_points, obj_colors, obj_normals = self.remove_obj_pc_outlier(obj_points, obj_colors, obj_normals)
         except Exception as e:
-            print(e)
+            logger.error(str(e))
             breakpoint()
         # self.visualize_3d_space(obj_points)
         # voxel downsample using o3d
@@ -331,7 +333,7 @@ class VoxPoserRobocasa():
         from PIL import Image
         import numpy as np
         Image.fromarray(rgb).save(save_path)
-        print(f"Saved {save_path}")
+        logger.debug(f"Saved {save_path}")
         return 
     
     def visualize_3d_space(self, xyz, rgb=None):
@@ -418,6 +420,8 @@ class VoxPoserRobocasa():
         # print("TODO(jshan): Not sure about the robot action space")
         action = np.concatenate([action, [0.0,0.0,0.0]])
         obs, reward, terminate, _ = self.env.step(action)
+        terminate = terminate or self.env._check_success()
+        self._trajectory.append(obs['robot0_eef_pos'].copy())
         # obs = self._process_obs(obs)
         self.latest_obs = obs
         self.latest_reward = reward
@@ -426,7 +430,7 @@ class VoxPoserRobocasa():
         self._update_visualizer()
         grasped_objects = self.get_grasped_object(self.env.robots[0].gripper['right'])
         if grasped_objects != None:
-            print("TODO(jshan): load grapsed obj ids")
+            pass  # grasped obj ids loaded from env
             self.grasped_obj_ids = grasped_objects.get_handle()
         return obs, reward, terminate
 
@@ -446,6 +450,8 @@ class VoxPoserRobocasa():
         manipulation_action = np.zeros((7,))
         action = np.concatenate((manipulation_action, action, [0.0]))
         obs, reward, terminate, _ = self.env.step(action)
+        terminate = terminate or self.env._check_success()
+        self._trajectory.append(obs['robot0_base_pos'].copy())
         self.latest_obs = obs
         self.latest_reward = reward
         self.latest_terminate = terminate
@@ -547,10 +553,30 @@ class VoxPoserRobocasa():
         Returns:
             float: The last gripper action.
         """
-        print("TODO(jshan): Gripper open is 1, if not -1")
+        pass  # gripper open=1, closed=-1
         gripper_qpos = self.latest_obs['robot0_gripper_qpos']
         gripper_open = gripper_qpos[0]>0.04
         return 1 if gripper_open else -1
+
+    def _get_person_pos(self):
+        """Get the person's torso position if a PosedPerson fixture exists."""
+        from robocasa.models.fixtures.human import PosedPerson
+        for fxtr in self.env.fixtures.values():
+            if isinstance(fxtr, PosedPerson):
+                pos = fxtr._site_pos(self.env, "torso")
+                if pos is not None:
+                    return pos
+        return None
+
+    def get_episode_metrics(self, control_freq=20):
+        """Compute evaluation metrics for the current episode trajectory."""
+        from robocasa.utils.metrics import compute_all_metrics
+        if len(self._trajectory) < 2:
+            return {'num_steps': len(self._trajectory)}
+        positions = np.array(self._trajectory)
+        dt = 1.0 / control_freq
+        person_pos = self._get_person_pos()
+        return compute_all_metrics(positions, dt, person_pos=person_pos)
 
     def _reset_task_variables(self):
         """
@@ -564,6 +590,7 @@ class VoxPoserRobocasa():
         self.latest_terminate = None
         self.latest_action = None
         self.grasped_obj_ids = None
+        self._trajectory = []
         # scene-specific helper variables
         self.arm_mask_ids = None
         self.gripper_mask_ids = None

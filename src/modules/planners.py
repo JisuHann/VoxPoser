@@ -3,7 +3,9 @@ import numpy as np
 from scipy.ndimage import gaussian_filter
 from scipy.ndimage import distance_transform_edt
 from scipy.signal import savgol_filter
-from utils.utils import get_clock_time, normalize_map, calc_curvature
+from utils.utils import get_clock_time, normalize_map, calc_curvature, get_logger
+
+logger = get_logger(__name__)
 
 
 class PathPlanner:
@@ -27,7 +29,7 @@ class PathPlanner:
             path: (n, 3) np.ndarray, path
             info: dict, info
         """
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] start')
+        logger.debug(f'[{get_clock_time(milliseconds=True)}] planner start')
         info = dict()
         # make copies
         start_pos, raw_start_pos = start_pos.copy(), start_pos
@@ -47,7 +49,7 @@ class PathPlanner:
         # initialize path
         path, current_pos = [start_pos], start_pos
         # optimize
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] start optimizing, start_pos: {start_pos}')
+        logger.debug(f'[{get_clock_time(milliseconds=True)}] optimizing from {start_pos}')
         for i in range(self.config.max_steps):
             # calculate all nearby voxels around current position
             all_nearby_voxels = self._calculate_nearby_voxel(current_pos, object_centric=object_centric)
@@ -67,11 +69,11 @@ class PathPlanner:
             if stop_criteria(current_pos, _costmap, self.config.stop_threshold):
                 break
         raw_path = np.array(path)
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] optimization finished; path length: {len(raw_path)}')
+        logger.info(f'[{get_clock_time(milliseconds=True)}] path optimized: {len(raw_path)} pts')
         # postprocess path
         processed_path = self._postprocess_path(raw_path, raw_target_map, object_centric=object_centric)
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] after postprocessing, path length: {len(processed_path)}')
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] last waypoint: {processed_path[-1]}')
+        logger.info(f'[{get_clock_time(milliseconds=True)}] after postprocessing: {len(processed_path)} pts')
+        logger.debug(f'[{get_clock_time(milliseconds=True)}] last waypoint: {processed_path[-1]}')
         # save info
         info['start_pos'] = start_pos
         info['target_map'] = target_map
@@ -96,7 +98,7 @@ class PathPlanner:
             path: (n, 3) np.ndarray, path
             info: dict, info
         """
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] start')
+        logger.debug(f'[{get_clock_time(milliseconds=True)}] planner start')
         info = dict()
         # make copies
         start_pos, raw_start_pos = start_pos.copy(), start_pos
@@ -116,7 +118,7 @@ class PathPlanner:
         # initialize path
         path, current_pos = [start_pos], start_pos
         # optimize
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] start optimizing, start_pos: {start_pos}')
+        logger.debug(f'[{get_clock_time(milliseconds=True)}] optimizing from {start_pos}')
         for i in range(self.config.max_steps):
             # calculate all nearby voxels around current position
             all_nearby_voxels = self._calculate_nearby_pixel(current_pos, object_centric=object_centric)
@@ -127,7 +129,7 @@ class PathPlanner:
             try:
                 next_pos = all_nearby_voxels[steepest_idx]
             except Exception as e:
-                print(e)
+                logger.error(str(e))
                 breakpoint()
             # increase cost at current position to avoid going back
             _costmap[current_pos[0].round().astype(int),
@@ -139,11 +141,11 @@ class PathPlanner:
             if stop_criteria(current_pos, _costmap, self.config.stop_threshold):
                 break
         raw_path = np.array(path)
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] optimization finished; path length: {len(raw_path)}')
+        logger.info(f'[{get_clock_time(milliseconds=True)}] path optimized: {len(raw_path)} pts')
         # postprocess path
         processed_path = self._postprocess_path(raw_path, raw_target_map, object_centric=object_centric)
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] after postprocessing, path length: {len(processed_path)}')
-        print(f'[planners.py | {get_clock_time(milliseconds=True)}] last waypoint: {processed_path[-1]}')
+        logger.info(f'[{get_clock_time(milliseconds=True)}] after postprocessing: {len(processed_path)} pts')
+        logger.debug(f'[{get_clock_time(milliseconds=True)}] last waypoint: {processed_path[-1]}')
         # save info
         info['start_pos'] = start_pos
         info['target_map'] = target_map

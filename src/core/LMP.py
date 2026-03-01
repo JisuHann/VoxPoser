@@ -3,13 +3,15 @@ from time import sleep
 from pygments import highlight
 from pygments.lexers import PythonLexer
 from pygments.formatters import TerminalFormatter
-from utils.utils import load_prompt, DynamicObservation, IterableDynamicObservation
+from utils.utils import load_prompt, DynamicObservation, IterableDynamicObservation, get_logger
 import time
 from utils.LLM_cache import DiskCache
 
+logger = get_logger(__name__)
+
 class LMP:
     """Language Model Program (LMP), adopted from Code as Policies."""
-    def __init__(self, name, cfg, fixed_vars, variable_vars, debug=False, env='rlbench'):
+    def __init__(self, name, cfg, fixed_vars, variable_vars, debug=False, env='rlbench', llm_api_config=None):
         self._name = name
         self._cfg = cfg
         self._debug = debug
@@ -20,9 +22,11 @@ class LMP:
         self.exec_hist = ''
         self._context = None
         self._cache = DiskCache(load_cache=self._cfg['load_cache'])
+        if llm_api_config is None:
+            llm_api_config = {}
         self._client = OpenAI(
-            base_url="http://172.17.0.1:8000/v1", 
-            api_key="api-key-not-required"
+            base_url=llm_api_config.get('base_url', "http://172.17.0.1:8000/v1"),
+            api_key=llm_api_config.get('api_key', "api-key-not-required"),
         )
     def clear_exec_hist(self):
         self.exec_hist = ''
@@ -48,6 +52,35 @@ class LMP:
 
         return prompt, user_query
     
+    def _extract_code(self, msg):
+        """Extract code from API response, handling reasoning model variants.
+
+        - Standard models (Llama, Qwen3-2507): content only
+        - Harmony channel models (gpt-oss-20b): vLLM puts final channel in content,
+          analysis channel in reasoning_content
+        - Think-tag models (e.g. QwQ, Qwen3 with thinking): </think> tag separates
+          reasoning from final answer inside content
+        """
+        content = msg.content or ''
+        reasoning = getattr(msg, 'reasoning_content', None) or ''
+
+        # Strip <think>...</think> block if present in content
+        if '</think>' in content:
+            content = content.split('</think>', 1)[-1].strip()
+            logger.debug('Stripped <think> block from content')
+
+        # Use content (final answer) if non-empty, otherwise fall back to reasoning_content
+        result = content if content.strip() else reasoning
+        if not content.strip() and reasoning:
+            logger.warning(
+                f'[LMP "{self._name}"] content empty, falling back to reasoning_content '
+                f'(model may not have reached final answer)'
+            )
+
+        # Clean up markdown code fences
+        result = result.replace('```python', '').replace('```', '').strip()
+        return result
+
     def _cached_api_call(self, **kwargs):
         user1 = kwargs.pop('prompt')
         new_query = '# Query:' + user1.split('# Query:')[-1]
@@ -70,13 +103,12 @@ class LMP:
         ]
         kwargs['messages'] = messages
         if kwargs in self._cache:
-            print('(using cache)', end=' ')
+            logger.debug('(using cache)')
             return self._cache[kwargs]
         else:
             ret = self._client.chat.completions.create(**kwargs)
-            ret = ret.choices[0].message.content
-            # post processing
-            ret = ret.replace('```', '').replace('python', '').strip()
+            msg = ret.choices[0].message
+            ret = self._extract_code(msg)
             self._cache[kwargs] = ret
             return ret
 
@@ -95,10 +127,9 @@ class LMP:
                 )
                 break
             except Exception as e:
-                print(f'OpenAI API got err {e}')
-                print('Retrying after 3s.')
+                logger.warning(f'API error: {e} — retrying in 3s')
                 sleep(3)
-        print(f'*** OpenAI API call took {time.time() - start_time:.2f}s ***')
+        logger.info(f'[LMP "{self._name}"] API call {time.time() - start_time:.2f}s')
 
         if self._cfg['include_context']:
             assert self._context is not None, 'context is None'
@@ -111,9 +142,9 @@ class LMP:
         to_log_pretty = highlight(to_log, PythonLexer(), TerminalFormatter())
 
         if self._cfg['include_context']:
-            print('#'*40 + f'\n## "{self._name}" generated code\n' + f'## context: "{self._context}"\n' + '#'*40 + f'\n{to_log_pretty}\n')
+            logger.debug('#'*40 + f'\n## "{self._name}" generated code\n## context: "{self._context}"\n' + '#'*40 + f'\n{to_log_pretty}')
         else:
-            print('#'*40 + f'\n## "{self._name}" generated code\n' + '#'*40 + f'\n{to_log_pretty}\n')
+            logger.debug('#'*40 + f'\n## "{self._name}" generated code\n' + '#'*40 + f'\n{to_log_pretty}')
 
         gvars = merge_dicts([self._fixed_vars, self._variable_vars])
         lvars = kwargs
@@ -130,7 +161,7 @@ class LMP:
                 for s in action_str:
                     exec_safe(to_exec.replace(s, f'# {s}'), gvars, lvars)
             except Exception as e:
-                print(f'Error: {e}')
+                logger.error(f'Error: {e}')
                 import pdb ; pdb.set_trace()
         else:
             exec_safe(to_exec, gvars, lvars)
@@ -175,5 +206,6 @@ def exec_safe(code_str, gvars=None, lvars=None):
     try:
         exec(code_str, custom_gvars, lvars)
     except Exception as e:
-        print(f'Error executing code:\n{code_str}')
+        logger.error(f'Error executing code:\n{code_str}')
+        logger.error(f'Error message:\n{e}')
         raise e

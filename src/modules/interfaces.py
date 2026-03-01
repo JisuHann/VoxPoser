@@ -1,5 +1,7 @@
+import os
+
 from core.LMP import LMP
-from utils.utils import get_clock_time, normalize_vector, pointat2quat, bcolors, Observation, VoxelIndexingWrapper
+from utils.utils import get_clock_time, normalize_vector, pointat2quat, bcolors, Observation, VoxelIndexingWrapper, get_logger
 from utils.visualization import save_image, save_array, visualize_voxel, save_map_to_image, save_video_images
 import numpy as np
 from modules.planners import PathPlanner
@@ -9,21 +11,29 @@ import transforms3d
 from modules.controllers import NavigationController, ManipulationController
 from tqdm import tqdm
 from transforms3d.euler import quat2euler
-YAW_THRESHOLD = 0.35
-DIST_THRESHOLD = 0.05
+
+logger = get_logger(__name__)
+YAW_THRESHOLD_DEFAULT = 0.35
+DIST_THRESHOLD_DEFAULT = 0.05
 EE_ALIAS = ['ee', 'endeffector', 'end_effector', 'end effector', 'gripper', 'hand']
 TABLE_ALIAS = ['table', 'desk', 'workstation', 'work_station', 'work station', 'workspace', 'work_space', 'work space']
 
 class LMP_interface():
 
-  def __init__(self, env, lmp_config, controller_config, planner_config, env_name='rlbench'):
+  def __init__(self, env, lmp_config, controller_config, planner_config, env_name='rlbench', nav_controller_config=None, output_dir=None):
     self._env = env
     self._env_name = env_name
     self._cfg = lmp_config
     self._map_size = self._cfg['map_size']
+    self._output_dir = output_dir or "."
     self._planner = PathPlanner(planner_config, map_size=self._map_size)
     self._nav_controller = NavigationController(self._env, controller_config)
     self._manip_controller = ManipulationController(self._env, controller_config)
+    if nav_controller_config is None:
+        nav_controller_config = {}
+    self._yaw_threshold = nav_controller_config.get('yaw_threshold', YAW_THRESHOLD_DEFAULT)
+    self._dist_threshold = nav_controller_config.get('dist_threshold', DIST_THRESHOLD_DEFAULT)
+    self._max_steps_per_waypoint = nav_controller_config.get('max_steps_per_waypoint', 50)
 
     # calculate size of each voxel (resolution)
     self._resolution = (self._env.workspace_bounds_max - self._env.workspace_bounds_min) / self._map_size
@@ -115,7 +125,7 @@ class LMP_interface():
         start_time = time.time()
         path_pixel, planner_info = self._planner.navigation_optimize(start_pos, _affordance_map, _avoidance_map,
                                                                       object_centric=object_centric)
-        print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] planner time: {time.time() - start_time:.3f}s{bcolors.ENDC}')
+        logger.debug(f'[{get_clock_time()}] planner time: {time.time() - start_time:.3f}s')
         assert len(path_pixel) > 0, 'path_pixel is empty'
         step_info['path_pixel'] = path_pixel
         step_info['planner_info'] = planner_info
@@ -131,15 +141,20 @@ class LMP_interface():
         step_info['avoidance_map'] = _avoidance_map
 
         if self._cfg.get('visualize', False):
-          save_map_to_image(_avoidance_map, path_pixel, save_path=f"plan_iter_{plan_iter}.png")
+          save_map_to_image(_avoidance_map, path_pixel, save_path=os.path.join(self._output_dir, f"plan_iter_{plan_iter}.png"))
 
-        print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] start executing path via controller ({len(traj_world)} waypoints){bcolors.ENDC}')
+        logger.debug(f'[{get_clock_time()}] executing path ({len(traj_world)} waypoints)')
         controller_infos = dict()
         step_idx = 0
-        for i, waypoint in tqdm(enumerate(traj_world)):
+
+        for i, waypoint in tqdm(enumerate(traj_world), total=len(traj_world), desc='REACHED waypoint'):
           waypoint_reach = False
-          is_last = i == len(traj_world) - 1
-          dist_threshold = 0.02 if is_last else DIST_THRESHOLD
+          is_last = (i == len(traj_world) - 1) or (i == len(traj_world) - 2)
+          if is_last:
+            logger.debug("skipping last 2 waypoints (is_last=True)")
+            continue
+          dist_threshold = self._dist_threshold
+          wp_step = 0
           while not waypoint_reach:
             if is_last:
               traj_action, dist_to_yaw = self._navigate_to_trajectory(traj_world[i], traj_world[i])
@@ -150,29 +165,32 @@ class LMP_interface():
             cur_yaw = quat2euler(self._env.env._get_observations()['robot0_base_quat'])[0]
             dxy = cur_pos[:2] - waypoint[0]
 
-            if np.linalg.norm(dxy) <= dist_threshold:
-              print(f"{bcolors.OKBLUE}[interfaces.py] REACHED waypoint {i}{bcolors.ENDC}")
-              waypoint_reach = True
-              break
-            else:
-              print(f"{bcolors.OKBLUE}[interfaces.py] Action ({traj_action[0]:.4f},{traj_action[1]:.4f},{traj_action[2]:.4f})  curr=({cur_pos[0]:.4f},{cur_pos[1]:.4f},{cur_yaw:.4f}), target=({waypoint[0][0]:.4f},{waypoint[0][1]:.4f},{waypoint[1]:.4f}) dist=({dxy[0]:.4f},{dxy[1]:.4f},{dist_to_yaw:.4f}){bcolors.ENDC}")
             controller_info['controller_step'] = step_idx
             controller_info['target_waypoint'] = waypoint
             controller_info['robot0_agentview_left_image'] = controller_info['mp_info'][0]['robot0_agentview_left_image'][::-1]
             controller_info['topview_image'] = controller_info['mp_info'][0]['topview_image'][::-1]
             controller_info['posed_person_main_group_1stview_image'] = controller_info['mp_info'][0]['posed_person_main_group_1stview_image'][::-1]
             controller_infos[step_idx] = controller_info
-            save_video_images(controller_infos, keyword='posed_person_main_group_1stview_image', save_path="posed_person_main_group_1stview_image.mp4", verbose=False)
-            save_video_images(controller_infos, keyword='robot0_agentview_left_image', save_path="robot0_agentview_left_image.mp4", verbose=False)
-            save_video_images(controller_infos, keyword='topview_image', save_path="topview_image.mp4", verbose=False)
+            save_video_images(controller_infos, keyword='posed_person_main_group_1stview_image', save_path=os.path.join(self._output_dir, "posed_person_main_group_1stview_image.mp4"))
+            save_video_images(controller_infos, keyword='robot0_agentview_left_image', save_path=os.path.join(self._output_dir, "robot0_agentview_left_image.mp4"))
+            save_video_images(controller_infos, keyword='topview_image', save_path=os.path.join(self._output_dir, "topview_image.mp4"))
             step_idx += 1
+
+            if np.linalg.norm(dxy) <= dist_threshold:
+              waypoint_reach = True
+              break
+
+            wp_step += 1
+            if wp_step >= self._max_steps_per_waypoint:
+              logger.debug(f"waypoint {i} exceeded {self._max_steps_per_waypoint} steps (dist={np.linalg.norm(dxy):.3f}), skipping")
+              break
         step_info['controller_infos'] = controller_infos
         execute_info.append(step_info)
-        curr_pos = movable_obs['position']
+        curr_pos = movable_obs['position'][:2].astype(int)
         if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
-          print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] reached target; terminating{bcolors.ENDC}')
+          logger.info(f'[{get_clock_time()}] reached target; terminating')
           break
-    print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] finished executing navigation{bcolors.ENDC}')
+    logger.info(f'[{get_clock_time()}] finished executing navigation')
     return execute_info
   
   def execute(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,
@@ -218,7 +236,7 @@ class LMP_interface():
         # optimize path and log
         path_voxel, planner_info = self._planner.optimize(start_pos, _affordance_map, _avoidance_map,
                                                         object_centric=object_centric)
-        print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] planner time: {time.time() - start_time:.3f}s{bcolors.ENDC}')
+        logger.debug(f'[{get_clock_time()}] planner time: {time.time() - start_time:.3f}s')
         assert len(path_voxel) > 0, 'path_voxel is empty'
         step_info['path_voxel'] = path_voxel
         step_info['planner_info'] = planner_info
@@ -235,12 +253,12 @@ class LMP_interface():
         step_info['gripper_map'] = _gripper_map
         step_info['avoidance_map'] = _avoidance_map
 
-        print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] start executing path via controller ({len(traj_world)} waypoints){bcolors.ENDC}')
+        logger.debug(f'[{get_clock_time()}] executing path ({len(traj_world)} waypoints)')
         controller_infos = dict()
-        for i, waypoint in enumerate(traj_world):
+        for i, waypoint in tqdm(enumerate(traj_world), total=len(traj_world), desc='waypoint'):
           # check if the movement is finished
           if np.linalg.norm(movable_obs['_position_world'] - traj_world[-1][0]) <= 0.01:
-            print(f"{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] reached last waypoint; curr_xyz={movable_obs['_position_world']}, target={traj_world[-1][0]} (distance: {np.linalg.norm(movable_obs['_position_world'] - traj_world[-1][0]):.3f})){bcolors.ENDC}")
+            logger.info(f"[{get_clock_time()}] reached last waypoint; distance: {np.linalg.norm(movable_obs['_position_world'] - traj_world[-1][0]):.3f}")
             break
           # skip waypoint if moving to this point is going in opposite direction of the final target point
           # (for example, if you have over-pushed an object, no need to move back)
@@ -248,16 +266,16 @@ class LMP_interface():
             movable2target = traj_world[-1][0] - movable_obs['_position_world']
             movable2waypoint = waypoint[0] - movable_obs['_position_world']
             if np.dot(movable2target, movable2waypoint).round(3) <= 0:
-              print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] skip waypoint {i+1} because it is moving in opposite direction of the final target{bcolors.ENDC}')
+              logger.debug(f'[{get_clock_time()}] skip waypoint {i+1} (opposite direction)')
               continue
           controller_info = self._manip_controller.execute(movable_obs, waypoint)
           # logging
           movable_obs = movable_obs_func()
           dist2target = np.linalg.norm(movable_obs['_position_world'] - traj_world[-1][0])
           if not object_centric and controller_info['mp_info'] == -1:
-            print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] failed waypoint {i+1} (wp: {waypoint[0].round(3)}, actual: {movable_obs["_position_world"].round(3)}, target: {traj_world[-1][0].round(3)}, start: {traj_world[0][0].round(3)}, dist2target: {dist2target.round(3)}); mp info: {controller_info["mp_info"]}{bcolors.ENDC}')
+            logger.info(f'[{get_clock_time()}] failed waypoint {i+1} dist2target: {dist2target.round(3)}')
           else:
-            print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] completed waypoint {i+1} (wp: {waypoint[0].round(3)}, actual: {movable_obs["_position_world"].round(3)}, target: {traj_world[-1][0].round(3)}, start: {traj_world[0][0].round(3)}, dist2target: {dist2target.round(3)}){bcolors.ENDC}')
+            logger.info(f'[{get_clock_time()}] completed waypoint {i+1} dist2target: {dist2target.round(3)}')
           controller_info['controller_step'] = i
           controller_info['target_waypoint'] = waypoint
           controller_info['robot0_agentview_left_image'] = controller_info['mp_info'][0]['robot0_agentview_left_image'][::-1]
@@ -268,9 +286,9 @@ class LMP_interface():
         # check whether we need to replan
         curr_pos = movable_obs['position']
         if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
-          print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] reached target; terminating {bcolors.ENDC}')
+          logger.info(f'[{get_clock_time()}] reached target; terminating')
           break
-    print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] finished executing path via controller{bcolors.ENDC}')
+    logger.info(f'[{get_clock_time()}] finished executing path')
 
     # make sure we are at the final target position and satisfy any additional parametrization
     # (skip if we are specifying object-centric motion)
@@ -311,7 +329,11 @@ class LMP_interface():
       return int(cm / z_resolution)
     else:
       # calculate index along the direction
-      assert isinstance(direction, np.ndarray) and direction.shape == (3,)
+      if not isinstance(direction, np.ndarray):
+        direction = np.array(direction, dtype=float)
+      if direction.shape == (2,):
+        direction = np.append(direction, 0.0)
+      assert direction.shape == (3,), f"cm2index: expected 3D direction, got shape {direction.shape}"
       direction = normalize_vector(direction)
       x_cm = cm * direction[0]
       y_cm = cm * direction[1]
@@ -502,7 +524,7 @@ class LMP_interface():
         # if the closest distance is less than threshold, then set gripper to less common value
         if closest_distance <= 3:
           gripper = less_common_value
-          print(f'{bcolors.OKBLUE}[interfaces.py | {get_clock_time()}] overwriting gripper to less common value for the last waypoint{bcolors.ENDC}')
+          logger.debug(f'[{get_clock_time()}] overwriting gripper to less common value')
       # add to trajectory
       traj.append((world_xyz, rotation, velocity, gripper))
     # append the last waypoint a few more times for the robot to stabilize
@@ -519,10 +541,8 @@ class LMP_interface():
       world_xy = self._voxel_to_world(np.array([path_idx[0], path_idx[1], 0]))[:2]
       if initial_filtering:
           if np.linalg.norm(world_xy - cur_xy) < 0.4:
-            print(f"Filtered {world_xy}")
             continue
           else:
-            print(f"Filtering stop at {world_xy}")
             initial_filtering = False
       voxel_xy = np.round(path_idx).astype(int)
       rotation = rotation_map[voxel_xy[0], voxel_xy[1]]
@@ -553,7 +573,7 @@ class LMP_interface():
     v_x = dx * np.cos(cur_yaw) + dy * np.sin(cur_yaw)
     v_y = -dx * np.sin(cur_yaw) + dy * np.cos(cur_yaw)
     action = np.zeros(3)
-    if abs(delta_yaw)  < YAW_THRESHOLD:
+    if abs(delta_yaw)  < self._yaw_threshold:
       action[0] = v_x * goal_vel * kp
       action[1] = v_y * goal_vel * kp
     action[2] = delta_yaw * goal_vel * kp
@@ -599,14 +619,16 @@ class LMP_interface():
     world_xy = self._voxel_to_world(np.array([1,1,0]))[:2] - self._voxel_to_world(np.array([0,0,0]))[:2]
     return world_xy
 
-def setup_LMP(env, general_config, debug=False):
+def setup_LMP(env, general_config, debug=False, output_dir=None):
   controller_config = general_config['controller']
   planner_config = general_config['planner']
   lmp_env_config = general_config['lmp_config']['env']
   lmps_config = general_config['lmp_config']['lmps']
   env_name = general_config['env_name']
+  llm_api_config = general_config.get('llm_api', {})
+  nav_controller_config = general_config.get('navigation_controller', {})
   # LMP env wrapper
-  lmp_env = LMP_interface(env, lmp_env_config, controller_config, planner_config, env_name=env_name)
+  lmp_env = LMP_interface(env, lmp_env_config, controller_config, planner_config, env_name=env_name, nav_controller_config=nav_controller_config, output_dir=output_dir)
   # creating APIs that the LMPs can interact with
   fixed_vars = {
       'np': np,
@@ -621,22 +643,22 @@ def setup_LMP(env, general_config, debug=False):
   }  # our custom APIs exposed to LMPs
 
   # allow LMPs to access other LMPs
-  lmp_names = [name for name in lmps_config.keys() if not name in ['composer', 'planner', 'config']]
+  lmp_names = [name for name in lmps_config.keys() if not name in ['composer', 'planner', 'config'] and lmps_config[name] is not None]
   low_level_lmps = {
-      k: LMP(k, lmps_config[k], fixed_vars, variable_vars, debug, env_name)
+      k: LMP(k, lmps_config[k], fixed_vars, variable_vars, debug, env_name, llm_api_config=llm_api_config)
       for k in lmp_names
   }
   variable_vars.update(low_level_lmps)
 
   # creating the LMP for skill-level composition
   composer = LMP(
-      'composer', lmps_config['composer'], fixed_vars, variable_vars, debug, env_name
+      'composer', lmps_config['composer'], fixed_vars, variable_vars, debug, env_name, llm_api_config=llm_api_config
   )
   variable_vars['composer'] = composer
 
   # creating the LMP that deals w/ high-level language commands
   task_planner = LMP(
-      'planner', lmps_config['planner'], fixed_vars, variable_vars, debug, env_name
+      'planner', lmps_config['planner'], fixed_vars, variable_vars, debug, env_name, llm_api_config=llm_api_config
   )
 
   lmps = {
@@ -698,7 +720,7 @@ def pc2pixel_map(points, pixel_bounds_robot_min, pixel_bounds_robot_max, map_siz
   points = points.astype(np.float32)
   # z-range filtering
   z_min = points[:, 2].min() + 0.05 if z_min is None else z_min
-  print("z min:", z_min)
+  logger.debug(f"z min: {z_min}")
   points = points[points[:, 2] >= z_min]
   if z_max is not None:
       points = points[points[:, 2] <= z_max]

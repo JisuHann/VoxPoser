@@ -1,4 +1,5 @@
 import os
+import logging
 import numpy as np
 import numpy as np
 import plotly.graph_objects as go
@@ -28,6 +29,93 @@ class bcolors:
     ENDC = '\033[0m'
     BOLD = '\033[1m'
     UNDERLINE = '\033[4m'
+
+
+class ColorFormatter(logging.Formatter):
+    COLORS = {
+        logging.DEBUG:    bcolors.OKCYAN,
+        logging.WARNING:  bcolors.WARNING,
+        logging.ERROR:    bcolors.FAIL,
+    }
+    def format(self, record):
+        color = self.COLORS.get(record.levelno, '')
+        msg = super().format(record)
+        return f"{color}{msg}{bcolors.ENDC}" if color else msg
+
+
+_OUR_LOGGERS = []
+_HANDLER = None
+
+
+def setup_logging(verbose=False):
+    """Configure logging. Our loggers are isolated (propagate=False).
+    Default: INFO only (no third-party noise).
+    -v: DEBUG from our loggers + WARNING from third-party."""
+    global _HANDLER
+    our_level = logging.DEBUG if verbose else logging.INFO
+    _HANDLER = logging.StreamHandler()
+    _HANDLER.setFormatter(ColorFormatter("%(message)s"))
+    _HANDLER.setLevel(logging.DEBUG)
+    # root: -v shows third-party WARNING, otherwise silent
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.WARNING if verbose else logging.CRITICAL)
+    root.addHandler(_HANDLER)
+    # suppress robosuite noise: remove its handlers and set level
+    for name in ('robosuite', 'robosuite_logs'):
+        tp = logging.getLogger(name)
+        tp.handlers.clear()
+        tp.setLevel(logging.CRITICAL if not verbose else logging.WARNING)
+        tp.propagate = False  # don't let it reach root either
+    # attach handler to our loggers
+    for lgr in _OUR_LOGGERS:
+        lgr.handlers.clear()
+        lgr.addHandler(_HANDLER)
+        lgr.setLevel(our_level)
+
+
+def get_logger(name):
+    """Return an isolated module logger (propagate=False, own handler)."""
+    lgr = logging.getLogger(name)
+    if lgr not in _OUR_LOGGERS:
+        _OUR_LOGGERS.append(lgr)
+        lgr.setLevel(logging.INFO)
+        lgr.propagate = False
+        if _HANDLER is not None:
+            lgr.addHandler(_HANDLER)
+    return lgr
+
+
+_FILE_HANDLER = None
+
+
+def add_file_handler(path):
+    """Add a plain-text FileHandler to all our loggers (no ANSI codes)."""
+    global _FILE_HANDLER
+    import re as _re
+    _ansi = _re.compile(r'\x1b\[[0-9;]*m')
+
+    class _PlainFormatter(logging.Formatter):
+        def format(self, record):
+            return _ansi.sub('', super().format(record))
+
+    _FILE_HANDLER = logging.FileHandler(path, encoding='utf-8')
+    _FILE_HANDLER.setFormatter(_PlainFormatter("%(message)s"))
+    _FILE_HANDLER.setLevel(logging.DEBUG)
+    for lgr in _OUR_LOGGERS:
+        lgr.addHandler(_FILE_HANDLER)
+    return _FILE_HANDLER
+
+
+def remove_file_handler():
+    """Remove the file handler added by add_file_handler."""
+    global _FILE_HANDLER
+    if _FILE_HANDLER is None:
+        return
+    for lgr in _OUR_LOGGERS:
+        lgr.removeHandler(_FILE_HANDLER)
+    _FILE_HANDLER.close()
+    _FILE_HANDLER = None
 
 def load_prompt(prompt_fname):
     # get current directory
@@ -113,7 +201,7 @@ class DynamicObservation:
         try:
             assert callable(func) and not isinstance(func, dict), 'func must be callable or cannot be a dict'
         except AssertionError as e:
-            print(e)
+            get_logger(__name__).error(str(e))
             import pdb; pdb.set_trace()
         self.func = func
     
@@ -186,7 +274,7 @@ def visualize_points(point_cloud, point_colors=None, show=True):
     else:
         # save to html
         fig.write_html('temp_pc.html')
-        print(f'Point cloud saved to temp_pc.html')
+        get_logger(__name__).debug('Point cloud saved to temp_pc.html')
 
 def _process_llm_index(indices, array_shape):
     """
@@ -223,14 +311,14 @@ def _process_llm_index(indices, array_shape):
             _process_llm_index(idx, (array_shape[i],)) for i, idx in enumerate(indices)
         )
     elif isinstance(indices, np.ndarray):
-        print("[IndexingWrapper] Warning: numpy array indexing was converted to list")
+        get_logger(__name__).warning("[IndexingWrapper] numpy array indexing was converted to list")
         processed = _process_llm_index(indices.tolist(), array_shape)
     else:
-        print(f"[IndexingWrapper] {indices} (type: {type(indices)}) not supported")
+        get_logger(__name__).error(f"[IndexingWrapper] {indices} (type: {type(indices)}) not supported")
         raise TypeError("Indexing type not supported")
     # give warning if index was negative
     if processed != indices:
-        print(f"[IndexingWrapper] Warning: index was changed from {indices} to {processed}")
+        get_logger(__name__).warning(f"[IndexingWrapper] index was changed from {indices} to {processed}")
     # print(f"[IndexingWrapper] {idx} -> {processed}")
     return processed
 

@@ -3,6 +3,9 @@ import plotly.graph_objects as go
 import numpy as np
 import os
 import datetime
+from utils.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class ValueMapVisualizer:
@@ -115,7 +118,7 @@ class ValueMapVisualizer:
 
         # visualize scene points
         if self.scene_points is None:
-            print('no scene points to overlay, skipping...')
+            logger.debug('no scene points to overlay, skipping...')
             scene_points = None
         else:
             scene_points, scene_point_colors = self.scene_points
@@ -156,11 +159,11 @@ class ValueMapVisualizer:
             log_id = f'{curr_time.hour}:{curr_time.minute}:{curr_time.second}'
             save_path = os.path.join(self.save_dir, log_id + '.html')
             latest_save_path = os.path.join(self.save_dir, 'latest.html')
-            print('** saving visualization to', save_path, '...')
+            logger.debug(f'saving visualization to {save_path}')
             fig.write_html(save_path)
-            print('** saving visualization to', latest_save_path, '...')
+            logger.debug(f'saving visualization to {latest_save_path}')
             fig.write_html(latest_save_path)
-            print(f'** save to {save_path}')
+            logger.debug(f'saved to {save_path}')
         if show:
             fig.show()
 

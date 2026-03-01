@@ -2,6 +2,7 @@ task:
   robot: "PandaOmron"
   camera_widths: 640
   camera_heights: 480
+  camera_names: ['robot0_robotview', 'robot0_agentview_center', 'robot0_agentview_left', 'robot0_agentview_right', 'robot0_frontview', 'robot0_eye_in_hand']
   layout_ids: 0
   style_ids: 0
   offscreen_render: True
@@ -15,6 +16,15 @@ navigation:
     stop_threshold: 0.01
     obstacle_map_gaussian_sigma: 5
     max_curvature: 5
+  navigation_controller:
+    yaw_threshold: 0.35
+    dist_threshold: 0.05
+    max_steps_per_waypoint: 50
+  lmp_config:
+    env:
+      visualize: False
+    lmps:
+      get_gripper_map: null
 
 manipulation:
   env_name: robocasa_manipulation
@@ -47,6 +57,10 @@ visualizer:
   quality: low
   map_size: 100
 
+llm_api:
+  base_url: "http://172.17.0.1:8000/v1"
+  api_key: "api-key-not-required"
+
 lmp_config:
   env:
     map_size: 100
@@ -56,8 +70,8 @@ lmp_config:
   lmps:
     planner:
       prompt_fname: planner_prompt
-      model: Qwen/Qwen3-4B-Instruct-2507
-      max_tokens: 512
+
+      max_tokens: 4096
       temperature: 0
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -71,8 +85,8 @@ lmp_config:
       load_cache: True
     composer:
       prompt_fname: composer_prompt
-      model: Qwen/Qwen3-4B-Instruct-2507
-      max_tokens: 512
+
+      max_tokens: 4096
       temperature: 0
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -86,8 +100,8 @@ lmp_config:
       load_cache: True
     parse_query_obj:
       prompt_fname: parse_query_obj_prompt
-      model: Qwen/Qwen3-4B-Instruct-2507
-      max_tokens: 512
+
+      max_tokens: 4096
       temperature: 0
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -101,8 +115,8 @@ lmp_config:
       load_cache: True
     get_affordance_map:
       prompt_fname: get_affordance_map_prompt
-      model: Qwen/Qwen3-4B-Instruct-2507
-      max_tokens: 512
+
+      max_tokens: 4096
       temperature: 0
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -116,8 +130,8 @@ lmp_config:
       load_cache: True
     get_avoidance_map:
       prompt_fname: get_avoidance_map_prompt
-      model: Qwen/Qwen3-4B-Instruct-2507
-      max_tokens: 512
+
+      max_tokens: 4096
       temperature: 0
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -131,8 +145,8 @@ lmp_config:
       load_cache: True
     get_velocity_map:
       prompt_fname: get_velocity_map_prompt
-      model: Qwen/Qwen3-4B-Instruct-2507
-      max_tokens: 512
+
+      max_tokens: 4096
       temperature: 0
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -146,8 +160,8 @@ lmp_config:
       load_cache: True
     get_rotation_map:
       prompt_fname: get_rotation_map_prompt
-      model: Qwen/Qwen3-4B-Instruct-2507
-      max_tokens: 512
+
+      max_tokens: 4096
       temperature: 0
       query_prefix: '# Query: '
       query_suffix: '.'
@@ -161,8 +175,8 @@ lmp_config:
       load_cache: True
     get_gripper_map:
       prompt_fname: get_gripper_map_prompt
-      model: Qwen/Qwen3-4B-Instruct-2507
-      max_tokens: 512
+
+      max_tokens: 4096
       temperature: 0
       query_prefix: '# Query: '
       query_suffix: '.'

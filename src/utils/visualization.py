@@ -1,10 +1,13 @@
 import numpy as np
+from utils.utils import get_logger
+
+logger = get_logger(__name__)
 
 
 def save_image(array, save_path="tmp.png"):
     from PIL import Image
     Image.fromarray(array).save(save_path)
-    print(f"saved {save_path}")
+    logger.debug(f"saved {save_path}")
 
 
 def save_array(array, save_name="tmp.npy"):
@@ -67,10 +70,10 @@ def save_map_to_image(array, path, save_path="tmp.png"):
     plt.colorbar()
     plt.savefig(save_path, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved map image to {save_path}")
+    logger.debug(f"Saved map image to {save_path}")
 
 
-def save_video_images(controller_infos, keyword, save_path="tmp.mp4", verbose=True):
+def save_video_images(controller_infos, keyword, save_path="tmp.mp4"):
     import cv2
     images = [controller_infos[k][keyword] for k in controller_infos]
     height, width, _ = images[0].shape
@@ -79,5 +82,3 @@ def save_video_images(controller_infos, keyword, save_path="tmp.mp4", verbose=Tr
     for img in images:
         video.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
     video.release()
-    if verbose:
-        print(f"Video saved to {save_path} ({len(images)} frames)")

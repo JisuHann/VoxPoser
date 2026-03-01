@@ -1,10 +1,11 @@
 import numpy as np
 from transforms3d.quaternions import mat2quat
-from utils.utils import normalize_vector
+from utils.utils import normalize_vector, get_logger
 import copy
 import time
 from modules.dynamics_models import PushingDynamicsModel
 
+logger = get_logger(__name__)
 EE_ALIAS = ['ee', 'endeffector', 'end_effector', 'end effector', 'gripper', 'hand']
 
 
@@ -65,13 +66,13 @@ class ManipulationController:
 
         self.env.close_gripper()
         self.env.move_to_pose(np.concatenate([t_start, ee_quat]), speed=target_velocity)
-        print('[controllers.py] moved to start pose', end='; ')
+        logger.debug('moved to start pose')
         self.env.move_to_pose(np.concatenate([t_interact, ee_quat]), speed=target_velocity * 0.2)
-        print('[controllers.py] moved to final pose', end='; ')
+        logger.debug('moved to final pose')
         self.env.move_to_pose(np.concatenate([t_rest, ee_quat]), speed=target_velocity * 0.33)
-        print('[controllers.py] back to release pose', end='; ')
+        logger.debug('back to release pose')
         self.env.reset_to_default_pose()
-        print('[controllers.py] back to default pose')
+        logger.debug('back to default pose')
 
     def execute(self, movable_obs, waypoint):
         """
@@ -93,10 +94,10 @@ class ManipulationController:
             start = time.time()
             movable_obs = {key: value for key, value in movable_obs.items() if key in ['_point_cloud_world']}
             best_control, self.mpc_info = self.random_shooting_MPC(movable_obs, target_xyz)
-            print('[controllers.py] mpc search completed in {} seconds with {} samples'.format(time.time() - start, self.config.num_samples))
+            logger.debug('mpc search: {:.2f}s, {} samples'.format(time.time() - start, self.config.num_samples))
             self.mpc_velocity = target_velocity
             self._apply_mpc_control(best_control[0])
-            print(f'[controllers.py] applied control (pos: {best_control[0][:3].round(4)}, dir: {best_control[0][3:6].round(4)}, dist: {best_control[0][6:].round(4)})')
+            logger.info(f'applied control pos:{best_control[0][:3].round(4)} dir:{best_control[0][3:6].round(4)} dist:{best_control[0][6:].round(4)}')
             info['mpc_info'] = self.mpc_info
             info['mpc_control'] = best_control[0]
         return info
