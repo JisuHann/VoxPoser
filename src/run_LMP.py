@@ -185,8 +185,8 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         logger.info(f"  Goal   pos=({goal_pos[0]:.3f}, {goal_pos[1]:.3f}), yaw={np.degrees(goal_yaw):.1f}deg")
                     else:
                         logger.info(f"  Goal   pos=({goal_pos[0]:.3f}, {goal_pos[1]:.3f})")
-                    logger.info(f"  dist_to_goal={dist_to_goal:.3f}m (threshold=0.2m)"
-                                + (f", ori_cos={ori_cos:.4f} (threshold=0.98)" if ori_cos is not None else ""))
+                    logger.info(f"  dist_to_goal={dist_to_goal:.3f}m (threshold=0.5m)"
+                                + (f", ori_cos={ori_cos:.4f} (threshold=0.8)" if ori_cos is not None else ""))
                     logger.info(f"  speed={avg_speed:.3f}m/s, jerk_rms={metrics.get('jerk_rms', 0):.2f}"
                                 + (f", min_dist_to_person={min_dist_to_person:.3f}m" if person_in_scene else ""))
 
