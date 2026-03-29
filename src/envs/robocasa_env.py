@@ -98,7 +98,18 @@ class VoxPoserRobocasa():
             for cam in self.camera_names:
                 seg = self.env.sim.render(camera_name=cam, height=self.map_size, width=self.map_size, segmentation=True)[:,:,1]
                 visible_geom_ids = np.unique(seg)
-                visible_objs = set([self.env.sim.model.body_id2name(self.env.sim.model.geom_bodyid[int(gid)]).split("_")[0] for gid in visible_geom_ids if gid >= 0 and self.env.sim.model.geom_id2name(int(gid)) is not None])
+                visible_objs = set()
+                for gid in visible_geom_ids:
+                    if gid < 0:
+                        continue
+                    if self.env.sim.model.geom_id2name(int(gid)) is None:
+                        continue
+                    body_name = self.env.sim.model.body_id2name(
+                        self.env.sim.model.geom_bodyid[int(gid)]
+                    )
+                    if body_name is None:
+                        continue
+                    visible_objs.add(body_name.split("_")[0])
                 visible_objects.extend(visible_objs)
             visible_objects = list(set(visible_objects))
         else:
@@ -128,6 +139,32 @@ class VoxPoserRobocasa():
                 if obj in name:
                     self.name2ids[obj].append(i)
                     
+    # Default cameras for VLM: robot front view, human 1st-person view, top-down view
+    _DEFAULT_VLM_CAMERAS = ['robot0_frontview', 'posed_person_main_group_1stview', 'topview']
+
+    def get_representative_images(self, cam_names=None):
+        """Get camera view images for VLM input.
+
+        Args:
+            cam_names: list of camera names. If None, uses 2 representative cameras.
+
+        Returns:
+            list of numpy RGB arrays (H, W, 3).
+        """
+        if cam_names is None:
+            cam_names = [c for c in self._DEFAULT_VLM_CAMERAS if c in self.camera_names]
+            if not cam_names:
+                cam_names = self.camera_names[:2]
+        self.update_latest_obs()
+        images = []
+        for cam in cam_names:
+            key = f'{cam}_image'
+            if key in self.latest_obs:
+                images.append(self.latest_obs[key])
+            else:
+                logger.warning(f"Camera '{cam}' image not found in observations")
+        return images
+
     def update_latest_obs(self):
         """
         Docstring for update_latest_obs
@@ -204,14 +241,14 @@ class VoxPoserRobocasa():
         rgb_o3d = o3d.geometry.Image(rgb.astype(np.uint8))
         depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
-            rgb_o3d, depth_o3d, 
-            depth_scale=1.0, 
-            depth_trunc=MAX_DEPTH + 1.0, 
+            rgb_o3d, depth_o3d,
+            depth_scale=1.0,
+            depth_trunc=MAX_DEPTH + 1.0,
             convert_rgb_to_intensity=False
         )
         intrinsic = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic)
-        
+
         # 카메라 좌표계 점들
         points_cam = np.asarray(pcd.points)
         colors = np.asarray(pcd.colors)
@@ -229,8 +266,8 @@ class VoxPoserRobocasa():
         # 월드 좌표로 변환
         points_world = (cam_rot @ points_cam.T).T + cam_pos
         point_cloud = np.hstack([points_world, colors])
-        if len(point_cloud) ==0:
-            breakpoint()
+        if len(point_cloud) == 0:
+            raise ValueError(f"Empty point cloud from camera '{cam_name}'")
         return point_cloud
     
     def fetch_obj_segmentation(self, cam_name, query_name):
@@ -270,11 +307,13 @@ class VoxPoserRobocasa():
             flip_indices = np.dot(cam_normals, self.lookat_vectors[cam]) > 0
             cam_normals[flip_indices] *= -1
             normals.append(cam_normals)
+            logger.info(f"[DEBUG] cam={cam}: pc={points[-1].shape}, img={colors[-1].shape}, mask={masks[-1].shape}, normals={cam_normals.shape}")
 
         points = np.concatenate(points, axis=0)
         colors = np.concatenate(colors, axis=0)
         masks = np.concatenate(masks, axis=0)
         normals = np.concatenate(normals, axis=0)
+        logger.info(f"[DEBUG] points={points.shape}, colors={colors.shape}, masks={masks.shape}, normals={normals.shape}")
     
         # Set workspace bound min/max at initial stage
         if query_name is None:
@@ -295,8 +334,11 @@ class VoxPoserRobocasa():
             obj_ids = self.name2ids[query_name]
         except Exception as e:
             # use mapped name from MOBILE_ALIAS
-            mapped_name = dict(map(reversed, MOBILE_ALIAS.items()))[query_name]
-            obj_ids = self.name2ids[mapped_name]
+            try:
+                mapped_name = dict(map(reversed, MOBILE_ALIAS.items()))[query_name]
+                obj_ids = self.name2ids[mapped_name]
+            except KeyError:
+                raise KeyError(f"'{query_name}' not found in scene objects or MOBILE_ALIAS")
         try:
             obj_points = points[np.isin(masks, obj_ids)]
             if len(obj_points) == 0 or len(obj_ids) == 0:
@@ -305,8 +347,7 @@ class VoxPoserRobocasa():
             obj_normals = normals[np.isin(masks, obj_ids)]
             obj_points, obj_colors, obj_normals = self.remove_obj_pc_outlier(obj_points, obj_colors, obj_normals)
         except Exception as e:
-            logger.error(str(e))
-            breakpoint()
+            raise ValueError(f"Object '{query_name}' point cloud error: {e}")
         # self.visualize_3d_space(obj_points)
         # voxel downsample using o3d
         pcd = o3d.geometry.PointCloud()

@@ -1,13 +1,26 @@
+import ast
+import bdb
+import base64
+import io
+import textwrap
 from openai import OpenAI
 from time import sleep
 from pygments import highlight
 from pygments.lexers import PythonLexer
 from pygments.formatters import TerminalFormatter
+from PIL import Image
 from utils.utils import load_prompt, DynamicObservation, IterableDynamicObservation, get_logger
 import time
 from utils.LLM_cache import DiskCache
 
 logger = get_logger(__name__)
+
+_VLM_PATTERNS = ['vl', 'vision', 'pixtral', 'llava', 'internvl']
+
+def is_vlm(model_name):
+    """Check if a model name indicates a Vision-Language Model."""
+    name = model_name.lower()
+    return any(p in name for p in _VLM_PATTERNS)
 
 class LMP:
     """Language Model Program (LMP), adopted from Code as Policies."""
@@ -21,11 +34,12 @@ class LMP:
         self._variable_vars = variable_vars
         self.exec_hist = ''
         self._context = None
+        self._images = None
         self._cache = DiskCache(load_cache=self._cfg['load_cache'])
         if llm_api_config is None:
             llm_api_config = {}
         self._client = OpenAI(
-            base_url=llm_api_config.get('base_url', "http://172.17.0.1:8000/v1"),
+            base_url=llm_api_config.get('base_url', "http://localhost:8000/v1"),
             api_key=llm_api_config.get('api_key', "api-key-not-required"),
         )
     def clear_exec_hist(self):
@@ -79,12 +93,94 @@ class LMP:
 
         # Clean up markdown code fences
         result = result.replace('```python', '').replace('```', '').strip()
+
+        # Strip import lines (exec_safe bans them; fixed_vars already provides imports)
+        lines = result.split('\n')
+        import_stripped = [l for l in lines if not l.strip().startswith(('import ', 'from '))]
+        if len(import_stripped) < len(lines):
+            logger.debug(f'[LMP "{self._name}"] stripped {len(lines) - len(import_stripped)} import line(s)')
+            result = '\n'.join(import_stripped).strip()
+
+        # Validate as Python; if invalid, filter out natural-language lines
+        try:
+            ast.parse(result)
+        except SyntaxError:
+            lines = result.split('\n')
+            filtered = []
+            for line in lines:
+                stripped = line.strip()
+                if not stripped or stripped.startswith('#'):
+                    filtered.append(line)
+                    continue
+                try:
+                    ast.parse(stripped)
+                    filtered.append(line)
+                except SyntaxError:
+                    logger.debug(f'[LMP "{self._name}"] filtered non-code line: {stripped[:80]}')
+            new_result = '\n'.join(filtered).strip()
+            n_removed = len(lines) - len(filtered)
+            if n_removed > 0:
+                logger.warning(
+                    f'[LMP "{self._name}"] filtered {n_removed} '
+                    f'natural-language line(s) from LLM output'
+                )
+            # Use filtered result even if empty (model produced no valid code)
+            result = new_result
+            if not result:
+                logger.warning(f'[LMP "{self._name}"] no valid Python code after filtering')
+
+        # Fix indentation leaking from CoT reasoning (e.g. Qwen-Thinking)
+        if result:
+            dedented = textwrap.dedent(result).strip()
+            if dedented != result.strip():
+                logger.debug(f'[LMP "{self._name}"] dedented code output')
+                result = dedented
+
+        # Fix broken indentation: lines indented without a preceding control statement
+        if result:
+            try:
+                ast.parse(result)
+            except SyntaxError:
+                lines = result.split('\n')
+                fixed = []
+                for i, line in enumerate(lines):
+                    if not line.strip():
+                        fixed.append(line)
+                        continue
+                    indent = len(line) - len(line.lstrip())
+                    prev_indent = len(fixed[-1]) - len(fixed[-1].lstrip()) if fixed and fixed[-1].strip() else 0
+                    # Line jumps in indent without a control statement on previous line
+                    if indent > prev_indent and fixed:
+                        prev_stripped = fixed[-1].rstrip()
+                        if prev_stripped and not prev_stripped.endswith(':'):
+                            # Dedent this line to match previous level
+                            fixed.append(' ' * prev_indent + line.lstrip())
+                            continue
+                    fixed.append(line)
+                new_result = '\n'.join(fixed)
+                try:
+                    ast.parse(new_result)
+                    logger.warning(f'[LMP "{self._name}"] fixed broken indentation')
+                    result = new_result
+                except SyntaxError:
+                    pass  # keep original if fix didn't help
+
         return result
+
+    @staticmethod
+    def _encode_image(img_array):
+        """Encode numpy RGB array to base64 JPEG string."""
+        img = Image.fromarray(img_array)
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG')
+        return base64.b64encode(buf.getvalue()).decode('utf-8')
 
     def _cached_api_call(self, **kwargs):
         user1 = kwargs.pop('prompt')
         new_query = '# Query:' + user1.split('# Query:')[-1]
-        user1 = ''.join(user1.split('# Query:')[:-1]).strip()
+        # Preserve '# Query:' in few-shot examples (only remove the last one which is the actual query)
+        parts = user1.split('# Query:')
+        user1 = '# Query:'.join(parts[:-1]).strip()
         user1 = f"I would like you to help me write Python code to control a robot arm operating in a tabletop environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
         assistant1 = f'Got it. I will complete what you give me next.'
         user2 = new_query
@@ -95,21 +191,59 @@ class LMP:
             user1 = '\n'.join(user1.split('\n')[:-4]) + '\n' + '\n'.join(user1.split('\n')[-3:])
             # add obj_context to user2
             user2 = obj_context.strip() + '\n' + user2
+        # Use 'developer' role for GPT-oss harmony channel compatibility;
+        # standard models treat 'developer' same as 'system'
+        sys_content = "You are a helpful assistant that pays attention to the user's instructions and writes good python code for operating a robot arm in a tabletop environment."
+        model_name = kwargs.get('model', '')
+        if 'gpt-oss' in model_name or 'gpt_oss' in model_name:
+            sys_role = 'developer'
+        else:
+            sys_role = 'system'
+        # Build the last user message: multimodal if model is VLM and images are available
+        attach_images = self._images and is_vlm(model_name)
+        if attach_images:
+            user2_content = [{"type": "text", "text": user2}]
+            for img in self._images:
+                b64 = self._encode_image(img)
+                user2_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+                })
+            logger.debug(f'[LMP "{self._name}"] attaching {len(self._images)} image(s) to request')
+        else:
+            user2_content = user2
         messages=[
-            {"role": "system", "content": "You are a helpful assistant that pays attention to the user's instructions and writes good python code for operating a robot arm in a tabletop environment."},
+            {"role": sys_role, "content": sys_content},
             {"role": "user", "content": user1},
             {"role": "assistant", "content": assistant1},
-            {"role": "user", "content": user2},
+            {"role": "user", "content": user2_content},
         ]
         kwargs['messages'] = messages
-        if kwargs in self._cache:
+        # Disable thinking mode for Qwen3 hybrid models (not Instruct-2507 which has no thinking)
+        extra_body = None
+        if 'qwen3' in model_name.lower() and 'instruct-2507' not in model_name.lower():
+            extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
+            logger.debug(f'[LMP "{self._name}"] disabling Qwen3 thinking mode')
+        elif 'gpt-oss' in model_name or 'gpt_oss' in model_name:
+            extra_body = {"reasoning_effort": "low"}
+            logger.debug(f'[LMP "{self._name}"] setting GPT-oss reasoning_effort=low')
+        # Cache disabled — always call API fresh
+        use_cache = False
+        cache_key = dict(kwargs)
+        if extra_body:
+            cache_key['extra_body'] = extra_body
+        if use_cache and cache_key in self._cache:
             logger.debug('(using cache)')
-            return self._cache[kwargs]
+            return self._cache[cache_key]
         else:
-            ret = self._client.chat.completions.create(**kwargs)
+            create_kwargs = dict(kwargs)
+            if extra_body:
+                create_kwargs['extra_body'] = extra_body
+            ret = self._client.chat.completions.create(**create_kwargs)
             msg = ret.choices[0].message
             ret = self._extract_code(msg)
-            self._cache[kwargs] = ret
+            if use_cache:
+                self._cache[cache_key] = ret
             return ret
 
     def __call__(self, query, **kwargs):
@@ -151,6 +285,8 @@ class LMP:
 
         # return function instead of executing it so we can replan using latest obs（do not do this for high-level UIs)
         if not self._name in ['composer', 'planner']:
+            if not to_exec.strip():
+                return None
             to_exec = 'def ret_val():\n' + to_exec.replace('ret_val = ', 'return ')
             to_exec = to_exec.replace('\n', '\n    ')
 
@@ -205,6 +341,8 @@ def exec_safe(code_str, gvars=None, lvars=None):
     ])
     try:
         exec(code_str, custom_gvars, lvars)
+    except bdb.BdbQuit:
+        raise
     except Exception as e:
         logger.error(f'Error executing code:\n{code_str}')
         logger.error(f'Error message:\n{e}')

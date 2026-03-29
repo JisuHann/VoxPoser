@@ -12,6 +12,18 @@ def set_lmp_objects(lmps, objects):
     for lmp in lmps:
         lmp._context = f'objects = {objects}'
 
+def set_lmp_images(lmps, images):
+    """Set camera images on all LMPs for VLM-based inference.
+
+    Args:
+        lmps: dict or iterable of LMP instances.
+        images: list of numpy RGB arrays, or None to clear.
+    """
+    if isinstance(lmps, dict):
+        lmps = lmps.values()
+    for lmp in lmps:
+        lmp._images = images
+
 def get_clock_time(milliseconds=False):
     curr_time = datetime.datetime.now()
     if milliseconds:
@@ -182,7 +194,7 @@ class IterableDynamicObservation:
             item = evaluated[index]
             # assert isinstance(item, Observation), f'got type {type(item)} instead of Observation'
             return item
-        return helper
+        return DynamicObservation(helper)
 
     def __len__(self):
         return len(self.func())
