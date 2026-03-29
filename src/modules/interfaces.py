@@ -46,6 +46,24 @@ class LMP_interface():
   
   def detect(self, obj_name):
     """return an observation dict containing useful information about the object"""
+    print("object name:", obj_name)
+    # if obj_name.lower() == 'robot_mobile_base':
+    #   import sys, os, logging
+    #   # sys.stdout is redirected to log file by run_LMP.py
+    #   # restore it to terminal for pdb interaction
+    #   logging.disable(logging.CRITICAL)
+    #   _saved_stdout = sys.stdout
+    #   sys.stdout = sys.__stdout__
+    #   sys.stderr = sys.__stderr__
+    #   print("\n" + "="*60)
+    #   print("PDB_BREAKPOINT_HIT: detect('robot_mobile_base')")
+    #   print("="*60)
+    #   sys.stdout.flush()
+    #   breakpoint()
+    #   # restore after continuing
+    #   sys.stdout = _saved_stdout
+    #   sys.stderr = sys.__stderr__
+    #   logging.disable(logging.NOTSET)
     if obj_name.lower() in EE_ALIAS:
       obs_dict = dict()
       obs_dict['name'] = obj_name
@@ -149,10 +167,7 @@ class LMP_interface():
 
         for i, waypoint in tqdm(enumerate(traj_world), total=len(traj_world), desc='REACHED waypoint'):
           waypoint_reach = False
-          is_last = (i == len(traj_world) - 1) or (i == len(traj_world) - 2)
-          if is_last:
-            logger.debug("skipping last 2 waypoints (is_last=True)")
-            continue
+          is_last = (i == len(traj_world) - 1)
           dist_threshold = self._dist_threshold
           wp_step = 0
           while not waypoint_reach:
@@ -171,14 +186,20 @@ class LMP_interface():
             controller_info['topview_image'] = controller_info['mp_info'][0]['topview_image'][::-1]
             controller_info['posed_person_main_group_1stview_image'] = controller_info['mp_info'][0]['posed_person_main_group_1stview_image'][::-1]
             controller_infos[step_idx] = controller_info
-            save_video_images(controller_infos, keyword='posed_person_main_group_1stview_image', save_path=os.path.join(self._output_dir, "posed_person_main_group_1stview_image.mp4"))
-            save_video_images(controller_infos, keyword='robot0_agentview_left_image', save_path=os.path.join(self._output_dir, "robot0_agentview_left_image.mp4"))
-            save_video_images(controller_infos, keyword='topview_image', save_path=os.path.join(self._output_dir, "topview_image.mp4"))
             step_idx += 1
 
             if np.linalg.norm(dxy) <= dist_threshold:
-              waypoint_reach = True
-              break
+              last_yaw = np.asarray(waypoint[1]).item() if np.asarray(waypoint[1]).size == 1 else 0.0
+              if is_last and last_yaw != 0.0:
+                # Last waypoint with target yaw: also check orientation
+                yaw_error = abs((last_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi)
+                if yaw_error < 0.785:  # ~45 degrees
+                  waypoint_reach = True
+                  break
+                # Position OK but yaw not aligned yet — keep rotating
+              else:
+                waypoint_reach = True
+                break
 
             wp_step += 1
             if wp_step >= self._max_steps_per_waypoint:
@@ -190,6 +211,11 @@ class LMP_interface():
         if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
           logger.info(f'[{get_clock_time()}] reached target; terminating')
           break
+    # Save videos once after all waypoints are done
+    if controller_infos:
+        save_video_images(controller_infos, keyword='posed_person_main_group_1stview_image', save_path=os.path.join(self._output_dir, "posed_person_main_group_1stview_image.mp4"))
+        save_video_images(controller_infos, keyword='robot0_agentview_left_image', save_path=os.path.join(self._output_dir, "robot0_agentview_left_image.mp4"))
+        save_video_images(controller_infos, keyword='topview_image', save_path=os.path.join(self._output_dir, "topview_image.mp4"))
     logger.info(f'[{get_clock_time()}] finished executing navigation')
     return execute_info
   
@@ -317,6 +343,19 @@ class LMP_interface():
 
     return execute_info
   
+  def yaw_toward(self, from_pos, to_pos):
+    """Compute yaw angle (radians) from from_pos toward to_pos.
+
+    Args:
+      from_pos: [x, y, ...] source position
+      to_pos: [x, y, ...] target position
+    Returns:
+      float: yaw in radians
+    """
+    dx = float(to_pos[0]) - float(from_pos[0])
+    dy = float(to_pos[1]) - float(from_pos[1])
+    return float(np.arctan2(dy, dx))
+
   def cm2index(self, cm, direction):
     if isinstance(direction, str) and direction == 'x':
       x_resolution = self._resolution[0] * 100  # resolution is in m, we need cm
@@ -548,6 +587,14 @@ class LMP_interface():
       rotation = rotation_map[voxel_xy[0], voxel_xy[1]]
       velocity = velocity_map[voxel_xy[0], voxel_xy[1]]
       traj.append((world_xy, rotation, velocity))
+    # Inject target orientation into last waypoint
+    if len(traj) > 0:
+      target_ori = getattr(self._env.env, 'target_ori', None)
+      if target_ori is not None:
+        last_wp = traj[-1]
+        target_yaw = float(target_ori[2])
+        traj[-1] = (last_wp[0], target_yaw, last_wp[2])
+        logger.debug(f'[{get_clock_time()}] injected target_yaw={np.degrees(target_yaw):.1f}deg into last waypoint')
     return traj
   
   def _navigate_to_trajectory(self, waypoint, to_waypoint, kp=10):
@@ -563,8 +610,11 @@ class LMP_interface():
     L = 0.3
     target_xy = goal_xy + seg_dir * min(L, seg_len)
     is_last = np.array_equal(goal_xy, target_xy)
-    if not is_last or (is_last and goal_yaw == 0):
-      goal_yaw = np.arctan2(seg_dir[1], seg_dir[0])
+    goal_yaw_scalar = np.asarray(goal_yaw).item() if np.asarray(goal_yaw).size == 1 else 0.0
+    if not is_last or (is_last and goal_yaw_scalar == 0):
+      goal_yaw = float(np.arctan2(seg_dir[1], seg_dir[0]))
+    else:
+      goal_yaw = goal_yaw_scalar
 
     dx = goal_xy[0] - cur_xy[0]
     dy = goal_xy[1] - cur_xy[1]
