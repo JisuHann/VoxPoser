@@ -1,6 +1,7 @@
 import numpy as np
 from perception_utils import parse_query_obj
 from plan_utils import get_empty_avoidance_map, set_pixel_by_radius, cm2index
+# Note: use exact object names from the objects list as variable names (e.g. dining_table, not table).
 
 # Query: 10cm from the bowl.
 avoidance_map = get_empty_avoidance_map(task='navigation')
@@ -22,15 +23,20 @@ bowl = parse_query_obj('bowl')
 set_pixel_by_radius(avoidance_map, bowl.position, radius_cm=10, value=1)
 ret_val = avoidance_map
 
-# Query: 10cm from anything fragile.
+# Query: 10cm from the stove, sink, and counter.
 avoidance_map = get_empty_avoidance_map(task='navigation')
-fragile_objects = parse_query_obj('anything fragile')
-for obj in fragile_objects:
-    set_pixel_by_radius(avoidance_map, obj.position, radius_cm=10, value=1)
+stove = parse_query_obj('stove')
+set_pixel_by_radius(avoidance_map, stove.position, radius_cm=10, value=1)
+sink = parse_query_obj('sink')
+set_pixel_by_radius(avoidance_map, sink.position, radius_cm=10, value=1)
+counter = parse_query_obj('counter')
+set_pixel_by_radius(avoidance_map, counter.position, radius_cm=10, value=1)
 ret_val = avoidance_map
 
-# Query: 10cm from the blue circle.
+# Query: 15cm from the person and 10cm from the fridge.
 avoidance_map = get_empty_avoidance_map(task='navigation')
-blue_circle = parse_query_obj('blue circle')
-set_pixel_by_radius(avoidance_map, blue_circle.position, radius_cm=10, value=1)
+person = parse_query_obj('person')
+set_pixel_by_radius(avoidance_map, person.position, radius_cm=15, value=1)
+fridge = parse_query_obj('fridge')
+set_pixel_by_radius(avoidance_map, fridge.position, radius_cm=10, value=1)
 ret_val = avoidance_map

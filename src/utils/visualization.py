@@ -74,11 +74,23 @@ def save_map_to_image(array, path, save_path="tmp.png"):
 
 
 def save_video_images(controller_infos, keyword, save_path="tmp.mp4"):
-    import cv2
+    import cv2, subprocess, tempfile, os
     images = [controller_infos[k][keyword] for k in controller_infos]
     height, width, _ = images[0].shape
+    # Write with mp4v first, then re-encode to H.264 for browser/VSCode playback
+    tmp_path = save_path + ".tmp.mp4"
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    video = cv2.VideoWriter(save_path, fourcc, 24, (width, height))
+    video = cv2.VideoWriter(tmp_path, fourcc, 24, (width, height))
     for img in images:
         video.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
     video.release()
+    # Re-encode to H.264
+    try:
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", tmp_path, "-c:v", "libx264", "-pix_fmt", "yuv420p",
+             "-movflags", "+faststart", "-loglevel", "error", save_path],
+            check=True)
+        os.remove(tmp_path)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        # ffmpeg unavailable — fall back to mp4v file
+        os.replace(tmp_path, save_path)

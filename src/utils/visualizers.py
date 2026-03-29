@@ -17,6 +17,7 @@ class ValueMapVisualizer:
         self.save_dir = config['save_dir']
         if self.save_dir is not None:
             os.makedirs(self.save_dir, exist_ok=True)
+            os.chmod(self.save_dir, 0o777)
         self.quality = config['quality']
         self.update_quality(self.quality)
         self.map_size = config['map_size']

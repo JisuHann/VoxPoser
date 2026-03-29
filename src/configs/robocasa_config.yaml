@@ -76,13 +76,13 @@ lmp_config:
       query_prefix: '# Query: '
       query_suffix: '.'
       stop:
-        - '# Query: '
-        - 'objects = '
+        - "\n# Query: "
+        - "\nobjects = "
       maintain_session: False
       include_context: True
       has_return: False
       return_val_name: ret_val
-      load_cache: True
+      load_cache: False
     composer:
       prompt_fname: composer_prompt
 
@@ -91,13 +91,13 @@ lmp_config:
       query_prefix: '# Query: '
       query_suffix: '.'
       stop:
-        - '# Query: '
-        - 'objects ='
+        - "\n# Query: "
+        - "\nobjects ="
       maintain_session: False
       include_context: False
       has_return: False
       return_val_name: ret_val
-      load_cache: True
+      load_cache: False
     parse_query_obj:
       prompt_fname: parse_query_obj_prompt
 
@@ -106,13 +106,13 @@ lmp_config:
       query_prefix: '# Query: '
       query_suffix: '.'
       stop:
-        - '# Query: '
-        - 'objects ='
+        - "\n# Query: "
+        - "\nobjects ="
       maintain_session: False
       include_context: True
       has_return: True
       return_val_name: ret_val
-      load_cache: True
+      load_cache: False
     get_affordance_map:
       prompt_fname: get_affordance_map_prompt
 
@@ -121,13 +121,13 @@ lmp_config:
       query_prefix: '# Query: '
       query_suffix: '.'
       stop:
-        - '# Query: '
-        - 'objects ='
+        - "\n# Query: "
+        - "\nobjects ="
       maintain_session: False
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
+      load_cache: False
     get_avoidance_map:
       prompt_fname: get_avoidance_map_prompt
 
@@ -136,13 +136,13 @@ lmp_config:
       query_prefix: '# Query: '
       query_suffix: '.'
       stop:
-        - '# Query: '
-        - 'objects ='
+        - "\n# Query: "
+        - "\nobjects ="
       maintain_session: False
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
+      load_cache: False
     get_velocity_map:
       prompt_fname: get_velocity_map_prompt
 
@@ -151,13 +151,13 @@ lmp_config:
       query_prefix: '# Query: '
       query_suffix: '.'
       stop:
-        - '# Query: '
-        - 'objects ='
+        - "\n# Query: "
+        - "\nobjects ="
       maintain_session: False
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
+      load_cache: False
     get_rotation_map:
       prompt_fname: get_rotation_map_prompt
 
@@ -166,13 +166,13 @@ lmp_config:
       query_prefix: '# Query: '
       query_suffix: '.'
       stop:
-        - '# Query: '
-        - 'objects ='
+        - "\n# Query: "
+        - "\nobjects ="
       maintain_session: False
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
+      load_cache: False
     get_gripper_map:
       prompt_fname: get_gripper_map_prompt
 
@@ -181,10 +181,10 @@ lmp_config:
       query_prefix: '# Query: '
       query_suffix: '.'
       stop:
-        - '# Query: '
-        - 'objects ='
+        - "\n# Query: "
+        - "\nobjects ="
       maintain_session: False
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
+      load_cache: False
