@@ -16,7 +16,7 @@ navigation:
     stop_threshold: 0.01
     obstacle_map_gaussian_sigma: 5
     max_curvature: 5
-    obstacle_map_weight: 0.5
+    obstacle_map_weight: 20
   navigation_controller:
     yaw_threshold: 0.35
     dist_threshold: 0.05
