@@ -1,7 +1,7 @@
 import os
 
 from core.LMP import LMP
-from utils.utils import get_clock_time, normalize_vector, pointat2quat, bcolors, Observation, VoxelIndexingWrapper, get_logger
+from utils.utils import get_clock_time, normalize_vector, pointat2quat, bcolors, Observation, VoxelIndexingWrapper, get_logger, DynamicObservation
 from utils.visualization import save_image, save_array, visualize_voxel, save_map_to_image, save_video_images
 import numpy as np
 from modules.planners import PathPlanner
@@ -13,6 +13,16 @@ from tqdm import tqdm
 from transforms3d.euler import quat2euler
 
 logger = get_logger(__name__)
+
+def _vec2quat(*args):
+    """Convert a direction vector to a quaternion (yaw rotation in the xy-plane).
+    Accepts either vec2quat(v) or vec2quat(ai, aj, ak) (euler-like, for LLM compatibility)."""
+    if len(args) == 3:
+        return transforms3d.euler.euler2quat(args[0], args[1], args[2])
+    v = np.asarray(args[0], dtype=float)
+    yaw = np.arctan2(v[1], v[0]) if np.linalg.norm(v[:2]) > 1e-8 else 0.0
+    return transforms3d.euler.euler2quat(yaw, 0, 0)
+
 YAW_THRESHOLD_DEFAULT = 0.35
 DIST_THRESHOLD_DEFAULT = 0.05
 EE_ALIAS = ['ee', 'endeffector', 'end_effector', 'end effector', 'gripper', 'hand']
@@ -111,7 +121,7 @@ class LMP_interface():
       visualize_voxel(voxel_maps, voxel_size)
 
   def execute_navigation(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,
-              velocity_map=None):
+              velocity_map=None, **kwargs):
     """
     Plan a navigation path then follow it with the controller.
 
@@ -122,6 +132,11 @@ class LMP_interface():
       rotation_map: callable returning 2D rotation map
       velocity_map: callable returning 2D velocity map
     """
+    # VLM-generated code may pass an already-evaluated Observation instead of a callable.
+    # Wrap non-callable observations so the rest of the pipeline works.
+    if not callable(movable_obs_func):
+      obs = movable_obs_func
+      movable_obs_func = lambda: obs
     if rotation_map is None:
       rotation_map = self._get_default_voxel_map('rotation', task='navigation')
     if velocity_map is None:
@@ -130,6 +145,7 @@ class LMP_interface():
       avoidance_map = self._get_default_voxel_map('obstacle', task='navigation')
     object_centric = False
     execute_info = []
+    controller_infos = dict()
     if affordance_map is not None:
       for plan_iter in range(self._cfg['max_plan_iter']):
         step_info = dict()
@@ -182,9 +198,18 @@ class LMP_interface():
 
             controller_info['controller_step'] = step_idx
             controller_info['target_waypoint'] = waypoint
-            controller_info['robot0_agentview_left_image'] = controller_info['mp_info'][0]['robot0_agentview_left_image'][::-1]
-            controller_info['topview_image'] = controller_info['mp_info'][0]['topview_image'][::-1]
-            controller_info['posed_person_main_group_1stview_image'] = controller_info['mp_info'][0]['posed_person_main_group_1stview_image'][::-1]
+            # Capture every VLM-input camera viewpoint for downstream review.
+            # Keep `robot0_agentview_left` for legacy compat.
+            for _vlm_cam in (
+                'topview',
+                'robot0_frontview',
+                'robot0_agentview_center',
+                'posed_person_main_group_1stview',
+                'robot0_agentview_left',
+            ):
+                _key = f"{_vlm_cam}_image"
+                if _key in controller_info['mp_info'][0]:
+                    controller_info[_key] = controller_info['mp_info'][0][_key][::-1]
             controller_infos[step_idx] = controller_info
             step_idx += 1
 
@@ -211,11 +236,27 @@ class LMP_interface():
         if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
           logger.info(f'[{get_clock_time()}] reached target; terminating')
           break
-    # Save videos once after all waypoints are done
+    # Save one mp4 per VLM-input camera so downstream review/labeling can
+    # reproduce exactly what the VLM sees at inference. `_DEFAULT_VLM_CAMERAS`
+    # in robocasa_env.py is the canonical list; legacy `robot0_agentview_left`
+    # kept for backward compat with prior runs.
+    _SAVE_CAMS = (
+        'topview',
+        'robot0_frontview',
+        'robot0_agentview_center',
+        'posed_person_main_group_1stview',
+        'robot0_agentview_left',
+    )
     if controller_infos:
-        save_video_images(controller_infos, keyword='posed_person_main_group_1stview_image', save_path=os.path.join(self._output_dir, "posed_person_main_group_1stview_image.mp4"))
-        save_video_images(controller_infos, keyword='robot0_agentview_left_image', save_path=os.path.join(self._output_dir, "robot0_agentview_left_image.mp4"))
-        save_video_images(controller_infos, keyword='topview_image', save_path=os.path.join(self._output_dir, "topview_image.mp4"))
+        for _cam in _SAVE_CAMS:
+            _kw = f"{_cam}_image"
+            # Only save if at least one frame actually has this camera.
+            if any(_kw in v for v in controller_infos.values()):
+                save_video_images(
+                    controller_infos,
+                    keyword=_kw,
+                    save_path=os.path.join(self._output_dir, f"{_kw}.mp4"),
+                )
     logger.info(f'[{get_clock_time()}] finished executing navigation')
     return execute_info
   
@@ -421,6 +462,8 @@ class LMP_interface():
   
   def set_pixel_by_radius(self, pixel_map, pixel_xy, radius_cm=0, value=1):
     """given a 2D np array, set the value of the pixel at pixel_xy to value. If radius is specified, set the value of all pixels within the radius to value."""
+    if pixel_map is None or pixel_xy is None:
+        return pixel_map
     pixel_map[pixel_xy[0], pixel_xy[1]] = value
     if radius_cm > 0:
       radius_x = self.cm2index(radius_cm, 'x')
@@ -573,6 +616,8 @@ class LMP_interface():
   
   def _path2traj_navigation(self, path, avoidance_map, rotation_map, velocity_map):
     """Convert pixel path to navigation trajectory with rotation and velocity."""
+    if velocity_map is None:
+      velocity_map = np.ones((self._map_size, self._map_size))
     traj = []
     cur_xy = self._env.env._get_observations()['robot0_base_pos'][:2]
     initial_filtering = True
@@ -589,12 +634,34 @@ class LMP_interface():
       traj.append((world_xy, rotation, velocity))
     # Inject target orientation into last waypoint
     if len(traj) > 0:
-      target_ori = getattr(self._env.env, 'target_ori', None)
-      if target_ori is not None:
-        last_wp = traj[-1]
-        target_yaw = float(target_ori[2])
-        traj[-1] = (last_wp[0], target_yaw, last_wp[2])
-        logger.debug(f'[{get_clock_time()}] injected target_yaw={np.degrees(target_yaw):.1f}deg into last waypoint')
+      dst_is_human = getattr(self._env.env, 'dst_is_human', False)
+      if dst_is_human:
+        # For human targets: compute yaw dynamically from last waypoint to person position.
+        # Using static sink→person angle fails when robot approaches from off-axis.
+        person_pos = getattr(self._env.env, 'target_pos', None)
+        if person_pos is not None:
+          last_wp = traj[-1]
+          dir_to_person = np.array(person_pos[:2]) - np.array(last_wp[0])
+          dist = np.linalg.norm(dir_to_person)
+          if dist > 0.1:
+            target_yaw = float(np.arctan2(dir_to_person[1], dir_to_person[0]))
+          elif len(traj) >= 2:
+            # Path ends at person — use final approach direction
+            prev_wp = traj[-2][0]
+            dir_approach = np.array(last_wp[0]) - np.array(prev_wp)
+            target_yaw = float(np.arctan2(dir_approach[1], dir_approach[0]))
+          else:
+            target_yaw = None
+          if target_yaw is not None:
+            traj[-1] = (last_wp[0], target_yaw, last_wp[2])
+            logger.debug(f'[{get_clock_time()}] injected human target_yaw={np.degrees(target_yaw):.1f}deg (dist_to_person={dist:.2f}m)')
+      else:
+        target_ori = getattr(self._env.env, 'target_ori', None)
+        if target_ori is not None:
+          last_wp = traj[-1]
+          target_yaw = float(target_ori[2])
+          traj[-1] = (last_wp[0], target_yaw, last_wp[2])
+          logger.debug(f'[{get_clock_time()}] injected target_yaw={np.degrees(target_yaw):.1f}deg into last waypoint')
     return traj
   
   def _navigate_to_trajectory(self, waypoint, to_waypoint, kp=10):
@@ -653,13 +720,26 @@ class LMP_interface():
 
   def _preprocess_avoidance_pixel_map(self, avoidance_map, affordance_map, movable_obs, robot_radius=0.35):
     scene_collision_map = self._get_scene_collision_pixel_map()
+    target_idx = np.unravel_index(np.argmax(affordance_map), affordance_map.shape)
+    # Clear scene_collision near target so robot can approach through fixture geometry.
+    # r=10px ~= 1m at 0.1m/px — enough to let robot reach within success threshold.
+    r_scene = 10
+    sy0 = max(0, target_idx[0]-r_scene); sy1 = min(scene_collision_map.shape[0], target_idx[0]+r_scene)
+    sx0 = max(0, target_idx[1]-r_scene); sx1 = min(scene_collision_map.shape[1], target_idx[1]+r_scene)
+    scene_collision_map[sy0:sy1, sx0:sx1] = 0
+    # Clear LLM avoidance near affordance target so robot can approach within threshold.
+    r = 6
+    y0, y1 = max(0, target_idx[0]-r), min(avoidance_map.shape[0], target_idx[0]+r)
+    x0, x1 = max(0, target_idx[1]-r), min(avoidance_map.shape[1], target_idx[1]+r)
+    avoidance_map[y0:y1, x0:x1] = 0
     # clear collision around robot start position so it can move out
     start_pos = movable_obs['position']
     ignore_mask = np.ones_like(avoidance_map)
     xy = self._compute_pixel_resolution()
     margin = np.ceil(robot_radius/xy)+1
-    ignore_mask[start_pos[0] - int(margin[0]):start_pos[0] + int(margin[0]),
-                start_pos[1] - int(margin[1]):start_pos[1] + int(margin[1])] = 0
+    sp0, sp1 = int(start_pos[0]), int(start_pos[1])
+    m0, m1 = int(margin[0]), int(margin[1])
+    ignore_mask[sp0 - m0:sp0 + m0, sp1 - m1:sp1 + m1] = 0
     scene_collision_map *= ignore_mask
     avoidance_map += scene_collision_map
     avoidance_map = np.clip(avoidance_map, 0, 1)
@@ -680,17 +760,26 @@ def setup_LMP(env, general_config, debug=False, output_dir=None):
   # LMP env wrapper
   lmp_env = LMP_interface(env, lmp_env_config, controller_config, planner_config, env_name=env_name, nav_controller_config=nav_controller_config, output_dir=output_dir)
   # creating APIs that the LMPs can interact with
+  import time as _time
   fixed_vars = {
       'np': np,
       'euler2quat': transforms3d.euler.euler2quat,
       'quat2euler': transforms3d.euler.quat2euler,
       'qinverse': transforms3d.quaternions.qinverse,
       'qmult': transforms3d.quaternions.qmult,
+      'vec2quat': _vec2quat,
+      'time': _time,
   }  # external library APIs
   variable_vars = {
       k: getattr(lmp_env, k)
       for k in dir(lmp_env) if callable(getattr(lmp_env, k)) and not k.startswith("_")
   }  # our custom APIs exposed to LMPs
+
+  # Pre-define 'movable' as the robot mobile base so LLM-generated code that omits
+  # `movable = parse_query_obj('mobile_base')` still has it in scope.
+  # Use DynamicObservation so detect() is called lazily (after env.load_task()).
+  if 'navigation' in env_name:
+      variable_vars['movable'] = DynamicObservation(lambda: lmp_env.detect('mobile_base'))
 
   # allow LMPs to access other LMPs
   lmp_names = [name for name in lmps_config.keys() if not name in ['composer', 'planner', 'config'] and lmps_config[name] is not None]
@@ -699,6 +788,21 @@ def setup_LMP(env, general_config, debug=False, output_dir=None):
       for k in lmp_names
   }
   variable_vars.update(low_level_lmps)
+
+  # Wrap parse_query_obj to return a safe fallback Observation when object not found,
+  # preventing 'NoneType' crashes in LLM-generated map code.
+  # Must be placed AFTER variable_vars.update(low_level_lmps) so the LMP version is wrapped.
+  _SAFE_FALLBACK_OBS = Observation({'position': np.array([0.0, 0.0, 0.0]),
+                                    'normal': np.array([0.0, 0.0, 1.0]),
+                                    'aabb': np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])})
+  _orig_parse_query_obj = variable_vars.get('parse_query_obj', lmp_env.detect)
+  def _safe_parse_query_obj(query):
+      try:
+          result = _orig_parse_query_obj(query)
+          return result if result is not None else _SAFE_FALLBACK_OBS
+      except Exception:
+          return _SAFE_FALLBACK_OBS
+  variable_vars['parse_query_obj'] = _safe_parse_query_obj
 
   # creating the LMP for skill-level composition
   composer = LMP(

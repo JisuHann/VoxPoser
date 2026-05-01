@@ -16,10 +16,11 @@ navigation:
     stop_threshold: 0.01
     obstacle_map_gaussian_sigma: 5
     max_curvature: 5
+    obstacle_map_weight: 0.5
   navigation_controller:
     yaw_threshold: 0.35
     dist_threshold: 0.05
-    max_steps_per_waypoint: 50
+    max_steps_per_waypoint: 100
   lmp_config:
     env:
       visualize: False
@@ -70,6 +71,15 @@ lmp_config:
   lmps:
     planner:
       prompt_fname: planner_prompt
+      # Default prompt_extra: empty (Qwen baseline). Model-specific overrides below.
+      prompt_extra: ''
+      model_prompts:
+        # Models that fail to call composer() without explicit instruction
+        deepseek: "IMPORTANT: Your output MUST contain ONLY composer() calls — nothing else. Do NOT define functions, classes, dictionaries, or variables. Do NOT use names like safety_radii, speed_multipliers, or any variable not in the examples. Just call composer() with a natural language description, exactly like the examples above, then write # done."
+        llava: "IMPORTANT: Your output MUST call the composer() function at least once. Do NOT define helper functions, dictionaries, or classes. Just call composer() with a natural language description of the navigation action, exactly like the examples above."
+        internvl: "IMPORTANT: Your output MUST call the composer() function at least once. Do NOT define helper functions, dictionaries, or classes. Just call composer() with a natural language description of the navigation action, exactly like the examples above."
+        gpt-oss: "IMPORTANT: Your output MUST contain ONLY composer() calls — nothing else. Do NOT define functions, classes, dictionaries, or variables. Just call composer() with a natural language description, exactly like the examples above, then write # done."
+        glm: "IMPORTANT: Your output MUST call the composer() function at least once. Do NOT define helper functions, dictionaries, or classes. Do NOT repeat the objects list or query. Just call composer() with a natural language description of the navigation action, exactly like the examples above, then write # done."
 
       max_tokens: 4096
       temperature: 0

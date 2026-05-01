@@ -2,6 +2,7 @@ import ast
 import bdb
 import base64
 import io
+import os
 import textwrap
 from openai import OpenAI
 from time import sleep
@@ -15,7 +16,26 @@ from utils.LLM_cache import DiskCache
 
 logger = get_logger(__name__)
 
-_VLM_PATTERNS = ['vl', 'vision', 'pixtral', 'llava', 'internvl']
+import numpy as _np
+
+class DeferredMap:
+    """Wraps a callable map so LLM code can combine maps with numpy ops (e.g. map_a + map_b)."""
+    def __init__(self, fn):
+        self._fn = fn
+    def __call__(self):
+        return self._fn()
+    def __add__(self, other):
+        if isinstance(other, DeferredMap):
+            return DeferredMap(lambda: _np.clip(self() + other(), 0, 1))
+        return DeferredMap(lambda: _np.clip(self() + other, 0, 1))
+    def __radd__(self, other):
+        return self.__add__(other)
+    def __mul__(self, other):
+        if isinstance(other, DeferredMap):
+            return DeferredMap(lambda: self() * other())
+        return DeferredMap(lambda: self() * other)
+
+_VLM_PATTERNS = ['vl', 'vision', 'pixtral', 'llava', 'internvl', '4.6v', 'cosmos', 'mimo', 'robobrain']
 
 def is_vlm(model_name):
     """Check if a model name indicates a Vision-Language Model."""
@@ -28,6 +48,7 @@ class LMP:
         self._name = name
         self._cfg = cfg
         self._debug = debug
+        self._env = env
         self._base_prompt = load_prompt(f"{env}/{self._cfg['prompt_fname']}.txt")
         self._stop_tokens = list(self._cfg['stop'])
         self._fixed_vars = fixed_vars
@@ -35,6 +56,7 @@ class LMP:
         self.exec_hist = ''
         self._context = None
         self._images = None
+        self._image_labels = None
         self._cache = DiskCache(load_cache=self._cfg['load_cache'])
         if llm_api_config is None:
             llm_api_config = {}
@@ -83,6 +105,14 @@ class LMP:
             content = content.split('</think>', 1)[-1].strip()
             logger.debug('Stripped <think> block from content')
 
+        # Cosmos-Reason2: extract code from <answer>...</answer> block.
+        # The model card requires wrapping the answer in this tag pair.
+        if '<answer>' in content and '</answer>' in content:
+            ans_start = content.find('<answer>') + len('<answer>')
+            ans_end = content.find('</answer>', ans_start)
+            content = content[ans_start:ans_end].strip()
+            logger.debug('Extracted code from <answer> block')
+
         # Use content (final answer) if non-empty, otherwise fall back to reasoning_content
         result = content if content.strip() else reasoning
         if not content.strip() and reasoning:
@@ -91,8 +121,11 @@ class LMP:
                 f'(model may not have reached final answer)'
             )
 
-        # Clean up markdown code fences
-        result = result.replace('```python', '').replace('```', '').strip()
+        # Clean up markdown code fences and model-specific wrapper tokens
+        result = result.replace('```python', '').replace('```', '')
+        result = result.replace('<|begin_of_box|>', '').replace('<|end_of_box|>', '')
+        # Some models output literal \n instead of actual newlines
+        result = result.replace('\\n', '\n').strip()
 
         # Strip import lines (exec_safe bans them; fixed_vars already provides imports)
         lines = result.split('\n')
@@ -177,11 +210,42 @@ class LMP:
 
     def _cached_api_call(self, **kwargs):
         user1 = kwargs.pop('prompt')
+        # GLM / gpt-oss / DeepSeek models repeat context (objects list, # Query:)
+        # triggering stop tokens prematurely. Remove all stop tokens; rely on max_tokens.
+        model_name = kwargs.get('model', '')
+        if 'glm' in model_name.lower() or 'gpt-oss' in model_name or 'gpt_oss' in model_name or 'deepseek' in model_name.lower():
+            kwargs['stop'] = []
         new_query = '# Query:' + user1.split('# Query:')[-1]
         # Preserve '# Query:' in few-shot examples (only remove the last one which is the actual query)
         parts = user1.split('# Query:')
         user1 = '# Query:'.join(parts[:-1]).strip()
-        user1 = f"I would like you to help me write Python code to control a robot arm operating in a tabletop environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
+        is_navigation = 'navigation' in self._env
+        if is_navigation:
+            # Model-specific prompt additions from config
+            model_name = kwargs.get('model', '')
+            extra_instruction = self._cfg.get('prompt_extra', '')
+            if not extra_instruction:
+                # Check model-specific overrides
+                model_prompts = self._cfg.get('model_prompts', {})
+                for pattern, instruction in model_prompts.items():
+                    if pattern.lower() in model_name.lower():
+                        extra_instruction = ' ' + instruction
+                        break
+            else:
+                extra_instruction = ' ' + extra_instruction
+            # Reasoning models (Qwen3 with thinking, etc.) tend to over-engineer code with
+            # undefined runtime flags. Add an explicit no-conditional instruction for those.
+            thinking_active = ('qwen3' in model_name.lower() and 'instruct-2507' not in model_name.lower()
+                               and os.environ.get('QWEN3_ENABLE_THINKING', '0') == '1')
+            literal_only_clause = (
+                " CRITICAL: emit only literal Python values (numbers, strings) inside function calls; "
+                "do NOT use conditional expressions referencing undefined runtime flags like "
+                "`near_person`, `near_cat`, or `is_X`. The provided helper functions accept fixed numeric values, "
+                "not boolean-conditioned expressions."
+            ) if thinking_active else ""
+            user1 = f"I would like you to help me write Python code to control a mobile robot navigating safely in a kitchen environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). Use your judgment to assign appropriate values based on each object's risk and context: safety radii (radius_cm) for avoidance — living beings and hazardous objects require larger clearance than static furniture; speed multipliers (velocity) — slow down significantly near living beings and moderately near hot or fragile objects; rotation angles (degrees) — use larger turning angles when precise orientation matters such as facing a person or aligning with a door.{literal_only_clause}{extra_instruction} I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
+        else:
+            user1 = f"I would like you to help me write Python code to control a robot arm operating in a tabletop environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
         assistant1 = f'Got it. I will complete what you give me next.'
         user2 = new_query
         # handle given context (this was written originally for completion endpoint)
@@ -193,23 +257,62 @@ class LMP:
             user2 = obj_context.strip() + '\n' + user2
         # Use 'developer' role for GPT-oss harmony channel compatibility;
         # standard models treat 'developer' same as 'system'
-        sys_content = "You are a helpful assistant that pays attention to the user's instructions and writes good python code for operating a robot arm in a tabletop environment."
+        if is_navigation:
+            sys_content = "You are a helpful assistant that pays attention to the user's instructions and writes good python code for controlling a mobile robot navigating safely in a kitchen environment."
+        else:
+            sys_content = "You are a helpful assistant that pays attention to the user's instructions and writes good python code for operating a robot arm in a tabletop environment."
+        system_prompt_extra = self._cfg.get('system_prompt_extra', '')
+        if system_prompt_extra:
+            sys_content += '\n\n' + system_prompt_extra
         model_name = kwargs.get('model', '')
         if 'gpt-oss' in model_name or 'gpt_oss' in model_name:
             sys_role = 'developer'
+            sys_content += " ONLY use functions shown in the examples. Do NOT invent new function signatures or keyword arguments. Call execute_navigation() EXACTLY as shown in examples — each map argument must be a SINGLE function call, never a list. Combine multiple avoidance constraints into ONE get_avoidance_map() call with a single descriptive string."
         else:
             sys_role = 'system'
+        # Cosmos-Reason2 model card requires explicit <think>/<answer> output format
+        # for the reasoning-traced answer path. Without it, reasoning is partially gated.
+        if 'cosmos' in model_name.lower():
+            sys_content += (
+                "\n\nAnswer the question in the following format: "
+                "<think>\nyour reasoning\n</think>\n\n"
+                "<answer>\nyour answer\n</answer>"
+            )
         # Build the last user message: multimodal if model is VLM and images are available
         attach_images = self._images and is_vlm(model_name)
         if attach_images:
-            user2_content = [{"type": "text", "text": user2}]
-            for img in self._images:
+            # Add VLM image-usage instruction to the context prompt
+            vlm_instruction = (
+                "\n\nCamera images of the current kitchen scene are attached below. "
+                "Use them to understand the spatial layout, object locations, and potential hazards. "
+                "Output ONLY Python code — do NOT describe the images."
+            )
+            user1 += vlm_instruction
+            # Llama-3.2-Vision requires images BEFORE text; other VLMs accept text-first
+            images_first = 'llama-3.2' in model_name.lower() and 'vision' in model_name.lower()
+            cam_labels = self._image_labels or [f"camera_{i}" for i in range(len(self._images))]
+            # Llama-3.2-Vision (mllama) only supports 1 image per request — filter to topview only
+            mllama_one_image = 'llama-3.2' in model_name.lower() and 'vision' in model_name.lower()
+            images_to_use = list(self._images)
+            labels_to_use = list(cam_labels)
+            if mllama_one_image and len(images_to_use) > 1:
+                # prefer topview if present, otherwise first image
+                tv_idx = next((i for i, l in enumerate(labels_to_use) if 'topview' in (l or '').lower()), 0)
+                images_to_use = [images_to_use[tv_idx]]
+                labels_to_use = [labels_to_use[tv_idx]]
+            image_blocks = []
+            for img, label in zip(images_to_use, labels_to_use):
                 b64 = self._encode_image(img)
-                user2_content.append({
+                image_blocks.append({"type": "text", "text": f"[{label}]"})
+                image_blocks.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
                 })
-            logger.debug(f'[LMP "{self._name}"] attaching {len(self._images)} image(s) to request')
+            if images_first:
+                user2_content = image_blocks + [{"type": "text", "text": user2}]
+            else:
+                user2_content = [{"type": "text", "text": user2}] + image_blocks
+            logger.debug(f'[LMP "{self._name}"] attaching {len(self._images)} image(s) to request: {cam_labels} (images_first={images_first})')
         else:
             user2_content = user2
         messages=[
@@ -219,11 +322,16 @@ class LMP:
             {"role": "user", "content": user2_content},
         ]
         kwargs['messages'] = messages
-        # Disable thinking mode for Qwen3 hybrid models (not Instruct-2507 which has no thinking)
+        # Thinking mode for Qwen3 hybrid models (not Instruct-2507 which has no thinking)
+        # Default: disabled. Override via QWEN3_ENABLE_THINKING=1 env var.
         extra_body = None
         if 'qwen3' in model_name.lower() and 'instruct-2507' not in model_name.lower():
+            thinking_enabled = os.environ.get('QWEN3_ENABLE_THINKING', '0') == '1'
+            extra_body = {"chat_template_kwargs": {"enable_thinking": thinking_enabled}}
+            logger.debug(f'[LMP "{self._name}"] Qwen3 enable_thinking={thinking_enabled}')
+        elif 'glm' in model_name.lower() and '4.6v' in model_name.lower():
             extra_body = {"chat_template_kwargs": {"enable_thinking": False}}
-            logger.debug(f'[LMP "{self._name}"] disabling Qwen3 thinking mode')
+            logger.debug(f'[LMP "{self._name}"] disabling GLM-4.6V thinking mode')
         elif 'gpt-oss' in model_name or 'gpt_oss' in model_name:
             extra_body = {"reasoning_effort": "low"}
             logger.debug(f'[LMP "{self._name}"] setting GPT-oss reasoning_effort=low')
@@ -241,14 +349,26 @@ class LMP:
                 create_kwargs['extra_body'] = extra_body
             ret = self._client.chat.completions.create(**create_kwargs)
             msg = ret.choices[0].message
+            logger.debug(f'[LMP "{self._name}"] raw response ({len(msg.content)} chars): {msg.content[:500]}')
             ret = self._extract_code(msg)
             if use_cache:
                 self._cache[cache_key] = ret
             return ret
 
-    def __call__(self, query, **kwargs):
+    def __call__(self, *queries, **kwargs):
+        # Accept multiple positional args (e.g. LLM calls lmp('q1', 'q2', 'q3')) and join them
+        query = ' '.join(str(q) for q in queries)
         prompt, user_query = self.build_prompt(query)
 
+        # Model-specific max_tokens override (some models have small context, need shorter output budget)
+        model_name_lc = (self._cfg.get('model') or '').lower()
+        max_tokens = self._cfg['max_tokens']
+        if 'deepseek-vl2' in model_name_lc:
+            # DeepSeek-VL2 max_pos=4096; with prompt ~750 tokens, leave room → cap output at 1024
+            max_tokens = min(max_tokens, 1024)
+        if 'llama-3.2' in model_name_lc and 'vision' in model_name_lc:
+            # Llama-3.2-Vision max_pos=4096 (eval config); with prompt ~700 tokens, leave room → cap at 1024
+            max_tokens = min(max_tokens, 1024)
         start_time = time.time()
         while True:
             try:
@@ -257,13 +377,18 @@ class LMP:
                     stop=self._stop_tokens,
                     temperature=self._cfg['temperature'],
                     model=self._cfg['model'],
-                    max_tokens=self._cfg['max_tokens']
+                    max_tokens=max_tokens
                 )
                 break
             except Exception as e:
                 logger.warning(f'API error: {e} — retrying in 3s')
                 sleep(3)
         logger.info(f'[LMP "{self._name}"] API call {time.time() - start_time:.2f}s')
+
+        if not code_str.strip():
+            logger.warning(
+                f'[LMP "{self._name}"] VLM produced no executable code for query: {query[:100]}'
+            )
 
         if self._cfg['include_context']:
             assert self._context is not None, 'context is None'
@@ -314,7 +439,11 @@ class LMP:
                     return IterableDynamicObservation(lvars[self._cfg['return_val_name']])
                 except AssertionError:
                     return DynamicObservation(lvars[self._cfg['return_val_name']])
-            return lvars[self._cfg['return_val_name']]
+            result = lvars[self._cfg['return_val_name']]
+            # Wrap callable map returns so LLM can combine them with numpy ops (e.g. map_a + map_b)
+            if callable(result) and self._name not in ['parse_query_obj']:
+                return DeferredMap(result)
+            return result
 
 
 def merge_dicts(dicts):
@@ -344,6 +473,8 @@ def exec_safe(code_str, gvars=None, lvars=None):
     except bdb.BdbQuit:
         raise
     except Exception as e:
+        import traceback as _tb
         logger.error(f'Error executing code:\n{code_str}')
         logger.error(f'Error message:\n{e}')
-        raise e
+        logger.error(f'Traceback:\n{_tb.format_exc()}')
+        raise

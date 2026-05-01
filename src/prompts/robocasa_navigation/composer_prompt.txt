@@ -35,7 +35,7 @@ movable = parse_query_obj('mobile_base')
 affordance_map = get_affordance_map('a point 10cm to the left of the brown block')
 execute_navigation(movable, affordance_map=affordance_map)
 
-# Query: turn counter-clockwise by 180 degrmobile_bases.
+# Query: turn counter-clockwise by 180 degrees.
 movable = parse_query_obj('mobile_base')
-rotation_map = get_rotation_map('turn counter-clockwise by 180 degrmobile_bases')
+rotation_map = get_rotation_map('turn counter-clockwise by 180 degrees')
 execute_navigation(movable, rotation_map=rotation_map)

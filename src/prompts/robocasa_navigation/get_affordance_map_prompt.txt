@@ -93,7 +93,7 @@ ret_val = affordance_map
 # Query: a point at the center of the blue circle.
 affordance_map = get_empty_affordance_map(task='navigation')
 blue_circle = parse_query_obj('blue circle')
-x, y, z = blue_block.position
+x, y, z = blue_circle.position
 affordance_map[x, y] = 1
 ret_val = affordance_map
 
@@ -106,4 +106,4 @@ center_x, center_y, center_z = yellow_bowl.position
 x = center_x
 y = min_y - cm2index(5, 'y')
 affordance_map[x, y] = 1
-ret_val = affordance_mapS
+ret_val = affordance_map

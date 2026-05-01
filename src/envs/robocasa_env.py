@@ -10,12 +10,17 @@ import robocasa
 from robosuite import load_composite_controller_config
 import time
 MAX_DEPTH = 20.0
-DONTKNOWWHATISTHIS = ['cab', 'left','right','main', 'obstacle', "light", "floor", "wall", "cab", "outlet", "stack", "robot0", "gripper0"]
+DONTKNOWWHATISTHIS = ['cab', 'left', 'right', 'obstacle', "light", "floor", "wall", "outlet", "stack", "robot0", "gripper0"]
 TABLE_ALIAS =["table", "cutting", "window",'stack', 'wall', 'utensil']
 MOBILE_ALIAS = {
     "posed": "person",
     "mobilebase0": "robot_mobile_base",
-    "coffee": "coffee_machine"
+    "coffee": "coffee_machine",
+    # 'door' intentionally not mapped — LLM sees 'door', name2ids['door'] has geom IDs directly
+}
+# LLM shorthand aliases: maps query names to name2ids keys (used in get_3d_obs_by_name)
+LLM_QUERY_ALIASES = {
+    "mobile_base": "mobilebase0",        # Route G: LLM generates 'mobile_base' instead of 'robot_mobile_base'
 }
 class VoxPoserRobocasa():
     def __init__(self, task_name = "", task_config=None, visualizer=None):
@@ -109,7 +114,16 @@ class VoxPoserRobocasa():
                     )
                     if body_name is None:
                         continue
-                    visible_objs.add(body_name.split("_")[0])
+                    tokens = body_name.split("_")
+                    if len(tokens) >= 2 and tokens[0] == "main" and tokens[1] == "door":
+                        visible_objs.add("door")
+                    elif tokens[0] == "obstacle":
+                        # Map obstacle_N_* → actual obstacle type (cat, dog, vase, etc.)
+                        obs_type = getattr(self.env, 'obstacle', None)
+                        if obs_type:
+                            visible_objs.add(obs_type)
+                    else:
+                        visible_objs.add(tokens[0])
                 visible_objects.extend(visible_objs)
             visible_objects = list(set(visible_objects))
         else:
@@ -138,18 +152,29 @@ class VoxPoserRobocasa():
             for obj in self.objects:
                 if obj in name:
                     self.name2ids[obj].append(i)
+        # Remap 'door' in name2ids to only main_door body geoms.
+        # The generic loop above maps 'door' -> ALL geoms with 'door' in geom_name (fridge, microwave,
+        # oven doors etc.). We need only the main_door fixture geoms for Route E navigation.
+        main_door_ids = []
+        for i in range(self.env.sim.model.ngeom):
+            body_id = self.env.sim.model.geom_bodyid[i]
+            body_name = self.env.sim.model.body_id2name(body_id) or ''
+            if body_name.startswith('main_door'):
+                main_door_ids.append(i)
+        if main_door_ids:
+            self.name2ids['door'] = main_door_ids
                     
-    # Default cameras for VLM: robot front view, human 1st-person view, top-down view
-    _DEFAULT_VLM_CAMERAS = ['robot0_frontview', 'posed_person_main_group_1stview', 'topview']
+    # Default cameras for VLM: top-down, front view, agent center, human 1st-person
+    _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_person_main_group_1stview']
 
     def get_representative_images(self, cam_names=None):
         """Get camera view images for VLM input.
 
         Args:
-            cam_names: list of camera names. If None, uses 2 representative cameras.
+            cam_names: list of camera names. If None, uses default VLM cameras.
 
         Returns:
-            list of numpy RGB arrays (H, W, 3).
+            (images, cam_names_used): list of numpy RGB arrays (H, W, 3) and their camera names.
         """
         if cam_names is None:
             cam_names = [c for c in self._DEFAULT_VLM_CAMERAS if c in self.camera_names]
@@ -157,13 +182,15 @@ class VoxPoserRobocasa():
                 cam_names = self.camera_names[:2]
         self.update_latest_obs()
         images = []
+        cam_names_used = []
         for cam in cam_names:
             key = f'{cam}_image'
             if key in self.latest_obs:
                 images.append(self.latest_obs[key])
+                cam_names_used.append(cam)
             else:
                 logger.warning(f"Camera '{cam}' image not found in observations")
-        return images
+        return images, cam_names_used
 
     def update_latest_obs(self):
         """
@@ -333,19 +360,45 @@ class VoxPoserRobocasa():
         try:
             obj_ids = self.name2ids[query_name]
         except Exception as e:
-            # use mapped name from MOBILE_ALIAS
-            try:
-                mapped_name = dict(map(reversed, MOBILE_ALIAS.items()))[query_name]
-                obj_ids = self.name2ids[mapped_name]
-            except KeyError:
-                raise KeyError(f"'{query_name}' not found in scene objects or MOBILE_ALIAS")
+            # try LLM shorthand aliases first (e.g. 'mobile_base' -> 'mobilebase0')
+            if query_name in LLM_QUERY_ALIASES:
+                mapped_name = LLM_QUERY_ALIASES[query_name]
+                obj_ids = self.name2ids.get(mapped_name)
+                if obj_ids is None:
+                    raise KeyError(f"'{query_name}' -> '{mapped_name}' not found in scene objects")
+            else:
+                # use reverse mapped name from MOBILE_ALIAS (display_name -> body_prefix)
+                try:
+                    mapped_name = dict(map(reversed, MOBILE_ALIAS.items()))[query_name]
+                    obj_ids = self.name2ids[mapped_name]
+                except KeyError:
+                    raise KeyError(f"'{query_name}' not found in scene objects or MOBILE_ALIAS")
         try:
             obj_points = points[np.isin(masks, obj_ids)]
-            if len(obj_points) == 0 or len(obj_ids) == 0:
+            if (len(obj_points) == 0 or len(obj_ids) == 0) and query_name == 'door':
+                # main_door not visible from cameras — fall back to sim body position.
+                # This happens when the robot starts with its back to the door.
+                door_world_pos = None
+                for body_suffix in ['main_door_room', 'main_door']:
+                    try:
+                        bid = self.env.sim.model.body_name2id(body_suffix)
+                        door_world_pos = self.env.sim.data.body_xpos[bid].copy()
+                        break
+                    except Exception:
+                        continue
+                if door_world_pos is not None:
+                    logger.debug(f"'door' not visible in cameras; using sim body position {door_world_pos}")
+                    obj_points = door_world_pos.reshape(1, 3)
+                    obj_colors = np.zeros((1, 3))
+                    obj_normals = np.array([[0, 0, 1]], dtype=np.float64)
+                else:
+                    raise ValueError(f"Object {query_name} not found in the scene or simulation")
+            elif len(obj_points) == 0 or len(obj_ids) == 0:
                 raise ValueError(f"Object {query_name} not found in the scene")
-            obj_colors = colors[np.isin(masks, obj_ids)]
-            obj_normals = normals[np.isin(masks, obj_ids)]
-            obj_points, obj_colors, obj_normals = self.remove_obj_pc_outlier(obj_points, obj_colors, obj_normals)
+            else:
+                obj_colors = colors[np.isin(masks, obj_ids)]
+                obj_normals = normals[np.isin(masks, obj_ids)]
+                obj_points, obj_colors, obj_normals = self.remove_obj_pc_outlier(obj_points, obj_colors, obj_normals)
         except Exception as e:
             raise ValueError(f"Object '{query_name}' point cloud error: {e}")
         # self.visualize_3d_space(obj_points)
@@ -616,8 +669,23 @@ class VoxPoserRobocasa():
             return {'num_steps': len(self._trajectory)}
         positions = np.array(self._trajectory)
         dt = 1.0 / control_freq
-        person_pos = self._get_person_pos()
-        return compute_all_metrics(positions, dt, person_pos=person_pos)
+        metrics = compute_all_metrics(positions, dt)
+        # For navigation tasks, merge richer metrics from benchmark's trajectory_info
+        # (includes obstacle intrusion, v_app computed at TRAJECTORY_LOG_INTERVAL cadence)
+        if self.navigate_task and hasattr(self.env, 'get_trajectory_info'):
+            try:
+                traj_info = self.env.get_trajectory_info()
+                for key in ('boundary_violation_ratio', 'boundary_violation_steps',
+                            'obstacle_min_distance', 'obstacle_contact_steps',
+                            'obstacle_contact_ratio', 'v_app',
+                            'timeseries_speed', 'timeseries_jerk',
+                            'timeseries_min_obstacle_distance',
+                            'timeseries_obstacle_distances'):
+                    if key in traj_info:
+                        metrics[key] = traj_info[key]
+            except Exception:
+                pass
+        return metrics
 
     def _reset_task_variables(self):
         """

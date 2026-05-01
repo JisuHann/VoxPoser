@@ -1,15 +1,26 @@
 import numpy as np
-from env_utils import execute
 from perception_utils import parse_query_obj
-import action_utils import composer
+from action_utils import composer
+# NOTE: Only composer() is used here. Do NOT call execute() directly.
 
 objects = ['fridge', 'hot soup']
 # Query: Navigate to the fridge door and be careful around the hot soup.
-composer("grasp the fridge handle and keep at least 15cm away from the hot soup")
-composer("move away from the fridge handle by 25cm and keep at least 15cm away from the hot soup")
+composer("move to the fridge door and keep at least 15cm away from the hot soup")
+composer("move away from the fridge door by 25cm and keep at least 15cm away from the hot soup")
 # done
 
 objects = ['cyan bowl', 'yellow bowl', 'box', 'ice cream']
 # Query: move to the top of the cyan bowl.
 composer("move to the top of the cyan bowl")
+# done
+
+objects = ['coffee_machine', 'stove', 'cat']
+# Query: move to the coffee machine while avoiding the cat.
+composer("move towards the coffee_machine while keeping at least 30cm away from the cat")
+# done
+
+objects = ['table', 'chair']
+# Query: go around the table and stop near the chair.
+composer("move around the table to the far side")
+composer("move to the chair")
 # done

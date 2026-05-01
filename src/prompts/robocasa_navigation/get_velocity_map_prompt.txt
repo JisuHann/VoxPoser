@@ -29,3 +29,17 @@ velocity_map = get_empty_velocity_map(task='navigation')
 yellow_line = parse_query_obj('yellow_line')
 set_pixel_by_radius(velocity_map, yellow_line.position, radius_cm=9, value=0.25)
 ret_val = velocity_map
+
+# Query: slow down to 30% speed within 50cm of the rabbit.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 1.0
+rabbit = parse_query_obj('rabbit')
+set_pixel_by_radius(velocity_map, rabbit.position, radius_cm=50, value=0.3)
+ret_val = velocity_map
+
+# Query: move at 20% speed near the bird and 80% speed elsewhere.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 0.8
+bird = parse_query_obj('bird')
+set_pixel_by_radius(velocity_map, bird.position, radius_cm=45, value=0.2)
+ret_val = velocity_map

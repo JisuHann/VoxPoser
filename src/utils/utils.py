@@ -12,17 +12,19 @@ def set_lmp_objects(lmps, objects):
     for lmp in lmps:
         lmp._context = f'objects = {objects}'
 
-def set_lmp_images(lmps, images):
+def set_lmp_images(lmps, images, cam_names=None):
     """Set camera images on all LMPs for VLM-based inference.
 
     Args:
         lmps: dict or iterable of LMP instances.
         images: list of numpy RGB arrays, or None to clear.
+        cam_names: list of camera name strings matching images, or None.
     """
     if isinstance(lmps, dict):
         lmps = lmps.values()
     for lmp in lmps:
         lmp._images = images
+        lmp._image_labels = cam_names
 
 def get_clock_time(milliseconds=False):
     curr_time = datetime.datetime.now()
@@ -134,10 +136,18 @@ def load_prompt(prompt_fname):
     curr_dir = 'src'
     # get full path to file
     if '/' in prompt_fname:
-        prompt_fname = prompt_fname.split('/')
-        full_path = os.path.join(curr_dir, 'prompts', *prompt_fname)
+        parts = prompt_fname.split('/')
+        full_path = os.path.join(curr_dir, 'prompts', *parts)
     else:
         full_path = os.path.join(curr_dir, 'prompts', prompt_fname)
+    # if variant file doesn't exist, fall back to robocasa_navigation baseline
+    if not os.path.exists(full_path) and '/' in prompt_fname:
+        parts = prompt_fname.split('/')
+        env_dir = parts[0]
+        if env_dir.startswith('robocasa_navigation_'):
+            fallback_path = os.path.join(curr_dir, 'prompts', 'robocasa_navigation', *parts[1:])
+            if os.path.exists(fallback_path):
+                full_path = fallback_path
     # read file
     with open(full_path, 'r') as f:
         contents = f.read().strip()
@@ -203,6 +213,13 @@ class IterableDynamicObservation:
         for i in range(len(self)):
             yield self.__getitem__(i)
 
+    def __getattr__(self, key):
+        # Delegate single-attribute access to first element so LLM code like
+        # `obs = parse_query_obj('person'); obs.position` works without indexing.
+        if key == 'func':
+            raise AttributeError(key)
+        return getattr(self[0], key)
+
     def __call__(self):
         static_list = self.func()
         return static_list
@@ -217,21 +234,32 @@ class DynamicObservation:
             import pdb; pdb.set_trace()
         self.func = func
     
+    _FALLBACK = {'position': np.array([0.0, 0.0, 0.0]), 'normal': np.array([0.0, 0.0, 1.0])}
+
     def __get__(self, key):
         evaluated = self.func()
+        if evaluated is None:
+            return self._FALLBACK.get(key, None)
         if isinstance(evaluated[key], np.ndarray):
             return evaluated[key].copy()
         return evaluated[key]
-    
+
     def __getattr__(self, key):
         return self.__get__(key)
-    
+
     def __getitem__(self, key):
         return self.__get__(key)
 
     def __call__(self):
         static_obs = self.func()
+        if static_obs is None:
+            static_obs = self._FALLBACK
         if not isinstance(static_obs, Observation):
+            if not isinstance(static_obs, dict):
+                get_logger(__name__).warning(
+                    f'DynamicObservation: func returned {type(static_obs).__name__}, using fallback'
+                )
+                static_obs = self._FALLBACK
             static_obs = Observation(static_obs)
         return static_obs
 

@@ -206,7 +206,7 @@ class PathPlanner:
         # Calculate all nearby voxel coordinates
         all_nearby_voxels = np.clip(current_pos + offsets_grid, 0, self.map_size - 1)
         # Remove duplicates, if any, caused by clipping
-        all_nearby_voxels = np.unique(all_nearby_voxels, axis=0)
+        all_nearby_voxels = np.unique(all_nearby_voxels, axis=0).astype(int)
         return all_nearby_voxels
     
     def _calculate_nearby_pixel(self, current_pos, object_centric=False):
@@ -220,7 +220,7 @@ class PathPlanner:
         # Calculate all nearby voxel coordinates
         all_nearby_voxels = np.clip(current_pos + offsets_grid, 0, self.map_size - 1)
         # Remove duplicates, if any, caused by clipping
-        all_nearby_voxels = np.unique(all_nearby_voxels, axis=0)
+        all_nearby_voxels = np.unique(all_nearby_voxels, axis=0).astype(int)
         return all_nearby_voxels
     
     def _postprocess_path(self, path, raw_target_map, object_centric=False):
