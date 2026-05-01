@@ -1,0 +1,69 @@
+import numpy as np
+from plan_utils import get_empty_velocity_map, set_pixel_by_radius, cm2index
+from perception_utils import parse_query_obj
+# Safety rules: slow to 0.3× within 80cm of humans; slow to 0.4× within 60cm of animals.
+
+# Query: faster when on the right side of the table and slower when on the left side of the table.
+velocity_map = get_empty_velocity_map(task='navigation')
+table = parse_query_obj('table')
+center_x, center_y, center_z = table.position
+# faster on right side so 1.5 when y > center_y, slower on left side so 0.5 when y < center_y
+velocity_map[:, center_y:] = 1.5
+velocity_map[:, :center_y] = 0.5
+ret_val = velocity_map
+
+# Query: slow down by a quarter.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 0.75
+ret_val = velocity_map
+
+# Query: slow down by a half when you're near anything fragile (objects: ['block', 'fork', 'mug', 'bowl', 'chips']).
+velocity_map = get_empty_velocity_map(task='navigation')
+mug = parse_query_obj('mug')
+set_pixel_by_radius(velocity_map, mug.position, radius_cm=10, value=0.5)
+bowl = parse_query_obj('bowl')
+set_pixel_by_radius(velocity_map, bowl.position, radius_cm=10, value=0.5)
+ret_val = velocity_map
+
+# Query: quarter of the speed when within 9cm from the yellow line.
+velocity_map = get_empty_velocity_map(task='navigation')
+yellow_line = parse_query_obj('yellow_line')
+set_pixel_by_radius(velocity_map, yellow_line.position, radius_cm=9, value=0.25)
+ret_val = velocity_map
+
+# Query: slow to 0.3 speed within 80cm of the person.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 1.0
+person = parse_query_obj('person')
+set_pixel_by_radius(velocity_map, person.position, radius_cm=80, value=0.3)
+ret_val = velocity_map
+
+# Query: slow to 0.4 speed within 60cm of the dog.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 1.0
+dog = parse_query_obj('dog')
+set_pixel_by_radius(velocity_map, dog.position, radius_cm=60, value=0.4)
+ret_val = velocity_map
+
+# Query: slow to 0.3 speed within 80cm of the person and 0.4 speed within 60cm of the cat.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 1.0
+person = parse_query_obj('person')
+set_pixel_by_radius(velocity_map, person.position, radius_cm=80, value=0.3)
+cat = parse_query_obj('cat')
+set_pixel_by_radius(velocity_map, cat.position, radius_cm=60, value=0.4)
+ret_val = velocity_map
+
+# Query: slow down to 30% speed within 50cm of the rabbit.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 1.0
+rabbit = parse_query_obj('rabbit')
+set_pixel_by_radius(velocity_map, rabbit.position, radius_cm=50, value=0.3)
+ret_val = velocity_map
+
+# Query: move at 20% speed near the bird and 80% speed elsewhere.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 0.8
+bird = parse_query_obj('bird')
+set_pixel_by_radius(velocity_map, bird.position, radius_cm=45, value=0.2)
+ret_val = velocity_map

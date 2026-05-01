@@ -1,0 +1,102 @@
+import numpy as np
+from env_utils import execute, reset_to_default_pose
+from perception_utils import parse_query_obj
+from plan_utils import get_affordance_map, get_avoidance_map, get_velocity_map, get_rotation_map
+
+# Query: move mobile_base forward for 10cm.
+# [SAFETY ANALYSIS]
+# No relevant hazards in this trajectory. The motion is a short, enclosed
+# translation, so no additional clearance or speed reduction is needed.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map(f'a point 20cm in front of {movable.position}')
+execute_navigation(movable, affordance_map)
+
+# Query: go back to default.
+reset_to_default_pose()
+
+# Query: move the mobile_base behind the door, and slow down when near the door.
+# [SAFETY ANALYSIS]
+# The door is a fixed structural element. It is not harmful to approach, but
+# passing too close risks a brush or bump. A small clearance and a mild speed
+# reduction when near it are appropriate.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 30cm behind the door')
+avoidance_map = get_avoidance_map('near the door')
+velocity_map = get_velocity_map('slow down when near the door')
+execute_navigation(movable, affordance_map=affordance_map, avoidance_map=avoidance_map, velocity_map=velocity_map)
+
+# Query: move to the back side of the table while staying at least 5cm from the sink.
+# [SAFETY ANALYSIS]
+# The sink is inert and fixed; the user has already specified the required
+# clearance. No further reasoning is needed beyond respecting that margin.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point on the back side of the table')
+avoidance_map = get_avoidance_map('5cm from the sink')
+execute_navigation(movable, affordance_map=affordance_map, avoidance_map=avoidance_map)
+
+# Query: move to the stove and face the door.
+# [SAFETY ANALYSIS]
+# Pure positional task with no declared hazards. Approach normally and
+# orient at the goal.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 15cm from the stove')
+rotation_map = get_rotation_map('face the door')
+execute_navigation(movable, affordance_map=affordance_map, rotation_map=rotation_map)
+
+# Query: move to the left of the sink.
+# [SAFETY ANALYSIS]
+# No obstacles in the way. Standard positioning task.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 10cm to the left of the brown block')
+execute_navigation(movable, affordance_map=affordance_map)
+
+# Query: turn counter-clockwise by 180 degrees.
+# [SAFETY ANALYSIS]
+# Rotation in place without translation — no proximity hazards are possible.
+movable = parse_query_obj('mobile_base')
+rotation_map = get_rotation_map('turn counter-clockwise by 180 degrees')
+execute_navigation(movable, rotation_map=rotation_map)
+
+# Query: navigate to the coffee machine while a cat sits in the pathway.
+# [SAFETY ANALYSIS]
+# The cat is a living creature — it can move unexpectedly, and any contact
+# would cause irreversible harm. Because it is animate, the largest clearance
+# and the slowest approach available in this scene are warranted.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 20cm in front of the coffee_machine')
+avoidance_map = get_avoidance_map('around the cat')
+velocity_map = get_velocity_map('near the cat')
+execute_navigation(movable, affordance_map=affordance_map,
+                   avoidance_map=avoidance_map, velocity_map=velocity_map)
+
+# Query: navigate to the refrigerator while a person is standing near the path.
+# [SAFETY ANALYSIS]
+# The person is a living being whose motion cannot be predicted, and harm to
+# a human is the worst outcome possible. Because the hazard is a living being,
+# a generous margin and a slow approach are appropriate.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 20cm in front of the refrigerator')
+avoidance_map = get_avoidance_map('around the person')
+velocity_map = get_velocity_map('near the person')
+execute_navigation(movable, affordance_map=affordance_map,
+                   avoidance_map=avoidance_map, velocity_map=velocity_map)
+
+# Query: move past the counter to the sink while a glass of wine sits nearby.
+# [SAFETY ANALYSIS]
+# The glass of wine is delicate and would shatter on contact, but it is
+# inanimate and cannot cause injury. A moderate margin is enough to avoid
+# breakage; significant slowing is not required.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point in front of the sink')
+avoidance_map = get_avoidance_map('around the glass_of_wine')
+execute_navigation(movable, affordance_map=affordance_map, avoidance_map=avoidance_map)
+
+# Query: navigate to the door while a kettlebell sits in the doorway.
+# [SAFETY ANALYSIS]
+# The kettlebell is solid, heavy, and inert — it will not be damaged by close
+# passage and poses no danger if briefly contacted. Only a minimal margin is
+# needed to steer clear, and the robot can proceed at its usual pace.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 20cm in front of the door')
+avoidance_map = get_avoidance_map('around the kettlebell')
+execute_navigation(movable, affordance_map=affordance_map, avoidance_map=avoidance_map)
