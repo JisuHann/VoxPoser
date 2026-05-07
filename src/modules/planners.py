@@ -1,4 +1,5 @@
 """Greedy path planner."""
+import heapq
 import numpy as np
 from scipy.ndimage import gaussian_filter
 from scipy.ndimage import distance_transform_edt
@@ -6,6 +7,100 @@ from scipy.signal import savgol_filter
 from utils.utils import get_clock_time, normalize_map, calc_curvature, get_logger
 
 logger = get_logger(__name__)
+
+
+def _astar_pixel(start_pos, costmap, target_mask, blocked_mask=None):
+    """A* search on a 2D cost grid to any cell in `target_mask`.
+
+    Args:
+        start_pos: (2,) array of (row, col) start (will be rounded to int)
+        costmap:   (H, W) float array — node cost at each cell
+        target_mask: (H, W) bool array — True for any acceptable goal cell
+        blocked_mask: optional (H, W) bool array — cells the robot cannot
+            physically enter (e.g. obstacle cells inflated by robot_radius).
+            A* will not expand neighbors into a blocked cell unless the
+            cell is the start or in target_mask. If start is itself blocked,
+            we relax for that single cell (so the search can begin).
+
+    Returns:
+        path: (n, 2) np.ndarray of grid cells (float), or None if start invalid.
+        If target is unreachable through unblocked cells, returns best-effort
+        path to the closest reachable cell so postprocess can still force-append.
+    """
+    H, W = costmap.shape
+    target_cells = np.argwhere(target_mask)
+    if target_cells.size == 0:
+        return None
+    start = (int(round(start_pos[0])), int(round(start_pos[1])))
+    if not (0 <= start[0] < H and 0 <= start[1] < W):
+        return None
+
+    # Heuristic: Euclidean distance from any cell to the closest target cell.
+    # Precomputed via distance_transform_edt for O(HW) total cost.
+    h_map = distance_transform_edt(~target_mask)
+
+    # 8-neighbors with edge step cost (Euclidean distance)
+    neighbors = (
+        (-1, -1, 1.41421356), (-1, 0, 1.0), (-1, 1, 1.41421356),
+        ( 0, -1, 1.0),                       ( 0, 1, 1.0),
+        ( 1, -1, 1.41421356), ( 1, 0, 1.0), ( 1, 1, 1.41421356),
+    )
+
+    # Respect blocked_mask but always allow start and target cells
+    def _is_blocked(pos):
+        if blocked_mask is None:
+            return False
+        if pos == start or target_mask[pos]:
+            return False
+        return bool(blocked_mask[pos])
+
+    open_heap = [(float(h_map[start]), 0.0, start)]
+    g_score = {start: 0.0}
+    came_from = {}
+    visited = set()
+    closest_pos, closest_h = start, float(h_map[start])
+
+    while open_heap:
+        _f, g, current = heapq.heappop(open_heap)
+        if current in visited:
+            continue
+        visited.add(current)
+        # Track best-effort if A* fails to find target later
+        ch = float(h_map[current])
+        if ch < closest_h:
+            closest_h = ch
+            closest_pos = current
+        # Goal test
+        if target_mask[current]:
+            path = [current]
+            while current in came_from:
+                current = came_from[current]
+                path.append(current)
+            return np.array(path[::-1], dtype=float)
+        for dy, dx, step_cost in neighbors:
+            ny, nx = current[0] + dy, current[1] + dx
+            if not (0 <= ny < H and 0 <= nx < W):
+                continue
+            np_ = (ny, nx)
+            if _is_blocked(np_):
+                continue
+            edge_cost = step_cost + float(costmap[ny, nx])
+            tentative_g = g + edge_cost
+            if np_ not in g_score or tentative_g < g_score[np_]:
+                g_score[np_] = tentative_g
+                came_from[np_] = current
+                f_new = tentative_g + float(h_map[ny, nx])
+                heapq.heappush(open_heap, (f_new, tentative_g, np_))
+
+    # Unreachable: return path to closest cell we managed to reach
+    if closest_pos == start:
+        return np.array([start], dtype=float)
+    path = [closest_pos]
+    cur = closest_pos
+    while cur in came_from:
+        cur = came_from[cur]
+        path.append(cur)
+    return np.array(path[::-1], dtype=float)
 
 
 class PathPlanner:
@@ -88,7 +183,7 @@ class PathPlanner:
         info['targets_voxel'] = np.argwhere(raw_target_map == 1)
         return processed_path, info
     
-    def navigation_optimize(self, start_pos: np.ndarray, target_map: np.ndarray, obstacle_map: np.ndarray, object_centric=False):
+    def navigation_optimize(self, start_pos: np.ndarray, target_map: np.ndarray, obstacle_map: np.ndarray, object_centric=False, robot_radius_cells: int = 0):
         """
         config:
             start_pos: (2,) np.ndarray, start position
@@ -113,35 +208,77 @@ class PathPlanner:
         costmap = target_map * self.config.target_map_weight + obstacle_map * self.config.obstacle_map_weight
         costmap = normalize_map(costmap)
         _costmap = costmap.copy()
-        # get stop criteria
-        stop_criteria = self._get_stop_criteria_navigation()
-        # initialize path
-        path, current_pos = [start_pos], start_pos
-        # optimize
-        logger.debug(f'[{get_clock_time(milliseconds=True)}] optimizing from {start_pos}')
-        for i in range(self.config.max_steps):
-            # calculate all nearby voxels around current position
-            all_nearby_voxels = self._calculate_nearby_pixel(current_pos, object_centric=object_centric)
-            # calculate the score of all nearby voxels
-            nearby_score = _costmap[all_nearby_voxels[:, 0], all_nearby_voxels[:, 1]]
-            # Find the minimum cost voxel
-            steepest_idx = np.argmin(nearby_score)
-            try:
-                next_pos = all_nearby_voxels[steepest_idx]
-            except Exception as e:
-                logger.error(str(e))
-                breakpoint()
-            # increase cost at current position to avoid going back
-            _costmap[current_pos[0].round().astype(int),
-                     current_pos[1].round().astype(int)] += 1
-            # update path and current position
-            path.append(next_pos)
-            current_pos = next_pos
-            # check stop criteria
-            if stop_criteria(current_pos, _costmap, self.config.stop_threshold):
-                break
-        raw_path = np.array(path)
-        logger.info(f'[{get_clock_time(milliseconds=True)}] path optimized: {len(raw_path)} pts')
+        # Optionally use A* (W1) instead of greedy descent. A* is global, finds
+        # paths around obstacle regions that local greedy can't see, and avoids
+        # the "stops far from goal → force-append teleport" failure mode.
+        use_astar = bool(self.config.get('use_astar', False)) if hasattr(self.config, 'get') else getattr(self.config, 'use_astar', False)
+        if use_astar:
+            target_mask = raw_target_map > 0
+            # Build A* cost map:
+            #  (1) Inflate raw obstacles by robot_radius_cells (binary_dilation)
+            #      so A* doesn't try to squeeze the robot through cells that
+            #      are obstacle-free as a 1-pixel point but blocked once the
+            #      robot's 35cm footprint is taken into account.
+            #  (2) Hard-penalize the inflated mask (+10) so A* detours around
+            #      it. The smooth costmap alone (W_O × 0.05 per cell) is too
+            #      weak — A* would gladly pay it to save a 10-cell detour.
+            #      +10 keeps cells "nearly forbidden" but still traversable
+            #      when no alternative exists (best-effort path).
+            #  (3) ALWAYS keep target/start cells traversable so a path
+            #      can begin and end (start often sits inside the inflated
+            #      band when robot is right next to a wall).
+            obs_binary = (raw_obstacle_map > 0.5)
+            if robot_radius_cells and robot_radius_cells > 0:
+                from scipy.ndimage import binary_dilation
+                inflated = binary_dilation(obs_binary, iterations=int(robot_radius_cells))
+            else:
+                inflated = obs_binary
+            # blocked_mask = inflated obstacles (truly untraversable for the
+            # robot's full footprint). A* skips these unless cell is start or
+            # in target_mask. If no path through unblocked region exists, A*
+            # returns best-effort path to closest reachable cell.
+            cm_for_astar = costmap.copy()
+            cm_for_astar[target_mask] = 0.0   # ensure target reachable terminator
+            astar_path = _astar_pixel(start_pos, cm_for_astar, target_mask, blocked_mask=inflated)
+            if astar_path is not None and len(astar_path) > 1:
+                raw_path = astar_path
+                _last = astar_path[-1].astype(int)
+                reached = bool(target_mask[_last[0], _last[1]])
+                logger.info(f'[{get_clock_time(milliseconds=True)}] A* path: {len(raw_path)} pts (target reachable={reached})')
+            else:
+                # A* failed unexpectedly — fall back to greedy
+                logger.warning('A* returned no path; falling back to greedy')
+                use_astar = False
+        if not use_astar:
+            # get stop criteria
+            stop_criteria = self._get_stop_criteria_navigation()
+            # initialize path
+            path, current_pos = [start_pos], start_pos
+            # optimize (greedy)
+            logger.debug(f'[{get_clock_time(milliseconds=True)}] optimizing from {start_pos}')
+            for i in range(self.config.max_steps):
+                # calculate all nearby voxels around current position
+                all_nearby_voxels = self._calculate_nearby_pixel(current_pos, object_centric=object_centric)
+                # calculate the score of all nearby voxels
+                nearby_score = _costmap[all_nearby_voxels[:, 0], all_nearby_voxels[:, 1]]
+                # Find the minimum cost voxel
+                steepest_idx = np.argmin(nearby_score)
+                try:
+                    next_pos = all_nearby_voxels[steepest_idx]
+                except Exception as e:
+                    logger.error(str(e))
+                    breakpoint()
+                # increase cost at current position to avoid going back
+                _costmap[current_pos[0].round().astype(int),
+                         current_pos[1].round().astype(int)] += 1
+                # update path and current position
+                path.append(next_pos)
+                current_pos = next_pos
+                # check stop criteria
+                if stop_criteria(current_pos, _costmap, self.config.stop_threshold):
+                    break
+            raw_path = np.array(path)
+            logger.info(f'[{get_clock_time(milliseconds=True)}] path optimized (greedy): {len(raw_path)} pts')
         # postprocess path
         processed_path = self._postprocess_path(raw_path, raw_target_map, object_centric=object_centric)
         logger.info(f'[{get_clock_time(milliseconds=True)}] after postprocessing: {len(processed_path)} pts')
@@ -159,7 +296,7 @@ class PathPlanner:
         info['planner_postprocessed_path'] = processed_path.copy()
         info['targets_voxel'] = np.argwhere(raw_target_map == 1)
         return processed_path, info
-    
+
     def _get_stop_criteria(self):
         def no_nearby_equal_criteria(current_pos, costmap, stop_threshold):
             """

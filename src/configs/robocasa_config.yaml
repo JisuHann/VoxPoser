@@ -3,8 +3,8 @@ task:
   camera_widths: 640
   camera_heights: 480
   camera_names: ['robot0_robotview', 'robot0_agentview_center', 'robot0_agentview_left', 'robot0_agentview_right', 'robot0_frontview', 'robot0_eye_in_hand']
-  layout_ids: 0
-  style_ids: 0
+  layout_ids: -1   # -1 = all 10 layouts (random sampling per episode)
+  style_ids: 0    # fixed COASTAL/INDUSTRIAL... (style 0)
   offscreen_render: True
 
 # task-type specific overrides
@@ -13,10 +13,11 @@ navigation:
   task:
     camera_names: ['robot0_robotview', 'robot0_agentview_center', 'robot0_agentview_left', 'robot0_agentview_right', 'robot0_frontview', 'robot0_eye_in_hand', 'topview', 'sideview', 'posed_person_main_group_1stview']
   planner:
+    use_astar: true                    # W1: replace greedy descent with global A*
     stop_threshold: 0.01
     obstacle_map_gaussian_sigma: 5
     max_curvature: 5
-    obstacle_map_weight: 20
+    obstacle_map_weight: 5
   navigation_controller:
     yaw_threshold: 0.35
     dist_threshold: 0.05
@@ -68,6 +69,14 @@ lmp_config:
     num_waypoints_per_plan: 10000
     max_plan_iter: 1
     visualize: True
+    # When True, parse_query_obj() auto-resolves kitchen fixtures
+    # (coffee_machine, sink, stove, fridge, microwave, oven, dishwasher)
+    # to their fixture.pos reference frame instead of the visible
+    # point-cloud centroid. Centroid can be 30cm–1m off the goal-success
+    # anchor; the fix closes that gap for affordance / avoidance maps.
+    # Movable obstacles (cat, dog, person, ...) are not in the fixtures
+    # registry so they always use centroid (correct for avoidance halo).
+    use_fixture_pos: True
   lmps:
     planner:
       prompt_fname: planner_prompt
@@ -75,7 +84,7 @@ lmp_config:
       prompt_extra: ''
       model_prompts:
         # Models that fail to call composer() without explicit instruction
-        deepseek: "IMPORTANT: Your output MUST contain ONLY composer() calls — nothing else. Do NOT define functions, classes, dictionaries, or variables. Do NOT use names like safety_radii, speed_multipliers, or any variable not in the examples. Just call composer() with a natural language description, exactly like the examples above, then write # done."
+        deepseek: "IMPORTANT: Your output MUST contain ONLY composer() calls — nothing else. Do NOT define functions, classes, dictionaries, or variables. Do NOT use names like safety_radii, velocity_multipliers, or any variable not in the examples. Just call composer() with a natural language description, exactly like the examples above, then write # done."
         llava: "IMPORTANT: Your output MUST call the composer() function at least once. Do NOT define helper functions, dictionaries, or classes. Just call composer() with a natural language description of the navigation action, exactly like the examples above."
         internvl: "IMPORTANT: Your output MUST call the composer() function at least once. Do NOT define helper functions, dictionaries, or classes. Just call composer() with a natural language description of the navigation action, exactly like the examples above."
         gpt-oss: "IMPORTANT: Your output MUST contain ONLY composer() calls — nothing else. Do NOT define functions, classes, dictionaries, or variables. Just call composer() with a natural language description, exactly like the examples above, then write # done."
@@ -92,7 +101,6 @@ lmp_config:
       include_context: True
       has_return: False
       return_val_name: ret_val
-      load_cache: False
     composer:
       prompt_fname: composer_prompt
 
@@ -107,7 +115,6 @@ lmp_config:
       include_context: False
       has_return: False
       return_val_name: ret_val
-      load_cache: False
     parse_query_obj:
       prompt_fname: parse_query_obj_prompt
 
@@ -122,7 +129,6 @@ lmp_config:
       include_context: True
       has_return: True
       return_val_name: ret_val
-      load_cache: False
     get_affordance_map:
       prompt_fname: get_affordance_map_prompt
 
@@ -137,7 +143,6 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: False
     get_avoidance_map:
       prompt_fname: get_avoidance_map_prompt
 
@@ -152,7 +157,6 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: False
     get_velocity_map:
       prompt_fname: get_velocity_map_prompt
 
@@ -167,7 +171,6 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: False
     get_rotation_map:
       prompt_fname: get_rotation_map_prompt
 
@@ -182,7 +185,6 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: False
     get_gripper_map:
       prompt_fname: get_gripper_map_prompt
 
@@ -197,4 +199,3 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: False
