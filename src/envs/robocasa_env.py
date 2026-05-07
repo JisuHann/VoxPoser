@@ -22,6 +22,47 @@ MOBILE_ALIAS = {
 LLM_QUERY_ALIASES = {
     "mobile_base": "mobilebase0",        # Route G: LLM generates 'mobile_base' instead of 'robot_mobile_base'
 }
+
+# Semantic grouping: collapse fine-grained kitchen furniture into a single
+# 'kitchen' label so the LLM sees a shorter, semantically meaningful object
+# list. Safety obstacles (cat/dog/person/wine/...) and navigation targets
+# (sink/fridge/oven/...) stay individual because they matter for avoidance
+# and goal selection. detect('kitchen') falls back to a UNION point cloud
+# of every furniture sub-name (handled in modules/interfaces.py).
+SEMANTIC_GROUP = {
+    # safety obstacles — keep individual
+    'cat': 'cat', 'dog': 'dog', 'person': 'person',
+    'crawling_baby': 'crawling_baby',
+    'wine': 'wine', 'glass_of_water': 'glass_of_water',
+    'hot_chocolate': 'hot_chocolate', 'vase': 'vase',
+    'kettlebell': 'kettlebell',
+    # robot — keep individual
+    'robot_mobile_base': 'robot_mobile_base',
+    # appliances / nav targets — keep individual (each can be Route src or dst)
+    'sink': 'sink', 'fridge': 'fridge', 'oven': 'oven',
+    'microwave': 'microwave', 'micro': 'microwave',
+    'stovetop': 'stovetop', 'dishwasher': 'dishwasher',
+    'coffee_machine': 'coffee_machine',
+    # navigation target/source fixtures — keep individual
+    'door': 'door',                # RouteE dst
+    # hazardous small items — keep individual
+    'knife': 'knife', 'plant': 'plant',
+    # static kitchen furniture — collapse to 'kitchen'
+    'island': 'kitchen', 'counter': 'kitchen',
+    'stool': 'kitchen', 'shelves': 'kitchen', 'cabinet': 'kitchen',
+    'top': 'kitchen', 'bottom': 'kitchen',
+    'standing': 'kitchen', 'hood': 'kitchen',
+    'wall': 'kitchen', 'window': 'kitchen',
+    # decoration / minor items
+    'utensil': 'kitchen', 'paper': 'kitchen',
+}
+# Sub-names that get_3d_obs_by_name should be queried with when the LLM
+# asks for the grouped 'kitchen' label. Excludes any name that is itself a
+# navigation src/dst (door) so it isn't double-counted into the union.
+KITCHEN_GROUP_SUBNAMES = (
+    'island', 'counter', 'stool', 'shelves', 'cabinet',
+    'top', 'bottom', 'standing', 'hood', 'wall', 'window',
+)
 class VoxPoserRobocasa():
     def __init__(self, task_name = "", task_config=None, visualizer=None):
         """
@@ -129,6 +170,11 @@ class VoxPoserRobocasa():
         else:
             visible_objects = list(self.env.objects.keys())
         pass  # object placement handled by env
+        # Navigation obstacle may be occluded from segmentation cameras at the
+        # initial frame — always surface it so the LLM has the obstacle name.
+        obs_type = getattr(self.env, 'obstacle', None)
+        if obs_type and obs_type not in visible_objects:
+            visible_objects.append(obs_type)
         visible_objects = [obj for obj in visible_objects if obj not in DONTKNOWWHATISTHIS]
         final_visible_objects = visible_objects.copy()
         if mapping_ids == False:
@@ -137,7 +183,11 @@ class VoxPoserRobocasa():
                 for k, v in MOBILE_ALIAS.items():
                     if k in obj:
                         final_visible_objects[idx] = v
-            logger.debug(f"Filtered visible objects: {final_visible_objects}")
+            # Semantic grouping: collapse fine-grained kitchen furniture so
+            # the LLM sees a shorter list. Order-preserving dedupe.
+            grouped = [SEMANTIC_GROUP.get(o, o) for o in final_visible_objects]
+            final_visible_objects = list(dict.fromkeys(grouped))
+            logger.debug(f"Filtered + grouped visible objects: {final_visible_objects}")
         else:
             logger.debug(f"Visible objects: {final_visible_objects}")
         return final_visible_objects
@@ -163,9 +213,57 @@ class VoxPoserRobocasa():
                 main_door_ids.append(i)
         if main_door_ids:
             self.name2ids['door'] = main_door_ids
-                    
+        # Map navigation obstacle (e.g. crawling_baby) to its body geoms.
+        # geom names are typically obstacle_N_*; the generic 'obj in name' loop
+        # above wouldn't match 'crawling_baby' against those geom names.
+        obs_type = getattr(self.env, 'obstacle', None)
+        if obs_type:
+            if obs_type == 'human':
+                # 'human' obstacle reuses the posed_person fixture (no separate
+                # obstacle_* body is spawned in kitchen_navigate_safe.py:580).
+                # Alias 'human' to the posed_person geoms so parse_query_obj('human')
+                # resolves correctly.
+                posed_ids = self.name2ids.get('posed') or []
+                if posed_ids:
+                    self.name2ids['human'] = list(posed_ids)
+            else:
+                obstacle_ids = []
+                for i in range(self.env.sim.model.ngeom):
+                    body_id = self.env.sim.model.geom_bodyid[i]
+                    body_name = self.env.sim.model.body_id2name(body_id) or ''
+                    if body_name.startswith('obstacle'):
+                        obstacle_ids.append(i)
+                if obstacle_ids:
+                    self.name2ids[obs_type] = obstacle_ids
+        # Populate robot_mask_ids — every geom whose body name belongs to the
+        # robot (mobile_base, arm links, gripper, fingers). Without this,
+        # ignore_robot=True in get_scene_3d_obs is a no-op and the robot's
+        # own mesh leaks into scene_collision, polluting the avoidance map.
+        robot_patterns = ('robot0', 'mobilebase', 'gripper0', 'panda')
+        robot_ids = []
+        arm_ids = []
+        gripper_ids = []
+        for i in range(self.env.sim.model.ngeom):
+            body_id = self.env.sim.model.geom_bodyid[i]
+            body_name = (self.env.sim.model.body_id2name(body_id) or '').lower()
+            if not body_name:
+                continue
+            if any(p in body_name for p in robot_patterns):
+                robot_ids.append(i)
+                if 'gripper' in body_name or 'finger' in body_name or 'eef' in body_name:
+                    gripper_ids.append(i)
+                elif 'link' in body_name or 'right_hand' in body_name:
+                    arm_ids.append(i)
+        self.robot_mask_ids = robot_ids
+        self.arm_mask_ids = arm_ids
+        self.gripper_mask_ids = gripper_ids
+        logger.info(f"robot_mask_ids: {len(robot_ids)} geoms (arm={len(arm_ids)}, gripper={len(gripper_ids)})")
+
     # Default cameras for VLM: top-down, front view, agent center, human 1st-person
     _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_person_main_group_1stview']
+    # Cameras whose per-step frames we record into mp4 for downstream review.
+    # Includes the legacy `robot0_agentview_left` so older runs remain reproducible.
+    VIDEO_RECORD_CAMERAS = tuple(_DEFAULT_VLM_CAMERAS) + ('robot0_agentview_left',)
 
     def get_representative_images(self, cam_names=None):
         """Get camera view images for VLM input.
@@ -348,12 +446,32 @@ class VoxPoserRobocasa():
                 self.workspace_bounds_min = np.array([points[:,0].min(), points[:,1].min(), points[:,2].min()])
                 self.workspace_bounds_max = np.array([points[:,0].max(), points[:,1].max(), points[:,2].max()])
             else: # Navigation
-                bbox_min = self.env.sim.data.xpos.min(axis=0)
-                bbox_max = self.env.sim.data.xpos.max(axis=0)
-                center = (bbox_min + bbox_max) / 2
-                half_size = (bbox_max - bbox_min).max() / 2
-                self.workspace_bounds_min = center - half_size
-                self.workspace_bounds_max = center + half_size
+                # Per-axis bounds (rectangular allowed) — the previous logic forced
+                # a cube via half_size = (max - min).max(), which made cells huge
+                # whenever any layout had an outlier body (e.g. standing_table at
+                # y=-7.5 in L8). Now each axis is sized to its own scene span.
+                # Exclude bodies that don't belong to the floor scene:
+                #   - world (origin marker)
+                #   - *eef_target* (placed at z=-1, below the floor)
+                #   - *standing_table* (room furniture far outside the kitchen,
+                #     consistently the y/x-axis outlier in L1/L3/L6/L7/L8/L9)
+                xpos = self.env.sim.data.xpos
+                model = self.env.sim.model
+                keep = np.ones(len(xpos), dtype=bool)
+                # Exclude only standing_table — it's consistently the outlier
+                # stretching the bbox in L1/L3/L6/L7/L8/L9 (always at y=±7m or
+                # x=7.5m, far outside the kitchen). Keep world (some layouts like
+                # L2 use origin as x_min — excluding it shrinks the workspace
+                # and breaks the navigation corridor) and eef_target (z=-1 only
+                # nudges z bound, harmless for XY).
+                exclude_patterns = ('standing_table',)
+                for i in range(model.nbody):
+                    n = (model.body_id2name(i) or '').lower()
+                    if any(p in n for p in exclude_patterns):
+                        keep[i] = False
+                xpos_clean = xpos[keep]
+                self.workspace_bounds_min = xpos_clean.min(axis=0).copy()
+                self.workspace_bounds_max = xpos_clean.max(axis=0).copy()
             return
 
         # get object points
@@ -546,19 +664,24 @@ class VoxPoserRobocasa():
         obs, reward, terminate, _ = self.env.step(action)
         terminate = terminate or self.env._check_success()
         self._trajectory.append(obs['robot0_base_pos'].copy())
+        try:
+            from transforms3d.euler import quat2euler
+            self._trajectory_yaw.append(float(quat2euler(obs['robot0_base_quat'])[0]))
+        except Exception:
+            self._trajectory_yaw.append(0.0)
         self.latest_obs = obs
         self.latest_reward = reward
         self.latest_terminate = terminate
         self.latest_action = action
         return obs, reward, terminate
 
-    def move_to_pose(self, pose, speed=None):
+    def move_to_pose(self, pose, velocity=None):
         """
         Moves the robot arm to a specific pose.
 
         Args:
             pose: The target pose.
-            speed: The speed at which to move the arm. Currently not implemented.
+            velocity: The velocity at which to move the arm. Currently not implemented.
 
         Returns:
             tuple: A tuple containing the latest observations, reward, and termination flag.
@@ -671,14 +794,14 @@ class VoxPoserRobocasa():
         dt = 1.0 / control_freq
         metrics = compute_all_metrics(positions, dt)
         # For navigation tasks, merge richer metrics from benchmark's trajectory_info
-        # (includes obstacle intrusion, v_app computed at TRAJECTORY_LOG_INTERVAL cadence)
+        # (includes obstacle intrusion, v_b computed at TRAJECTORY_LOG_INTERVAL cadence)
         if self.navigate_task and hasattr(self.env, 'get_trajectory_info'):
             try:
                 traj_info = self.env.get_trajectory_info()
                 for key in ('boundary_violation_ratio', 'boundary_violation_steps',
                             'obstacle_min_distance', 'obstacle_contact_steps',
-                            'obstacle_contact_ratio', 'v_app',
-                            'timeseries_speed', 'timeseries_jerk',
+                            'obstacle_contact_ratio', 'v_b',
+                            'timeseries_velocity', 'timeseries_jerk',
                             'timeseries_min_obstacle_distance',
                             'timeseries_obstacle_distances'):
                     if key in traj_info:
@@ -700,6 +823,7 @@ class VoxPoserRobocasa():
         self.latest_action = None
         self.grasped_obj_ids = None
         self._trajectory = []
+        self._trajectory_yaw = []
         # scene-specific helper variables
         self.arm_mask_ids = None
         self.gripper_mask_ids = None
