@@ -9,6 +9,7 @@ import time
 from scipy.ndimage import distance_transform_edt
 import transforms3d
 from modules.controllers import NavigationController, ManipulationController
+from envs.robocasa_env import VoxPoserRobocasa, KITCHEN_GROUP_SUBNAMES
 from tqdm import tqdm
 from transforms3d.euler import quat2euler
 
@@ -43,7 +44,12 @@ class LMP_interface():
         nav_controller_config = {}
     self._yaw_threshold = nav_controller_config.get('yaw_threshold', YAW_THRESHOLD_DEFAULT)
     self._dist_threshold = nav_controller_config.get('dist_threshold', DIST_THRESHOLD_DEFAULT)
-    self._max_steps_per_waypoint = nav_controller_config.get('max_steps_per_waypoint', 50)
+    self._max_steps_per_waypoint = nav_controller_config.get('max_steps_per_waypoint', 100)
+    # When True, parse_query_obj() / detect() auto-resolve fixture queries
+    # (coffee_machine, sink, stove, ...) to fixture.pos instead of the
+    # visible point-cloud centroid. Default True — flip to False to
+    # restore legacy centroid behaviour.
+    self._use_fixture_pos = bool(self._cfg.get('use_fixture_pos', True))
 
     # calculate size of each voxel (resolution)
     self._resolution = (self._env.workspace_bounds_max - self._env.workspace_bounds_min) / self._map_size
@@ -55,7 +61,23 @@ class LMP_interface():
     return self._world_to_voxel(self._env.get_ee_pos())
   
   def detect(self, obj_name):
-    """return an observation dict containing useful information about the object"""
+    """Return an observation dict for the object.
+
+    When the env config has `interfaces.use_fixture_pos: true` (default),
+    queries that match a known kitchen *fixture* (coffee_machine, sink,
+    stove, fridge, microwave, oven, dishwasher) automatically resolve
+    `position` / `_position_world` to the fixture's reference pose
+    (`fixture.pos`) instead of the visible point-cloud centroid.
+
+    Why this matters: visible-mesh centroid can be 30cm–1m off
+    fixture.pos (fridge sliding doors, sink basin interior, coffee
+    machine front face). Goal-success uses fixture.pos with a 0.5m
+    threshold, so anchoring affordance to fixture.pos closes that gap.
+
+    Movable obstacles (cat, dog, person, ...) are not in the fixtures
+    registry so they always fall back to visible centroid — which is
+    what we want (avoidance halo around the actual mesh).
+    """
     print("object name:", obj_name)
     # if obj_name.lower() == 'robot_mobile_base':
     #   import sys, os, logging
@@ -74,6 +96,35 @@ class LMP_interface():
     #   sys.stdout = _saved_stdout
     #   sys.stderr = sys.__stderr__
     #   logging.disable(logging.NOTSET)
+    # Grouped 'kitchen' label → union of all kitchen-furniture point clouds
+    # so the LLM can avoid the generic kitchen as a single semantic obstacle.
+    if obj_name.lower() == 'kitchen':
+      obs_dict = dict()
+      pcs, normals = [], []
+      for _sub in KITCHEN_GROUP_SUBNAMES:
+        try:
+          (_, _), (sub_pc, sub_n) = self._env.get_3d_obs_by_name(_sub)
+          if sub_pc is not None and len(sub_pc):
+            pcs.append(np.asarray(sub_pc))
+            normals.append(np.asarray(sub_n))
+        except Exception:
+          continue
+      if not pcs:
+        # Fall back to default detect path so we don't crash
+        return self.detect('counter')
+      obj_pc = np.concatenate(pcs, axis=0)
+      obj_normal = np.concatenate(normals, axis=0)
+      voxel_map = self._points_to_voxel_map(obj_pc)
+      aabb_min = self._world_to_voxel(np.min(obj_pc, axis=0))
+      aabb_max = self._world_to_voxel(np.max(obj_pc, axis=0))
+      obs_dict['occupancy_map'] = voxel_map
+      obs_dict['name'] = 'kitchen'
+      obs_dict['position'] = self._world_to_voxel(np.mean(obj_pc, axis=0))
+      obs_dict['aabb'] = np.array([aabb_min, aabb_max])
+      obs_dict['_position_world'] = np.mean(obj_pc, axis=0)
+      obs_dict['_point_cloud_world'] = obj_pc
+      obs_dict['normal'] = normalize_vector(obj_normal.mean(axis=0))
+      return Observation(obs_dict)
     if obj_name.lower() in EE_ALIAS:
       obs_dict = dict()
       obs_dict['name'] = obj_name
@@ -108,8 +159,42 @@ class LMP_interface():
       obs_dict['_position_world'] = np.mean(obj_pc, axis=0)  # in world frame
       obs_dict['_point_cloud_world'] = obj_pc  # in world frame
       obs_dict['normal'] = normalize_vector(obj_normal.mean(axis=0))
+    # Auto-resolve to fixture.pos when configured and a matching kitchen
+    # fixture exists. Movable obstacles fall through (no fixture match).
+    if getattr(self, '_use_fixture_pos', True):
+      _fpos = self._lookup_fixture_pos(obj_name)
+      if _fpos is not None:
+        obs_dict['_position_world'] = np.asarray(_fpos)
+        obs_dict['position'] = self._world_to_voxel(np.asarray(_fpos))
     object_obs = Observation(obs_dict)
     return object_obs
+
+  def _lookup_fixture_pos(self, obj_name):
+    """Return (x, y, z) of the matching kitchen fixture's reference frame.
+    Returns None if no fixture matches `obj_name`. Used by `detect(.., as_target=True)`
+    to anchor affordance/goal to fixture.pos instead of visible centroid."""
+    try:
+      kitchen = getattr(self._env, "env", None)
+      if kitchen is None: return None
+      fixtures = getattr(kitchen, "fixtures", None) or {}
+      target_alias = {
+          "coffee_machine": ("coffee", "coffeemachine"),
+          "sink":           ("sink",),
+          "stove":          ("stove", "stovetop"),
+          "stovetop":       ("stove", "stovetop"),
+          "fridge":         ("fridge",),
+          "microwave":      ("microwave", "micro"),
+          "oven":           ("oven",),
+          "dishwasher":     ("dishwasher",),
+      }
+      keys = target_alias.get(obj_name.lower(), (obj_name.lower(),))
+      for fname, fix in fixtures.items():
+        fl = fname.lower()
+        if any(k in fl for k in keys) and hasattr(fix, "pos"):
+          return np.asarray(fix.pos)
+    except Exception as e:
+      logger.debug(f"_lookup_fixture_pos({obj_name}) failed: {e}")
+    return None
 
   def save_image(self, array, save_path="tmp.png"):
       save_image(array, save_path)
@@ -124,6 +209,11 @@ class LMP_interface():
               velocity_map=None, **kwargs):
     """
     Plan a navigation path then follow it with the controller.
+
+    Side effect for downstream visualisation:
+      Saves `{output_dir}/voxposer_dump.npz` containing a per-plan-iter record
+      of (path_pixel, traj_world, affordance/avoidance/rotation/velocity maps,
+      start_pos). Used by `scripts/visualize_voxposer_task.py`.
 
     Args:
       movable_obs_func: callable returning observation of the body to be moved
@@ -157,8 +247,14 @@ class LMP_interface():
         _avoidance_map = self._preprocess_avoidance_pixel_map(_avoidance_map, _affordance_map, movable_obs)
         start_pos = movable_obs['position'][:2]
         start_time = time.time()
+        # Inflation disabled (0 cells) — first verify robot_mask_ids fix in
+        # robocasa_env.py:load_task() actually filters robot mesh out of
+        # scene_collision. With clean avoidance map, paths may already be
+        # traversable. Re-enable inflation only if collision issues persist.
+        _robot_radius_cells = 0
         path_pixel, planner_info = self._planner.navigation_optimize(start_pos, _affordance_map, _avoidance_map,
-                                                                      object_centric=object_centric)
+                                                                      object_centric=object_centric,
+                                                                      robot_radius_cells=_robot_radius_cells)
         logger.debug(f'[{get_clock_time()}] planner time: {time.time() - start_time:.3f}s')
         assert len(path_pixel) > 0, 'path_pixel is empty'
         step_info['path_pixel'] = path_pixel
@@ -199,14 +295,7 @@ class LMP_interface():
             controller_info['controller_step'] = step_idx
             controller_info['target_waypoint'] = waypoint
             # Capture every VLM-input camera viewpoint for downstream review.
-            # Keep `robot0_agentview_left` for legacy compat.
-            for _vlm_cam in (
-                'topview',
-                'robot0_frontview',
-                'robot0_agentview_center',
-                'posed_person_main_group_1stview',
-                'robot0_agentview_left',
-            ):
+            for _vlm_cam in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
                 _key = f"{_vlm_cam}_image"
                 if _key in controller_info['mp_info'][0]:
                     controller_info[_key] = controller_info['mp_info'][0][_key][::-1]
@@ -216,9 +305,12 @@ class LMP_interface():
             if np.linalg.norm(dxy) <= dist_threshold:
               last_yaw = np.asarray(waypoint[1]).item() if np.asarray(waypoint[1]).size == 1 else 0.0
               if is_last and last_yaw != 0.0:
-                # Last waypoint with target yaw: also check orientation
+                # Last waypoint with target yaw: also check orientation.
+                # Use config yaw_threshold (default 0.35 rad ≈ 20°) — must be
+                # tighter than success threshold (0.8 cos ≈ 36.9°) so the robot
+                # doesn't exit the waypoint loop just outside the success cone.
                 yaw_error = abs((last_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi)
-                if yaw_error < 0.785:  # ~45 degrees
+                if yaw_error < self._yaw_threshold:
                   waypoint_reach = True
                   break
                 # Position OK but yaw not aligned yet — keep rotating
@@ -236,19 +328,159 @@ class LMP_interface():
         if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
           logger.info(f'[{get_clock_time()}] reached target; terminating')
           break
-    # Save one mp4 per VLM-input camera so downstream review/labeling can
-    # reproduce exactly what the VLM sees at inference. `_DEFAULT_VLM_CAMERAS`
-    # in robocasa_env.py is the canonical list; legacy `robot0_agentview_left`
-    # kept for backward compat with prior runs.
-    _SAVE_CAMS = (
-        'topview',
-        'robot0_frontview',
-        'robot0_agentview_center',
-        'posed_person_main_group_1stview',
-        'robot0_agentview_left',
-    )
+    # Dump planner state for offline visualisation. We strip the heavy
+    # `controller_infos` (mp_info has full sim state + camera images) and
+    # only persist arrays that scripts/visualize_voxposer_task.py renders.
+    try:
+      from transforms3d.euler import quat2euler as _q2e
+      _dump_iters = []
+      for _si in execute_info:
+        _wps = _si.get("traj_world") or []
+        _wp_xy = np.asarray([np.asarray(w[0])[:3] for w in _wps]) if _wps else np.empty((0, 3))
+        # Try to recover key-waypoint yaw from the quaternion entry. Quaternion
+        # convention is wxyz here (interfaces._process_obs converts xyzw→wxyz).
+        _wp_yaw = []
+        for _w in _wps:
+          try:
+            _wp_yaw.append(float(_q2e(np.asarray(_w[1]))[0]))
+          except Exception:
+            _wp_yaw.append(0.0)
+        _dump_iters.append({
+          "plan_iter":     int(_si.get("plan_iter", 0)),
+          "start_pos":     np.asarray(_si.get("start_pos")),
+          "path_pixel":    np.asarray(_si.get("path_pixel")),
+          "traj_world":    _wp_xy,
+          "traj_world_yaw": np.asarray(_wp_yaw, dtype=np.float32),
+          "affordance_map": np.asarray(_si.get("affordance_map")),
+          "avoidance_map":  np.asarray(_si.get("avoidance_map")),
+          "rotation_map":   np.asarray(_si.get("rotation_map")),
+          "velocity_map":   np.asarray(_si.get("velocity_map")),
+        })
+      _dump_path = os.path.join(self._output_dir, "voxposer_dump.npz")
+      # Project workspace_bounds 4 corners to topview UV pixels so the
+      # visualiser can warp planner maps onto the kitchen floor exactly
+      # (no floor-mask heuristic needed).
+      _ws_min = np.asarray(self._env.workspace_bounds_min)
+      _ws_max = np.asarray(self._env.workspace_bounds_max)
+      _topview_corners_uv = None
+      try:
+        _sim = self._env.env.sim
+        _cid = _sim.model.camera_name2id('topview')
+        _cam_pos = _sim.data.cam_xpos[_cid].copy()
+        _cam_mat = _sim.data.cam_xmat[_cid].reshape(3, 3).copy()
+        _fovy = float(_sim.model.cam_fovy[_cid])
+        _W = int(self._env.cam_width)
+        _H = int(self._env.cam_height)
+        _fy = (_H / 2.0) / np.tan(np.radians(_fovy / 2.0))
+        _fx = _fy
+        _z = 0.0  # floor plane
+        _corners_world = np.array([
+            [_ws_min[0], _ws_min[1], _z],   # planner (0, 0)
+            [_ws_min[0], _ws_max[1], _z],   # planner (0, map_size-1)
+            [_ws_max[0], _ws_max[1], _z],   # planner (map_size-1, map_size-1)
+            [_ws_max[0], _ws_min[1], _z],   # planner (map_size-1, 0)
+        ])
+        _corners_uv = []
+        for _w in _corners_world:
+            _rel = (_w - _cam_pos)
+            _cam_frame = _cam_mat.T @ _rel
+            _depth = -_cam_frame[2]
+            _u = (_W / 2.0) + _fx * (_cam_frame[0] / _depth)
+            _v = (_H / 2.0) - _fy * (_cam_frame[1] / _depth)
+            _corners_uv.append([float(_u), float(_v)])
+        _topview_corners_uv = np.asarray(_corners_uv)
+      except Exception as _proj_err:
+        logger.warning(f"topview corner projection failed: {_proj_err}")
+
+      # Best-effort: locate the obstacle in world xy. Different task types
+      # surface this in different attributes / fixtures, so try a few.
+      #
+      # Order (corrected 2026-05-07):
+      #   1. obstacle_name == "human" → _get_person_pos() (person is body)
+      #   2. Floor-placed obstacles (cat/dog/kettlebell/vase/crawling_baby):
+      #      look up the actual MuJoCo body whose name starts with "obstacle"
+      #      and use the geom_xpos centroid. Robocasa places these via
+      #      sample_region_kwargs with size=(0.8, 0.8), so they sit anywhere
+      #      up to ~40cm from `_obstacle_blocking_xy` → that planning anchor
+      #      should NOT be reported as the obstacle location.
+      #   3. Fall back to `_obstacle_blocking_xy` (only when (2) finds no
+      #      body — e.g. table-mounted drinks where the body is on a fixture
+      #      and the planning anchor matches well enough).
+      _obstacle_xy = None
+      _obstacle_name = None
+      try:
+        _kitchen = getattr(self._env, "env", None)
+        _obstacle_name = getattr(_kitchen, "obstacle", None) if _kitchen else None
+        if _obstacle_name == "human" and hasattr(self._env, "_get_person_pos"):
+          _p = self._env._get_person_pos()
+          if _p is not None:
+            _obstacle_xy = np.asarray(_p)[:2]
+        if _obstacle_xy is None and _kitchen is not None:
+          _sim2 = _kitchen.sim
+          for _bid in range(_sim2.model.nbody):
+            _nm = _sim2.model.body_id2name(_bid) or ""
+            if _nm.startswith("obstacle"):
+              # body_xpos is the body's reference frame; the actual mesh can
+              # be attached with an offset. Use the mean of geom_xpos for all
+              # geoms attached so the marker lands on the rendered mesh, not
+              # on the body anchor.
+              _gxs = []
+              for _gid in range(_sim2.model.ngeom):
+                if _sim2.model.geom_bodyid[_gid] == _bid:
+                  _gxs.append(_sim2.data.geom_xpos[_gid])
+              if _gxs:
+                _obstacle_xy = np.mean(_gxs, axis=0)[:2]
+              else:
+                _obstacle_xy = np.asarray(_sim2.data.body_xpos[_bid])[:2]
+              break
+        # Final fallback: planning anchor (only used when no obstacle body
+        # exists in the scene — e.g. corrupt task or unusual config).
+        if _obstacle_xy is None and _kitchen is not None:
+          for _attr in ("_obstacle_blocking_xy", "_obstacle_xy",
+                        "obstacle_pos", "_obstacle_pos"):
+            _v = getattr(_kitchen, _attr, None)
+            if _v is not None:
+              _obstacle_xy = np.asarray(_v).reshape(-1)[:2]
+              break
+
+        # Same correction for goal_xy: store the actual visible mesh
+        # centroid of the destination fixture so the goal marker matches
+        # what's rendered. We pull it from the 3-camera point cloud the LMP
+        # already computes (parse_query_obj path), with body_xpos as
+        # fallback. This is a no-op for cases where the two coincide.
+        _goal_xy = None
+        try:
+          _tgt = getattr(_kitchen, "target_fixture", None)
+          if _tgt is not None and hasattr(_tgt, "pos"):
+            _goal_xy = np.asarray(_tgt.pos)[:2]
+        except Exception:
+          pass
+      except Exception as _ob_err:
+        logger.warning(f"obstacle position lookup failed: {_ob_err}")
+
+      _save_kwargs = dict(
+          iters=np.array(_dump_iters, dtype=object),
+          workspace_bounds_min=_ws_min,
+          workspace_bounds_max=_ws_max,
+          map_size=np.asarray(self._map_size),
+      )
+      if _topview_corners_uv is not None:
+          _save_kwargs["topview_corners_uv"] = _topview_corners_uv
+      if _obstacle_xy is not None:
+          _save_kwargs["obstacle_xy"] = np.asarray(_obstacle_xy, dtype=np.float32)
+      if _obstacle_name:
+          _save_kwargs["obstacle_name"] = np.asarray(str(_obstacle_name))
+      if _goal_xy is not None:
+          _save_kwargs["goal_xy_fixture"] = np.asarray(_goal_xy, dtype=np.float32)
+      np.savez_compressed(_dump_path, **_save_kwargs)
+      logger.info(f"voxposer dump → {_dump_path}")
+    except Exception as _dump_err:
+      logger.warning(f"voxposer dump failed: {_dump_err}")
+    # Save one mp4 per recorded camera so downstream review/labeling can
+    # reproduce exactly what the VLM sees at inference. Source of truth:
+    # VoxPoserRobocasa.VIDEO_RECORD_CAMERAS.
     if controller_infos:
-        for _cam in _SAVE_CAMS:
+        for _cam in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
             _kw = f"{_cam}_image"
             # Only save if at least one frame actually has this camera.
             if any(_kw in v for v in controller_infos.values()):
@@ -347,9 +579,16 @@ class LMP_interface():
           controller_info['target_waypoint'] = waypoint
           controller_info['robot0_agentview_left_image'] = controller_info['mp_info'][0]['robot0_agentview_left_image'][::-1]
           controller_infos[i] = controller_info
-          save_video_images(controller_infos)
         step_info['controller_infos'] = controller_infos
         execute_info.append(step_info)
+        if controller_infos:
+          _kw = 'robot0_agentview_left_image'
+          if any(_kw in v for v in controller_infos.values()):
+            save_video_images(
+                controller_infos,
+                keyword=_kw,
+                save_path=os.path.join(self._output_dir, f"{_kw}.mp4"),
+            )
         # check whether we need to replan
         curr_pos = movable_obs['position']
         if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
@@ -460,19 +699,95 @@ class LMP_interface():
       voxel_map[min_x:max_x, min_y:max_y, min_z:max_z] = value
     return voxel_map
   
-  def set_pixel_by_radius(self, pixel_map, pixel_xy, radius_cm=0, value=1):
-    """given a 2D np array, set the value of the pixel at pixel_xy to value. If radius is specified, set the value of all pixels within the radius to value."""
-    if pixel_map is None or pixel_xy is None:
+  def set_pixel_by_radius(self, pixel_map, pixel_xy_or_obj, radius_cm=0, value=1):
+    """Set `value` over a region of `pixel_map`. Two modes:
+
+    Object mode (preferred for fixtures and grouped objects):
+        pixel_xy_or_obj is an Observation dict with `occupancy_map`. The
+        actual obstacle geometry is dilated by `radius_cm` cells, so the
+        avoidance halo follows the real mesh — not a centroid disk that
+        collapses to floor-center for perimeter-distributed obstacles
+        (counter, kitchen group, etc.).
+
+    Point mode (legacy):
+        pixel_xy_or_obj is [x, y] (or [x, y, z]). Sets a square of size
+        2·radius_cm centred at that point.
+    """
+    if pixel_map is None or pixel_xy_or_obj is None:
         return pixel_map
-    pixel_map[pixel_xy[0], pixel_xy[1]] = value
+
+    # Duck-typed object detection. Supports Observation (dict subclass),
+    # DynamicObservation, IterableDynamicObservation, and raw [x,y].
+    occ = None
+    try:
+      candidate = pixel_xy_or_obj.occupancy_map  # __getattr__ delegates for dynamic types
+      if candidate is not None:
+        occ = np.asarray(candidate)
+    except (AttributeError, KeyError, TypeError):
+      occ = None
+
+    # pixel_map may be VoxelIndexingWrapper without a .shape attr;
+    # underlying ndarray exposes .shape correctly.
+    pm_arr = pixel_map.array if hasattr(pixel_map, 'array') else pixel_map
+    pm_shape = pm_arr.shape
+
+    if occ is not None and occ.size > 0:
+      if occ.ndim == 3:
+        occ = occ.any(axis=2)        # 3D voxel → 2D floor projection
+      occ = occ.astype(bool)
+      if occ.shape != pm_shape:
+        try:
+          import cv2
+          occ = cv2.resize(occ.astype(np.uint8),
+                           (pm_shape[1], pm_shape[0]),
+                           interpolation=cv2.INTER_NEAREST).astype(bool)
+        except Exception:
+          occ = None
+      if occ is not None and occ.any():
+        if radius_cm > 0:
+          from scipy.ndimage import distance_transform_edt
+          radius_cells = max(1, int(round(radius_cm / (self._resolution[0] * 100))))
+          halo = distance_transform_edt(~occ) <= radius_cells
+        else:
+          halo = occ
+        target = pixel_map.array if hasattr(pixel_map, 'array') else pixel_map
+        target[halo] = value
+        # Debug: log how many cells got set vs total
+        try:
+          _name = pixel_xy_or_obj.get('name', '?') if isinstance(pixel_xy_or_obj, dict) else getattr(pixel_xy_or_obj, 'name', '?')
+        except Exception:
+          _name = '?'
+        logger.info(f"[set_pixel_by_radius OCC-MODE] obj={_name} occ_cells={int(occ.sum())} halo_cells={int(halo.sum())} radius_cm={radius_cm}")
+        return pixel_map
+
+    # No usable occupancy_map → fall back to .position
+    pos = None
+    try:
+      candidate = pixel_xy_or_obj.position
+      if candidate is not None:
+        pos = np.asarray(candidate)
+    except (AttributeError, KeyError, TypeError):
+      pos = None
+
+    if pos is not None:
+      pixel_xy = pos
+    else:
+      # Raw sequence [x, y] (numpy array, list, tuple)
+      try:
+        pixel_xy = [pixel_xy_or_obj[0], pixel_xy_or_obj[1]]
+      except (TypeError, KeyError, IndexError):
+        return pixel_map  # can't locate — no-op
+
+    # Legacy point mode
+    logger.info(f"[set_pixel_by_radius PT-MODE] xy={pixel_xy} radius_cm={radius_cm}")
+    pixel_map[int(pixel_xy[0]), int(pixel_xy[1])] = value
     if radius_cm > 0:
       radius_x = self.cm2index(radius_cm, 'x')
       radius_y = self.cm2index(radius_cm, 'y')
-      # simplified version - use rectangle instead of circle (because it is faster)
-      min_x = max(0, pixel_xy[0] - radius_x)
-      max_x = min(self._map_size, pixel_xy[0] + radius_x + 1)
-      min_y = max(0, pixel_xy[1] - radius_y)
-      max_y = min(self._map_size, pixel_xy[1] + radius_y + 1)
+      min_x = max(0, int(pixel_xy[0]) - radius_x)
+      max_x = min(self._map_size, int(pixel_xy[0]) + radius_x + 1)
+      min_y = max(0, int(pixel_xy[1]) - radius_y)
+      max_y = min(self._map_size, int(pixel_xy[1]) + radius_y + 1)
       pixel_map[min_x:max_x, min_y:max_y] = value
     return pixel_map
 
@@ -670,8 +985,9 @@ class LMP_interface():
     direction_vector = to_goal_xy - goal_xy
     cur_xy = self._env.env._get_observations()['robot0_base_pos']
     cur_yaw = quat2euler(self._env.env._get_observations()['robot0_base_quat'])[0]
-    
-    # lookahead smoothing
+
+    # lookahead smoothing — drive toward a point 0.3m ahead of goal_xy
+    # along the segment direction so motion is smoother through corners.
     seg_len = np.linalg.norm(direction_vector) + 1e-8
     seg_dir = direction_vector / seg_len
     L = 0.3
@@ -683,16 +999,25 @@ class LMP_interface():
     else:
       goal_yaw = goal_yaw_scalar
 
-    dx = goal_xy[0] - cur_xy[0]
-    dy = goal_xy[1] - cur_xy[1]
+    # Drive toward the lookahead point (target_xy) instead of exact goal_xy
+    # for smoother motion. Use cosine-scaled translation: PandaOmron is
+    # holonomic so x/y/yaw move simultaneously, but we damp translation
+    # when the robot is far off-yaw to avoid weird sideways drifting.
+    dx = target_xy[0] - cur_xy[0]
+    dy = target_xy[1] - cur_xy[1]
     delta_yaw = (goal_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi
 
     v_x = dx * np.cos(cur_yaw) + dy * np.sin(cur_yaw)
     v_y = -dx * np.sin(cur_yaw) + dy * np.cos(cur_yaw)
+    # move_factor = cos(delta_yaw) clamped to [0, 1]:
+    #   0° error  → 1.0 (full forward speed)
+    #   60° error → 0.5
+    #   90° error → 0.0 (rotate only)
+    #   >90°      → 0.0 (rotate only — don't move backward)
+    move_factor = max(0.0, float(np.cos(delta_yaw)))
     action = np.zeros(3)
-    if abs(delta_yaw)  < self._yaw_threshold:
-      action[0] = v_x * goal_vel * kp
-      action[1] = v_y * goal_vel * kp
+    action[0] = v_x * goal_vel * kp * move_factor
+    action[1] = v_y * goal_vel * kp * move_factor
     action[2] = delta_yaw * goal_vel * kp
     action = np.clip(action, -1.0, 1.0)
     return action, delta_yaw
@@ -718,32 +1043,108 @@ class LMP_interface():
     avoidance_map = np.clip(avoidance_map, 0, 1)
     return avoidance_map
 
-  def _preprocess_avoidance_pixel_map(self, avoidance_map, affordance_map, movable_obs, robot_radius=0.35):
+  def _preprocess_avoidance_pixel_map(self, avoidance_map, affordance_map, movable_obs,
+                                      robot_radius=0.35, r_scene_m=0.55, r_llm_m=0.32):
     scene_collision_map = self._get_scene_collision_pixel_map()
-    target_idx = np.unravel_index(np.argmax(affordance_map), affordance_map.shape)
-    # Clear scene_collision near target so robot can approach through fixture geometry.
-    # r=10px ~= 1m at 0.1m/px — enough to let robot reach within success threshold.
-    r_scene = 10
-    sy0 = max(0, target_idx[0]-r_scene); sy1 = min(scene_collision_map.shape[0], target_idx[0]+r_scene)
-    sx0 = max(0, target_idx[1]-r_scene); sx1 = min(scene_collision_map.shape[1], target_idx[1]+r_scene)
-    scene_collision_map[sy0:sy1, sx0:sx1] = 0
-    # Clear LLM avoidance near affordance target so robot can approach within threshold.
-    r = 6
-    y0, y1 = max(0, target_idx[0]-r), min(avoidance_map.shape[0], target_idx[0]+r)
-    x0, x1 = max(0, target_idx[1]-r), min(avoidance_map.shape[1], target_idx[1]+r)
-    avoidance_map[y0:y1, x0:x1] = 0
-    # clear collision around robot start position so it can move out
-    start_pos = movable_obs['position']
-    ignore_mask = np.ones_like(avoidance_map)
+    H, W = avoidance_map.shape
+    # (A) Radii expressed in meters and converted to pixels via the actual cell
+    # resolution — robust to workspace size changes.
+    # r_scene_m ≥ 0.5m goal-success threshold so the robot can reach the goal.
     xy = self._compute_pixel_resolution()
-    margin = np.ceil(robot_radius/xy)+1
+    cell_m = float(xy.min())
+    r_scene = int(np.ceil(r_scene_m / cell_m))
+    r_llm   = int(np.ceil(r_llm_m / cell_m))
+    # (C) Use full affordance footprint (not just argmax) as the target region —
+    # fall back to argmax if affordance is empty so behavior degrades gracefully.
+    target_mask = affordance_map > 0
+    if not target_mask.any():
+        ti = np.unravel_index(np.argmax(affordance_map), affordance_map.shape)
+        target_mask = np.zeros_like(affordance_map, dtype=bool)
+        target_mask[ti] = True
+    # (B) Circular clear via Euclidean distance transform — isotropic, no axial bias.
+    # avoidance_map may be a VoxelIndexingWrapper; reach the underlying ndarray
+    # for boolean-mask indexing (the wrapper's __setitem__ chokes on bool masks).
+    av_arr = avoidance_map.array if hasattr(avoidance_map, 'array') else avoidance_map
+    target_dist = distance_transform_edt(~target_mask)
+    scene_collision_map[target_dist <= r_scene] = 0
+    av_arr[target_dist <= r_llm] = 0
+    # Clear collision around robot start position so it can move out.
+    # (B) Circular clear here too.
+    start_pos = movable_obs['position']
     sp0, sp1 = int(start_pos[0]), int(start_pos[1])
-    m0, m1 = int(margin[0]), int(margin[1])
-    ignore_mask[sp0 - m0:sp0 + m0, sp1 - m1:sp1 + m1] = 0
-    scene_collision_map *= ignore_mask
-    avoidance_map += scene_collision_map
-    avoidance_map = np.clip(avoidance_map, 0, 1)
+    xy = self._compute_pixel_resolution()
+    margin = int(np.ceil(robot_radius / float(xy.min()))) + 1
+    yy, xx = np.ogrid[:H, :W]
+    start_clear = (yy - sp0)**2 + (xx - sp1)**2 <= margin**2
+    scene_collision_map[start_clear] = 0
+    av_arr += scene_collision_map
+    np.clip(av_arr, 0, 1, out=av_arr)
+    # (E) Robot footprint mask — project every robot body's geom_xpos to floor
+    # and force those cells (and a 1-cell dilation buffer) to be free. The
+    # camera-mask exclusion in get_scene_3d_obs handles point-cloud level, but
+    # the 35cm start_clear circle alone may miss the arm/gripper footprint
+    # when extended.
+    robot_mask = self._get_robot_floor_footprint(H, W)
+    if robot_mask is not None:
+        av_arr[robot_mask] = 0
+    # (D) Force workspace boundary ring to obstacle — applied AFTER all clearing
+    # logic so the border is never carved out by goal/start clear.
+    border_w = max(1, int(np.ceil(0.10 / cell_m)))   # ~10cm ring
+    av_arr[:border_w, :] = 1.0
+    av_arr[-border_w:, :] = 1.0
+    av_arr[:, :border_w] = 1.0
+    av_arr[:, -border_w:] = 1.0
     return avoidance_map
+
+  def _get_robot_floor_footprint(self, H, W):
+    """Project all robot body geom positions to a 2D floor mask in the
+    avoidance grid. Returns (H, W) bool array or None if env unavailable.
+    Uses workspace_bounds to convert world XY → grid index. Dilates by 1
+    cell so adjacent corners are also cleared.
+    """
+    try:
+      sim = self._env.env.sim
+      model = sim.model
+      wmin = self._env.workspace_bounds_min[:2]
+      wmax = self._env.workspace_bounds_max[:2]
+    except (AttributeError, TypeError):
+      return None
+    if wmax[0] - wmin[0] <= 0 or wmax[1] - wmin[1] <= 0:
+      return None
+    # Identify robot body IDs by name pattern. Include gripper bodies (their
+    # geoms can extend horizontally when arm is pointed forward and project
+    # to floor cells outside the start_clear circle). Exclude eef_target
+    # bodies (placed at z=-1, below floor; would land as phantom obstacle
+    # near origin XY).
+    robot_body_ids = set()
+    for i in range(model.nbody):
+      n = (model.body_id2name(i) or '').lower()
+      if 'eef_target' in n:
+        continue
+      if any(p in n for p in ('robot0', 'mobilebase', 'gripper0', 'panda')):
+        robot_body_ids.add(i)
+    if not robot_body_ids:
+      return None
+    # Collect geom XY (mesh center positions) belonging to robot bodies
+    geom_xy = []
+    for gid in range(model.ngeom):
+      bid = int(model.geom_bodyid[gid])
+      if bid in robot_body_ids:
+        p = sim.data.geom_xpos[gid]
+        geom_xy.append((p[0], p[1]))
+    if not geom_xy:
+      return None
+    geom_xy = np.asarray(geom_xy)
+    # World XY → grid index
+    rr = ((geom_xy[:, 0] - wmin[0]) / (wmax[0] - wmin[0]) * H).round().astype(int)
+    cc = ((geom_xy[:, 1] - wmin[1]) / (wmax[1] - wmin[1]) * W).round().astype(int)
+    rr = np.clip(rr, 0, H - 1); cc = np.clip(cc, 0, W - 1)
+    mask = np.zeros((H, W), dtype=bool)
+    mask[rr, cc] = True
+    # 1-cell dilation buffer so cells adjacent to robot mesh are also cleared
+    from scipy.ndimage import binary_dilation
+    mask = binary_dilation(mask, iterations=1)
+    return mask
   
   def _compute_pixel_resolution(self):
     world_xy = self._voxel_to_world(np.array([1,1,0]))[:2] - self._voxel_to_world(np.array([0,0,0]))[:2]
@@ -792,9 +1193,18 @@ def setup_LMP(env, general_config, debug=False, output_dir=None):
   # Wrap parse_query_obj to return a safe fallback Observation when object not found,
   # preventing 'NoneType' crashes in LLM-generated map code.
   # Must be placed AFTER variable_vars.update(low_level_lmps) so the LMP version is wrapped.
-  _SAFE_FALLBACK_OBS = Observation({'position': np.array([0.0, 0.0, 0.0]),
-                                    'normal': np.array([0.0, 0.0, 1.0]),
-                                    'aabb': np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]])})
+  # Fallback carries every key a real detect() Observation has so LLM code paths
+  # like `obj.occupancy_map` / `obj._point_cloud_world` don't KeyError on miss.
+  _M = lmp_env._map_size
+  _SAFE_FALLBACK_OBS = Observation({
+      'name':                '_fallback',
+      'position':            np.array([0.0, 0.0, 0.0]),
+      'normal':              np.array([0.0, 0.0, 1.0]),
+      'aabb':                np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+      'occupancy_map':       np.zeros((_M, _M, _M), dtype=np.float32),
+      '_position_world':     np.array([0.0, 0.0, 0.0]),
+      '_point_cloud_world':  np.zeros((1, 3), dtype=np.float32),
+  })
   _orig_parse_query_obj = variable_vars.get('parse_query_obj', lmp_env.detect)
   def _safe_parse_query_obj(query):
       try:
