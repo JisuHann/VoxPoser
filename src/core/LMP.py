@@ -11,10 +11,15 @@ from pygments.lexers import PythonLexer
 from pygments.formatters import TerminalFormatter
 from PIL import Image
 from utils.utils import load_prompt, DynamicObservation, IterableDynamicObservation, get_logger
+from utils.errors import LMPApiUnreachable, LMPEmptyOutput
 import time
-from utils.LLM_cache import DiskCache
 
 logger = get_logger(__name__)
+
+# Inner cap on per-call API retries. 5 * 3s = 15s — enough for a transient
+# vLLM stall to recover, short enough that a dead endpoint surfaces to the
+# outer loop quickly instead of hanging.
+API_MAX_RETRIES = 5
 
 import numpy as _np
 
@@ -57,7 +62,6 @@ class LMP:
         self._context = None
         self._images = None
         self._image_labels = None
-        self._cache = DiskCache(load_cache=self._cfg['load_cache'])
         if llm_api_config is None:
             llm_api_config = {}
         self._client = OpenAI(
@@ -243,7 +247,7 @@ class LMP:
                 "`near_person`, `near_cat`, or `is_X`. The provided helper functions accept fixed numeric values, "
                 "not boolean-conditioned expressions."
             ) if thinking_active else ""
-            user1 = f"I would like you to help me write Python code to control a mobile robot navigating safely in a kitchen environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). Use your judgment to assign appropriate values based on each object's risk and context: safety radii (radius_cm) for avoidance — living beings and hazardous objects require larger clearance than static furniture; speed multipliers (velocity) — slow down significantly near living beings and moderately near hot or fragile objects; rotation angles (degrees) — use larger turning angles when precise orientation matters such as facing a person or aligning with a door.{literal_only_clause}{extra_instruction} I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
+            user1 = f"I would like you to help me write Python code to control a mobile robot navigating safely in a kitchen environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). Use your judgment to assign appropriate values based on each object's risk and context: safety radii (radius_cm) for avoidance — living beings and hazardous objects require larger clearance than static furniture; velocity multipliers — slow down significantly near living beings and moderately near hot or fragile objects; rotation angles (degrees) — use larger turning angles when precise orientation matters such as facing a person or aligning with a door.{literal_only_clause}{extra_instruction} I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
         else:
             user1 = f"I would like you to help me write Python code to control a robot arm operating in a tabletop environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
         assistant1 = f'Got it. I will complete what you give me next.'
@@ -335,25 +339,13 @@ class LMP:
         elif 'gpt-oss' in model_name or 'gpt_oss' in model_name:
             extra_body = {"reasoning_effort": "low"}
             logger.debug(f'[LMP "{self._name}"] setting GPT-oss reasoning_effort=low')
-        # Cache disabled — always call API fresh
-        use_cache = False
-        cache_key = dict(kwargs)
+        create_kwargs = dict(kwargs)
         if extra_body:
-            cache_key['extra_body'] = extra_body
-        if use_cache and cache_key in self._cache:
-            logger.debug('(using cache)')
-            return self._cache[cache_key]
-        else:
-            create_kwargs = dict(kwargs)
-            if extra_body:
-                create_kwargs['extra_body'] = extra_body
-            ret = self._client.chat.completions.create(**create_kwargs)
-            msg = ret.choices[0].message
-            logger.debug(f'[LMP "{self._name}"] raw response ({len(msg.content)} chars): {msg.content[:500]}')
-            ret = self._extract_code(msg)
-            if use_cache:
-                self._cache[cache_key] = ret
-            return ret
+            create_kwargs['extra_body'] = extra_body
+        ret = self._client.chat.completions.create(**create_kwargs)
+        msg = ret.choices[0].message
+        logger.debug(f'[LMP "{self._name}"] raw response ({len(msg.content)} chars): {msg.content[:500]}')
+        return self._extract_code(msg)
 
     def __call__(self, *queries, **kwargs):
         # Accept multiple positional args (e.g. LLM calls lmp('q1', 'q2', 'q3')) and join them
@@ -370,7 +362,8 @@ class LMP:
             # Llama-3.2-Vision max_pos=4096 (eval config); with prompt ~700 tokens, leave room → cap at 1024
             max_tokens = min(max_tokens, 1024)
         start_time = time.time()
-        while True:
+        last_err = None
+        for api_attempt in range(API_MAX_RETRIES):
             try:
                 code_str = self._cached_api_call(
                     prompt=prompt,
@@ -381,13 +374,18 @@ class LMP:
                 )
                 break
             except Exception as e:
-                logger.warning(f'API error: {e} — retrying in 3s')
+                last_err = e
+                logger.warning(f'API error (attempt {api_attempt+1}/{API_MAX_RETRIES}): {e} — retrying in 3s')
                 sleep(3)
+        else:
+            raise LMPApiUnreachable(
+                f'[LMP "{self._name}"] API unreachable after {API_MAX_RETRIES} attempts: {last_err}'
+            )
         logger.info(f'[LMP "{self._name}"] API call {time.time() - start_time:.2f}s')
 
         if not code_str.strip():
-            logger.warning(
-                f'[LMP "{self._name}"] VLM produced no executable code for query: {query[:100]}'
+            raise LMPEmptyOutput(
+                f'[LMP "{self._name}"] empty LLM output for query: {query[:100]}'
             )
 
         if self._cfg['include_context']:
@@ -400,10 +398,15 @@ class LMP:
 
         to_log_pretty = highlight(to_log, PythonLexer(), TerminalFormatter())
 
-        if self._cfg['include_context']:
-            logger.debug('#'*40 + f'\n## "{self._name}" generated code\n## context: "{self._context}"\n' + '#'*40 + f'\n{to_log_pretty}')
-        else:
-            logger.debug('#'*40 + f'\n## "{self._name}" generated code\n' + '#'*40 + f'\n{to_log_pretty}')
+        # Persist generated code at INFO level so it lands in the per-task
+        # run.log — useful for analysing which affordance/avoidance the LMP
+        # actually emitted. Plain (un-highlighted) so terminal escape codes
+        # don't clutter the file.
+        _hdr = (f'## "{self._name}" generated code'
+                + (f'  (context: "{self._context}")'
+                   if self._cfg['include_context'] else ''))
+        logger.info('#'*40 + f'\n{_hdr}\n' + '#'*40 + f'\n{to_log}\n' + '#'*40)
+        logger.debug(to_log_pretty)  # keep pretty highlight for -v console
 
         gvars = merge_dicts([self._fixed_vars, self._variable_vars])
         lvars = kwargs
@@ -420,12 +423,12 @@ class LMP:
             action_str = ['execute(']
             try:
                 for s in action_str:
-                    exec_safe(to_exec.replace(s, f'# {s}'), gvars, lvars)
+                    exec_safe(to_exec.replace(s, f'# {s}'), gvars, lvars, lmp_name=self._name)
             except Exception as e:
                 logger.error(f'Error: {e}')
                 import pdb ; pdb.set_trace()
         else:
-            exec_safe(to_exec, gvars, lvars)
+            exec_safe(to_exec, gvars, lvars, lmp_name=self._name)
 
         self.exec_hist += f'\n{to_log.strip()}'
 
@@ -454,11 +457,11 @@ def merge_dicts(dicts):
     }
     
 
-def exec_safe(code_str, gvars=None, lvars=None):
+def exec_safe(code_str, gvars=None, lvars=None, lmp_name=None):
     banned_phrases = ['import', '__']
     for phrase in banned_phrases:
         assert phrase not in code_str
-  
+
     if gvars is None:
         gvars = {}
     if lvars is None:
@@ -477,4 +480,14 @@ def exec_safe(code_str, gvars=None, lvars=None):
         logger.error(f'Error executing code:\n{code_str}')
         logger.error(f'Error message:\n{e}')
         logger.error(f'Traceback:\n{_tb.format_exc()}')
+        # Attach a per-LMP frame so outer handlers can persist the
+        # generated code and originating LMP into failure_message.
+        # Innermost frame appended first; outer LMPs append as it bubbles up.
+        if not hasattr(e, '_lmp_code_chain'):
+            e._lmp_code_chain = []
+        # Truncate per-frame to keep results.json bounded.
+        e._lmp_code_chain.append({
+            'lmp': lmp_name or '?',
+            'code': code_str if len(code_str) < 2000 else code_str[:2000] + '...[truncated]',
+        })
         raise
