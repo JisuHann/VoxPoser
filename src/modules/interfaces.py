@@ -858,6 +858,18 @@ class LMP_interface():
     return collision_voxel
 
   def _get_scene_collision_pixel_map(self):
+    """Build scene_collision pixel map from KITCHEN FIXTURE FOOTPRINTS, not
+    point cloud. Point-cloud-based collision is patchy because tall fixtures
+    (counter, sink, fridge) only expose top/side surfaces to cameras, leaving
+    holes in the projected XY map. Body-AABB projection gives the actual
+    obstacle footprint at floor level — same idea as _get_robot_floor_footprint
+    but for fixtures.
+    """
+    if hasattr(self, '_env') and self._env is not None:
+      mask = self._get_fixture_floor_footprint(self._map_size, self._map_size)
+      if mask is not None:
+        return mask.astype(np.float64)
+    # Fallback: point-cloud based (used if env is missing or no fixture detected)
     collision_points_world, _ = self._env.get_scene_3d_obs(ignore_robot=True)
     collision_pixel = self._points_to_pixel_map(collision_points_world)
     return collision_pixel
@@ -1174,6 +1186,75 @@ class LMP_interface():
       return None
     return mask
   
+  def _get_fixture_floor_footprint(self, H, W):
+    """Project all kitchen FIXTURE body geom AABBs to a 2D floor mask.
+
+    Replaces the point-cloud-based scene_collision (which is patchy because
+    cameras only see exposed surfaces of tall fixtures, leaving the interior
+    footprint blank). Same projection style as _get_robot_floor_footprint,
+    but excludes robot, floor, eef_target — everything else (counter, sink,
+    fridge, oven, dishwasher, stove, walls, doors, etc.) is treated as
+    static obstacle at the cell its geom_rbound disk covers.
+
+    Returns (H, W) bool array or None if env unavailable.
+    """
+    try:
+      sim = self._env.env.sim
+      model = sim.model
+      wmin = self._env.workspace_bounds_min[:2]
+      wmax = self._env.workspace_bounds_max[:2]
+    except (AttributeError, TypeError):
+      return None
+    if wmax[0] - wmin[0] <= 0 or wmax[1] - wmin[1] <= 0:
+      return None
+
+    # Bodies to EXCLUDE from fixture footprint:
+    #   - robot bodies (handled separately as movable)
+    #   - floor geoms (the navigable surface, not an obstacle)
+    #   - eef_target / *_target / world (visualisation markers, not physical)
+    exclude_patterns = ('robot0', 'mobilebase', 'gripper0', 'panda',
+                        'eef_target', '_target', 'world',
+                        'standing_table')  # outlier room furniture
+    # Floor geoms are excluded by geom name (rather than body name) since
+    # the Floor fixture body may contain non-floor geoms too.
+    exclude_body_ids = set()
+    for i in range(model.nbody):
+      n = (model.body_id2name(i) or '').lower()
+      if any(p in n for p in exclude_patterns):
+        exclude_body_ids.add(i)
+
+    sx_m = (wmax[0] - wmin[0]) / H
+    sy_m = (wmax[1] - wmin[1]) / W
+    cell_min_m = float(min(sx_m, sy_m))
+    yy, xx = np.ogrid[:H, :W]
+    mask = np.zeros((H, W), dtype=bool)
+    for gid in range(model.ngeom):
+      gname = (model.geom_id2name(gid) or '').lower()
+      if 'floor' in gname:
+        continue   # floor surface — navigable, not obstacle
+      bid = int(model.geom_bodyid[gid])
+      if bid in exclude_body_ids:
+        continue
+      p = sim.data.geom_xpos[gid]
+      # Skip very-low geoms (markers placed below floor)
+      if p[2] < -0.05:
+        continue
+      # Skip very-high geoms above robot reach (light fixtures, ceiling lamps)
+      # — robot base navigates at z≈0.4, anything above 1.8m can't collide.
+      if p[2] > 1.8:
+        continue
+      # Convert geom XY to grid coords
+      r = (p[0] - wmin[0]) / (wmax[0] - wmin[0]) * H
+      c = (p[1] - wmin[1]) / (wmax[1] - wmin[1]) * W
+      rb_m = float(model.geom_rbound[gid])
+      if rb_m <= 0:
+        continue
+      r_cells = max(1, int(np.ceil(rb_m / cell_min_m)))
+      mask |= (yy - r)**2 + (xx - c)**2 <= r_cells**2
+    if not mask.any():
+      return None
+    return mask
+
   def _compute_pixel_resolution(self):
     world_xy = self._voxel_to_world(np.array([1,1,0]))[:2] - self._voxel_to_world(np.array([0,0,0]))[:2]
     return world_xy
