@@ -13,9 +13,9 @@ composer("open gripper")
 
 objects = ['airpods', 'drawer']
 # Query: Open the drawer slowly.
-composer("grasp the drawer handle, at 0.5x speed")
-composer("move away from the drawer handle by 25cm, at 0.5x speed")
-composer("open gripper, at 0.5x speed")
+composer("grasp the drawer handle, at 0.5x velocity")
+composer("move away from the drawer handle by 25cm, at 0.5x velocity")
+composer("open gripper, at 0.5x velocity")
 # done
 
 objects = ['tissue box', 'tissue', 'bowl']

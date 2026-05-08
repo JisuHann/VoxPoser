@@ -25,27 +25,27 @@ bowl = parse_query_obj('bowl')
 set_pixel_by_radius(velocity_map, bowl.position, radius_cm=10, value=0.5)
 ret_val = velocity_map
 
-# Query: quarter of the speed when within 9cm from the yellow line.
+# Query: quarter of the velocity when within 9cm from the yellow line.
 velocity_map = get_empty_velocity_map(task='navigation')
 yellow_line = parse_query_obj('yellow_line')
 set_pixel_by_radius(velocity_map, yellow_line.position, radius_cm=9, value=0.25)
 ret_val = velocity_map
 
-# Query: slow to 0.3 speed within 80cm of the person.
+# Query: slow to 0.3 velocity within 80cm of the person.
 velocity_map = get_empty_velocity_map(task='navigation')
 velocity_map[:] = 1.0
 person = parse_query_obj('person')
 set_pixel_by_radius(velocity_map, person.position, radius_cm=80, value=0.3)
 ret_val = velocity_map
 
-# Query: slow to 0.4 speed within 60cm of the dog.
+# Query: slow to 0.4 velocity within 60cm of the dog.
 velocity_map = get_empty_velocity_map(task='navigation')
 velocity_map[:] = 1.0
 dog = parse_query_obj('dog')
 set_pixel_by_radius(velocity_map, dog.position, radius_cm=60, value=0.4)
 ret_val = velocity_map
 
-# Query: slow to 0.3 speed within 80cm of the person and 0.4 speed within 60cm of the cat.
+# Query: slow to 0.3 velocity within 80cm of the person and 0.4 velocity within 60cm of the cat.
 velocity_map = get_empty_velocity_map(task='navigation')
 velocity_map[:] = 1.0
 person = parse_query_obj('person')
@@ -54,14 +54,14 @@ cat = parse_query_obj('cat')
 set_pixel_by_radius(velocity_map, cat.position, radius_cm=60, value=0.4)
 ret_val = velocity_map
 
-# Query: slow down to 30% speed within 50cm of the rabbit.
+# Query: slow down to 30% velocity within 50cm of the rabbit.
 velocity_map = get_empty_velocity_map(task='navigation')
 velocity_map[:] = 1.0
 rabbit = parse_query_obj('rabbit')
 set_pixel_by_radius(velocity_map, rabbit.position, radius_cm=50, value=0.3)
 ret_val = velocity_map
 
-# Query: move at 20% speed near the bird and 80% speed elsewhere.
+# Query: move at 20% velocity near the bird and 80% velocity elsewhere.
 velocity_map = get_empty_velocity_map(task='navigation')
 velocity_map[:] = 0.8
 bird = parse_query_obj('bird')

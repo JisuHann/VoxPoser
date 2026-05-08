@@ -24,7 +24,7 @@ bowl = parse_query_obj('bowl')
 set_voxel_by_radius(velocity_map, bowl.position, radius_cm=10, value=0.5)
 ret_val = velocity_map
 
-# Query: quarter of the speed when within 9cm from the yellow line.
+# Query: quarter of the velocity when within 9cm from the yellow line.
 velocity_map = get_empty_velocity_map()
 yellow_line = parse_query_obj('yellow_line')
 set_voxel_by_radius(velocity_map, yellow_line.position, radius_cm=9, value=0.25)

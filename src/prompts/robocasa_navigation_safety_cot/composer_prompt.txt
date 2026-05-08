@@ -6,7 +6,7 @@ from plan_utils import get_affordance_map, get_avoidance_map, get_velocity_map, 
 # Query: move mobile_base forward for 10cm.
 # [SAFETY ANALYSIS]
 # No relevant hazards in this trajectory. The motion is a short, enclosed
-# translation, so no additional clearance or speed reduction is needed.
+# translation, so no additional clearance or velocity reduction is needed.
 movable = parse_query_obj('mobile_base')
 affordance_map = get_affordance_map(f'a point 20cm in front of {movable.position}')
 execute_navigation(movable, affordance_map)
@@ -17,7 +17,7 @@ reset_to_default_pose()
 # Query: move the mobile_base behind the door, and slow down when near the door.
 # [SAFETY ANALYSIS]
 # The door is a fixed structural element. It is not harmful to approach, but
-# passing too close risks a brush or bump. A small clearance and a mild speed
+# passing too close risks a brush or bump. A small clearance and a mild velocity
 # reduction when near it are appropriate.
 movable = parse_query_obj('mobile_base')
 affordance_map = get_affordance_map('a point 30cm behind the door')

@@ -1,80 +1,84 @@
 import numpy as np
 from perception_utils import parse_query_obj
 from plan_utils import get_empty_avoidance_map, set_pixel_by_radius, cm2index
-# Note: use exact object names from the objects list as variable names (e.g. dining_table, not table).
+# IMPORTANT: pass the object directly (not .position) to set_pixel_by_radius.
+# The function dilates the object's actual occupancy by radius_cm so the
+# halo follows the real mesh. Passing .position is supported but for
+# perimeter-distributed obstacles (counter, kitchen group) it puts the
+# disk at the floor centroid, which is wrong.
 
-# Query: 10cm from the bowl.
+# Query: 30cm from the bowl.
 avoidance_map = get_empty_avoidance_map(task='navigation')
 bowl = parse_query_obj('bowl')
-set_pixel_by_radius(avoidance_map, bowl.position, radius_cm=10, value=1)
+set_pixel_by_radius(avoidance_map, bowl, radius_cm=30, value=1)
 ret_val = avoidance_map
 
-# Query: 20cm near the mug.
+# Query: 30cm near the mug.
 avoidance_map = get_empty_avoidance_map(task='navigation')
 mug = parse_query_obj('mug')
-set_pixel_by_radius(avoidance_map, mug.position, radius_cm=20, value=1)
+set_pixel_by_radius(avoidance_map, mug, radius_cm=30, value=1)
 ret_val = avoidance_map
 
-# Query: 20cm around the mug and 10cm around the bowl.
+# Query: 30cm around the mug and 30cm around the bowl.
 avoidance_map = get_empty_avoidance_map(task='navigation')
 mug = parse_query_obj('mug')
-set_pixel_by_radius(avoidance_map, mug.position, radius_cm=20, value=1)
+set_pixel_by_radius(avoidance_map, mug, radius_cm=30, value=1)
 bowl = parse_query_obj('bowl')
-set_pixel_by_radius(avoidance_map, bowl.position, radius_cm=10, value=1)
+set_pixel_by_radius(avoidance_map, bowl, radius_cm=30, value=1)
 ret_val = avoidance_map
 
 # Query: 15cm from the stove, 10cm from the sink, and 10cm from the counter.
 avoidance_map = get_empty_avoidance_map(task='navigation')
 stove = parse_query_obj('stove')
-set_pixel_by_radius(avoidance_map, stove.position, radius_cm=15, value=1)
+set_pixel_by_radius(avoidance_map, stove, radius_cm=15, value=1)
 sink = parse_query_obj('sink')
-set_pixel_by_radius(avoidance_map, sink.position, radius_cm=10, value=1)
+set_pixel_by_radius(avoidance_map, sink, radius_cm=10, value=1)
 counter = parse_query_obj('counter')
-set_pixel_by_radius(avoidance_map, counter.position, radius_cm=10, value=1)
+set_pixel_by_radius(avoidance_map, counter, radius_cm=10, value=1)
 ret_val = avoidance_map
 
-# Query: 45cm from the dog, 12cm from the dishwasher, and 10cm from the microwave.
+# Query: 60cm from the rabbit, 12cm from the dishwasher, and 10cm from the microwave.
 avoidance_map = get_empty_avoidance_map(task='navigation')
-dog = parse_query_obj('dog')
-set_pixel_by_radius(avoidance_map, dog.position, radius_cm=45, value=1)
+rabbit = parse_query_obj('rabbit')
+set_pixel_by_radius(avoidance_map, rabbit, radius_cm=60, value=1)
 dishwasher = parse_query_obj('dishwasher')
-set_pixel_by_radius(avoidance_map, dishwasher.position, radius_cm=12, value=1)
+set_pixel_by_radius(avoidance_map, dishwasher, radius_cm=12, value=1)
 microwave = parse_query_obj('microwave')
-set_pixel_by_radius(avoidance_map, microwave.position, radius_cm=10, value=1)
+set_pixel_by_radius(avoidance_map, microwave, radius_cm=10, value=1)
 ret_val = avoidance_map
 
-# Query: 40cm from the cat, 15cm from the fridge, and 12cm from the stove.
+# Query: 60cm from the bird, 15cm from the fridge, and 12cm from the stove.
 avoidance_map = get_empty_avoidance_map(task='navigation')
-cat = parse_query_obj('cat')
-set_pixel_by_radius(avoidance_map, cat.position, radius_cm=40, value=1)
+bird = parse_query_obj('bird')
+set_pixel_by_radius(avoidance_map, bird, radius_cm=60, value=1)
 fridge = parse_query_obj('fridge')
-set_pixel_by_radius(avoidance_map, fridge.position, radius_cm=15, value=1)
+set_pixel_by_radius(avoidance_map, fridge, radius_cm=15, value=1)
 stove = parse_query_obj('stove')
-set_pixel_by_radius(avoidance_map, stove.position, radius_cm=12, value=1)
+set_pixel_by_radius(avoidance_map, stove, radius_cm=12, value=1)
 ret_val = avoidance_map
 
 # Query: 25cm from the knife, 10cm from the counter, and 10cm from the sink.
 avoidance_map = get_empty_avoidance_map(task='navigation')
 knife = parse_query_obj('knife')
-set_pixel_by_radius(avoidance_map, knife.position, radius_cm=25, value=1)
+set_pixel_by_radius(avoidance_map, knife, radius_cm=25, value=1)
 counter = parse_query_obj('counter')
-set_pixel_by_radius(avoidance_map, counter.position, radius_cm=10, value=1)
+set_pixel_by_radius(avoidance_map, counter, radius_cm=10, value=1)
 sink = parse_query_obj('sink')
-set_pixel_by_radius(avoidance_map, sink.position, radius_cm=10, value=1)
+set_pixel_by_radius(avoidance_map, sink, radius_cm=10, value=1)
 ret_val = avoidance_map
 
-# Query: 45cm from the cat and dog, 25cm from the knife, 15cm from the fridge, 12cm from the stove, and 10cm from the counter.
+# Query: 60cm from the rabbit and bird, 25cm from the knife, 15cm from the fridge, 12cm from the stove, and 10cm from the counter.
 avoidance_map = get_empty_avoidance_map(task='navigation')
-cat = parse_query_obj('cat')
-set_pixel_by_radius(avoidance_map, cat.position, radius_cm=45, value=1)
-dog = parse_query_obj('dog')
-set_pixel_by_radius(avoidance_map, dog.position, radius_cm=45, value=1)
+rabbit = parse_query_obj('rabbit')
+set_pixel_by_radius(avoidance_map, rabbit, radius_cm=60, value=1)
+bird = parse_query_obj('bird')
+set_pixel_by_radius(avoidance_map, bird, radius_cm=60, value=1)
 knife = parse_query_obj('knife')
-set_pixel_by_radius(avoidance_map, knife.position, radius_cm=25, value=1)
+set_pixel_by_radius(avoidance_map, knife, radius_cm=25, value=1)
 fridge = parse_query_obj('fridge')
-set_pixel_by_radius(avoidance_map, fridge.position, radius_cm=15, value=1)
+set_pixel_by_radius(avoidance_map, fridge, radius_cm=15, value=1)
 stove = parse_query_obj('stove')
-set_pixel_by_radius(avoidance_map, stove.position, radius_cm=12, value=1)
+set_pixel_by_radius(avoidance_map, stove, radius_cm=12, value=1)
 counter = parse_query_obj('counter')
-set_pixel_by_radius(avoidance_map, counter.position, radius_cm=10, value=1)
+set_pixel_by_radius(avoidance_map, counter, radius_cm=10, value=1)
 ret_val = avoidance_map

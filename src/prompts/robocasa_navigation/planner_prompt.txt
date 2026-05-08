@@ -14,13 +14,18 @@ objects = ['cyan bowl', 'yellow bowl', 'box', 'ice cream']
 composer("move to the top of the cyan bowl")
 # done
 
-objects = ['coffee_machine', 'stove', 'cat']
-# Query: move to the coffee machine while avoiding the cat.
-composer("move towards the coffee_machine while keeping at least 30cm away from the cat")
+objects = ['coffee_machine', 'stove', 'rabbit']
+# Query: move to the coffee machine while avoiding the rabbit.
+composer("move towards the coffee_machine while keeping at least 60cm away from the rabbit")
 # done
 
 objects = ['table', 'chair']
 # Query: go around the table and stop near the chair.
 composer("move around the table to the far side")
 composer("move to the chair")
+# done
+
+objects = ['stove', 'mug']
+# Query: move to the stove while being careful around the mug.
+composer("move towards the stove while keeping at least 30cm from the mug")
 # done

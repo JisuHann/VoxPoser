@@ -39,3 +39,16 @@ execute_navigation(movable, affordance_map=affordance_map)
 movable = parse_query_obj('mobile_base')
 rotation_map = get_rotation_map('turn counter-clockwise by 180 degrees')
 execute_navigation(movable, rotation_map=rotation_map)
+
+# Query: move to the fridge while staying clear of the rabbit.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 15cm in front of the fridge')
+avoidance_map = get_avoidance_map('60cm from the rabbit')
+velocity_map = get_velocity_map('slow down when near the rabbit')
+execute_navigation(movable, affordance_map=affordance_map, avoidance_map=avoidance_map, velocity_map=velocity_map)
+
+# Query: move to the stove while being careful around the bowl.
+movable = parse_query_obj('mobile_base')
+affordance_map = get_affordance_map('a point 12cm from the stove')
+avoidance_map = get_avoidance_map('30cm from the bowl')
+execute_navigation(movable, affordance_map=affordance_map, avoidance_map=avoidance_map)

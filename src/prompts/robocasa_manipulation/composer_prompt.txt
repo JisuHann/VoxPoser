@@ -46,10 +46,10 @@ movable = parse_query_obj('second to the left block')
 affordance_map = get_affordance_map('the red line')
 execute(movable, affordance_map=affordance_map)
 
-# Query: grasp the blue block from the table at a quarter of the speed.
+# Query: grasp the blue block from the table at a quarter of the velocity.
 movable = parse_query_obj('gripper')
 affordance_map = get_affordance_map('a point at the center of blue block')
-velocity_map = get_velocity_map('quarter of the speed')
+velocity_map = get_velocity_map('quarter of the velocity')
 gripper_map = get_gripper_map('open everywhere except 1cm around the blue block')
 execute(movable, affordance_map=affordance_map, velocity_map=velocity_map, gripper_map=gripper_map)
 
@@ -68,11 +68,11 @@ movable = parse_query_obj('drawer handle')
 affordance_map = get_affordance_map('a point 5cm into the drawer handle')
 execute(movable, affordance_map=affordance_map)
 
-# Query: move to 5cm on top of the soda can, at 0.5x speed when within 20cm of the wooden mug, and keep at least 15cm away from the wooden mug.
+# Query: move to 5cm on top of the soda can, at 0.5x velocity when within 20cm of the wooden mug, and keep at least 15cm away from the wooden mug.
 movable = parse_query_obj('gripper')
 affordance_map = get_affordance_map('a point 5cm above the soda can')
 avoidance_map = get_avoidance_map('15cm from the wooden mug')
-velocity_map = get_velocity_map('0.5x speed when within 20cm of the wooden mug')
+velocity_map = get_velocity_map('0.5x velocity when within 20cm of the wooden mug')
 execute(movable, affordance_map=affordance_map, avoidance_map=avoidance_map, velocity_map=velocity_map)
 
 # Query: wipe the red dot but avoid the blue block.
@@ -87,11 +87,11 @@ affordance_map = get_affordance_map('a point at the center of the mug handle')
 gripper_map = get_gripper_map('open everywhere except 1cm around the mug handle')
 execute(movable, affordance_map=affordance_map, gripper_map=gripper_map)
 
-# Query: move to 10cm on top of the soup bowl, and 5cm to the left of the soup bowl, while away from the glass, at 0.75x speed.
+# Query: move to 10cm on top of the soup bowl, and 5cm to the left of the soup bowl, while away from the glass, at 0.75x velocity.
 movable = parse_query_obj('gripper')
 affordance_map = get_affordance_map('a point 10cm above and 5cm to the left of the soup bowl')
 avoidance_map = get_avoidance_map('10cm from the glass')
-velocity_map = get_velocity_map('0.75x speed')
+velocity_map = get_velocity_map('0.75x velocity')
 execute(movable, affordance_map=affordance_map, avoidance_map=avoidance_map, velocity_map=velocity_map)
 
 # Query: open gripper.
@@ -111,10 +111,10 @@ for particle in particles:
     affordance_map = get_affordance_map('a point on the left side of the table')
     execute(particle, affordance_map=affordance_map)
 
-# Query: grasp the bottom drawer handle while moving at 0.5x speed.
+# Query: grasp the bottom drawer handle while moving at 0.5x velocity.
 movable = parse_query_obj('gripper')
 affordance_map = get_affordance_map('a point at the center of the bottom drawer handle')
-velocity_map = get_velocity_map('0.5x speed')
+velocity_map = get_velocity_map('0.5x velocity')
 rotation_map = get_rotation_map('face the bottom drawer handle')
 gripper_map = get_gripper_map('open everywhere except 1cm around the bottom drawer handle')
 execute(movable, affordance_map=affordance_map, velocity_map=velocity_map, rotation_map=rotation_map, gripper_map=gripper_map)
