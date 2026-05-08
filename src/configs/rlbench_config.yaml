@@ -45,7 +45,6 @@ lmp_config:
       include_context: True
       has_return: False
       return_val_name: ret_val
-      load_cache: True
     composer:
       prompt_fname: composer_prompt
       model: gpt-4
@@ -60,7 +59,6 @@ lmp_config:
       include_context: False
       has_return: False
       return_val_name: ret_val
-      load_cache: True
     parse_query_obj:
       prompt_fname: parse_query_obj_prompt
       model: gpt-4
@@ -75,7 +73,6 @@ lmp_config:
       include_context: True
       has_return: True
       return_val_name: ret_val
-      load_cache: True
     get_affordance_map:
       prompt_fname: get_affordance_map_prompt
       model: gpt-4
@@ -90,7 +87,6 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
     get_avoidance_map:
       prompt_fname: get_avoidance_map_prompt
       model: gpt-4
@@ -105,7 +101,6 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
     get_velocity_map:
       prompt_fname: get_velocity_map_prompt
       model: gpt-4
@@ -120,7 +115,6 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
     get_rotation_map:
       prompt_fname: get_rotation_map_prompt
       model: gpt-4
@@ -135,7 +129,6 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
     get_gripper_map:
       prompt_fname: get_gripper_map_prompt
       model: gpt-4
@@ -150,4 +143,3 @@ lmp_config:
       include_context: False
       has_return: True
       return_val_name: ret_val
-      load_cache: True
