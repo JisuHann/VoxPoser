@@ -858,21 +858,19 @@ class LMP_interface():
     return collision_voxel
 
   def _get_scene_collision_pixel_map(self):
-    """Build scene_collision pixel map from KITCHEN FIXTURE FOOTPRINTS, not
-    point cloud. Point-cloud-based collision is patchy because tall fixtures
-    (counter, sink, fridge) only expose top/side surfaces to cameras, leaving
-    holes in the projected XY map. Body-AABB projection gives the actual
-    obstacle footprint at floor level — same idea as _get_robot_floor_footprint
-    but for fixtures.
+    """Build scene_collision from camera point cloud + morphological closing.
+
+    Point cloud alone is patchy (cameras only see exposed surfaces of tall
+    fixtures, leaving holes in the projected XY map). Morphological closing
+    fills small gaps inside fixture footprints without inflating beyond the
+    real obstacle area — unlike geom_rbound disk projection which over-covers
+    thin/long geoms (walls have rbound ≈ length/2, blanketing the kitchen).
     """
-    if hasattr(self, '_env') and self._env is not None:
-      mask = self._get_fixture_floor_footprint(self._map_size, self._map_size)
-      if mask is not None:
-        return mask.astype(np.float64)
-    # Fallback: point-cloud based (used if env is missing or no fixture detected)
     collision_points_world, _ = self._env.get_scene_3d_obs(ignore_robot=True)
     collision_pixel = self._points_to_pixel_map(collision_points_world)
-    return collision_pixel
+    # Fill point-cloud sparsity gaps (~3 cell radius ≈ 18cm)
+    from scipy.ndimage import binary_closing
+    return binary_closing(collision_pixel > 0, iterations=3).astype(np.float64)
 
   def _points_to_pixel_map(self, points):
     """convert points in world frame to voxel frame, voxelize, and return the voxelized points"""
