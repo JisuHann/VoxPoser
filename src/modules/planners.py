@@ -214,40 +214,50 @@ class PathPlanner:
         use_astar = bool(self.config.get('use_astar', False)) if hasattr(self.config, 'get') else getattr(self.config, 'use_astar', False)
         if use_astar:
             target_mask = raw_target_map > 0
-            # Build A* cost map:
-            #  (1) Inflate raw obstacles by robot_radius_cells (binary_dilation)
-            #      so A* doesn't try to squeeze the robot through cells that
-            #      are obstacle-free as a 1-pixel point but blocked once the
-            #      robot's 35cm footprint is taken into account.
-            #  (2) Hard-penalize the inflated mask (+10) so A* detours around
-            #      it. The smooth costmap alone (W_O × 0.05 per cell) is too
-            #      weak — A* would gladly pay it to save a 10-cell detour.
-            #      +10 keeps cells "nearly forbidden" but still traversable
-            #      when no alternative exists (best-effort path).
-            #  (3) ALWAYS keep target/start cells traversable so a path
-            #      can begin and end (start often sits inside the inflated
-            #      band when robot is right next to a wall).
             obs_binary = (raw_obstacle_map > 0.5)
-            if robot_radius_cells and robot_radius_cells > 0:
-                from scipy.ndimage import binary_dilation
-                inflated = binary_dilation(obs_binary, iterations=int(robot_radius_cells))
-            else:
-                inflated = obs_binary
-            # blocked_mask = inflated obstacles (truly untraversable for the
-            # robot's full footprint). A* skips these unless cell is start or
-            # in target_mask. If no path through unblocked region exists, A*
-            # returns best-effort path to closest reachable cell.
             cm_for_astar = costmap.copy()
             cm_for_astar[target_mask] = 0.0   # ensure target reachable terminator
-            astar_path = _astar_pixel(start_pos, cm_for_astar, target_mask, blocked_mask=inflated)
+
+            # Multi-attempt A* with decreasing inflation radius.
+            # Try the largest radius first (collision-safe path). If A* can't
+            # find a path that reaches the target, retry with progressively
+            # smaller radii — accepting some risk of brushing obstacles in
+            # exchange for actually reaching the goal. Final attempt uses no
+            # inflation (point robot), guaranteeing a best-effort path always.
+            base_r = int(robot_radius_cells or 0)
+            if base_r > 0:
+                attempts = [base_r, max(1, base_r // 2), 1, 0]
+                # Dedupe while preserving order
+                seen = set(); attempts = [r for r in attempts if not (r in seen or seen.add(r))]
+            else:
+                attempts = [0]
+            astar_path = None
+            chosen_r = None
+            for r in attempts:
+                if r > 0:
+                    from scipy.ndimage import binary_dilation
+                    inflated = binary_dilation(obs_binary, iterations=int(r))
+                else:
+                    inflated = None
+                p = _astar_pixel(start_pos, cm_for_astar, target_mask, blocked_mask=inflated)
+                if p is None or len(p) < 2:
+                    continue
+                _last = p[-1].astype(int)
+                reached = bool(target_mask[_last[0], _last[1]])
+                if reached:
+                    astar_path, chosen_r = p, r
+                    break
+                # Best-effort fallback: keep the longest path (closest to goal)
+                if astar_path is None or len(p) > len(astar_path):
+                    astar_path, chosen_r = p, r
             if astar_path is not None and len(astar_path) > 1:
                 raw_path = astar_path
                 _last = astar_path[-1].astype(int)
                 reached = bool(target_mask[_last[0], _last[1]])
-                logger.info(f'[{get_clock_time(milliseconds=True)}] A* path: {len(raw_path)} pts (target reachable={reached})')
+                logger.info(f'[{get_clock_time(milliseconds=True)}] A* path: {len(raw_path)} pts '
+                            f'(target reachable={reached}, inflation_used={chosen_r} cells)')
             else:
-                # A* failed unexpectedly — fall back to greedy
-                logger.warning('A* returned no path; falling back to greedy')
+                logger.warning('A* returned no path even at 0 inflation; falling back to greedy')
                 use_astar = False
         if not use_astar:
             # get stop criteria

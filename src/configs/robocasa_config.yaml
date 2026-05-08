@@ -16,10 +16,10 @@ navigation:
     use_astar: true                    # W1: replace greedy descent with global A*
     stop_threshold: 0.01
     obstacle_map_gaussian_sigma: 5
-    max_curvature: 5
+    max_curvature: 5                   # v6 winner config (15 reverted, no significant gain)
     obstacle_map_weight: 5
   navigation_controller:
-    yaw_threshold: 0.35
+    yaw_threshold: 0.35                # v6 winner config (0.45 reverted, no significant gain)
     dist_threshold: 0.05
     max_steps_per_waypoint: 100
   lmp_config:

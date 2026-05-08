@@ -247,11 +247,18 @@ class LMP_interface():
         _avoidance_map = self._preprocess_avoidance_pixel_map(_avoidance_map, _affordance_map, movable_obs)
         start_pos = movable_obs['position'][:2]
         start_time = time.time()
-        # Inflation disabled (0 cells) — first verify robot_mask_ids fix in
-        # robocasa_env.py:load_task() actually filters robot mesh out of
-        # scene_collision. With clean avoidance map, paths may already be
-        # traversable. Re-enable inflation only if collision issues persist.
-        _robot_radius_cells = 0
+        # Inflation enabled with multi-attempt fallback — A* tries the
+        # largest radius first (collision-safe) and progressively reduces
+        # if no path found, ending at 0 inflation (point robot guarantee).
+        # 0.25m provides a meaningful safety margin without blocking too
+        # many tight corridors. (Falls back to smaller radii automatically
+        # in narrow kitchens.)
+        try:
+          _xy = self._compute_pixel_resolution()
+          _cell_m = float(np.asarray(_xy).min())
+          _robot_radius_cells = max(1, int(np.ceil(0.25 / _cell_m)))
+        except Exception:
+          _robot_radius_cells = 0
         path_pixel, planner_info = self._planner.navigation_optimize(start_pos, _affordance_map, _avoidance_map,
                                                                       object_centric=object_centric,
                                                                       robot_radius_cells=_robot_radius_cells)
@@ -319,8 +326,13 @@ class LMP_interface():
                 break
 
             wp_step += 1
-            if wp_step >= self._max_steps_per_waypoint:
-              logger.debug(f"waypoint {i} exceeded {self._max_steps_per_waypoint} steps (dist={np.linalg.norm(dxy):.3f}), skipping")
+            # Give the LAST waypoint extra time so yaw can fully align
+            # (success criterion needs <36.9° but config yaw_threshold is
+            # 20° — at clipped rotation rate ~0.5°/step, 90° rotation needs
+            # ~180 steps, exceeding the default 100).
+            wp_max = self._max_steps_per_waypoint * (3 if is_last else 1)
+            if wp_step >= wp_max:
+              logger.debug(f"waypoint {i} exceeded {wp_max} steps (dist={np.linalg.norm(dxy):.3f}), skipping")
               break
         step_info['controller_infos'] = controller_infos
         execute_info.append(step_info)
@@ -994,7 +1006,14 @@ class LMP_interface():
     target_xy = goal_xy + seg_dir * min(L, seg_len)
     is_last = np.array_equal(goal_xy, target_xy)
     goal_yaw_scalar = np.asarray(goal_yaw).item() if np.asarray(goal_yaw).size == 1 else 0.0
-    if not is_last or (is_last and goal_yaw_scalar == 0):
+    # Intermediate wp: face along the path segment.
+    # Last wp: use the explicitly-injected target_yaw from _path2traj_navigation
+    #   (which always sets it from env.target_ori for navigation tasks). The
+    #   previous `goal_yaw_scalar == 0` sentinel was buggy — 0 is a valid
+    #   target yaw (e.g. coffee_machine with rot=0), and treating it as
+    #   "no target" caused the robot to align with seg_dir instead, failing
+    #   the success criterion's ori_cos check at the goal fixture.
+    if not is_last:
       goal_yaw = float(np.arctan2(seg_dir[1], seg_dir[0]))
     else:
       goal_yaw = goal_yaw_scalar
@@ -1125,25 +1144,34 @@ class LMP_interface():
         robot_body_ids.add(i)
     if not robot_body_ids:
       return None
-    # Collect geom XY (mesh center positions) belonging to robot bodies
-    geom_xy = []
+    # Project EACH robot geom as a disk of radius geom_rbound (the geom's
+    # enclosing-sphere radius — a safe upper bound for the floor footprint).
+    # Previously we only marked the geom's xpos centroid + 1-cell dilation,
+    # which underestimates large geoms (e.g. mobilebase0_wheeled_base
+    # rbound=0.541m → ~10 cells radius vs 1 cell with the old code).
+    sx_m = (wmax[0] - wmin[0]) / H
+    sy_m = (wmax[1] - wmin[1]) / W
+    cell_min_m = float(min(sx_m, sy_m))
+    yy, xx = np.ogrid[:H, :W]
+    mask = np.zeros((H, W), dtype=bool)
     for gid in range(model.ngeom):
       bid = int(model.geom_bodyid[gid])
-      if bid in robot_body_ids:
-        p = sim.data.geom_xpos[gid]
-        geom_xy.append((p[0], p[1]))
-    if not geom_xy:
+      if bid not in robot_body_ids:
+        continue
+      p = sim.data.geom_xpos[gid]
+      # Skip geoms whose center is well below the floor (likely visualisation
+      # markers like *_target placed at z<0).
+      if p[2] < -0.05:
+        continue
+      r = (p[0] - wmin[0]) / (wmax[0] - wmin[0]) * H
+      c = (p[1] - wmin[1]) / (wmax[1] - wmin[1]) * W
+      rb_m = float(model.geom_rbound[gid])
+      if rb_m <= 0:
+        continue
+      r_cells = max(1, int(np.ceil(rb_m / cell_min_m)))
+      mask |= (yy - r)**2 + (xx - c)**2 <= r_cells**2
+    if not mask.any():
       return None
-    geom_xy = np.asarray(geom_xy)
-    # World XY → grid index
-    rr = ((geom_xy[:, 0] - wmin[0]) / (wmax[0] - wmin[0]) * H).round().astype(int)
-    cc = ((geom_xy[:, 1] - wmin[1]) / (wmax[1] - wmin[1]) * W).round().astype(int)
-    rr = np.clip(rr, 0, H - 1); cc = np.clip(cc, 0, W - 1)
-    mask = np.zeros((H, W), dtype=bool)
-    mask[rr, cc] = True
-    # 1-cell dilation buffer so cells adjacent to robot mesh are also cleared
-    from scipy.ndimage import binary_dilation
-    mask = binary_dilation(mask, iterations=1)
     return mask
   
   def _compute_pixel_resolution(self):

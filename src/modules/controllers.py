@@ -65,11 +65,11 @@ class ManipulationController:
         t_rest = contact_position - pushing_dir * start_dist * 0.8
 
         self.env.close_gripper()
-        self.env.move_to_pose(np.concatenate([t_start, ee_quat]), speed=target_velocity)
+        self.env.move_to_pose(np.concatenate([t_start, ee_quat]), velocity=target_velocity)
         logger.debug('moved to start pose')
-        self.env.move_to_pose(np.concatenate([t_interact, ee_quat]), speed=target_velocity * 0.2)
+        self.env.move_to_pose(np.concatenate([t_interact, ee_quat]), velocity=target_velocity * 0.2)
         logger.debug('moved to final pose')
-        self.env.move_to_pose(np.concatenate([t_rest, ee_quat]), speed=target_velocity * 0.33)
+        self.env.move_to_pose(np.concatenate([t_rest, ee_quat]), velocity=target_velocity * 0.33)
         logger.debug('back to release pose')
         self.env.reset_to_default_pose()
         logger.debug('back to default pose')
