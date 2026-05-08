@@ -267,6 +267,18 @@ class VoxPoserRobocasa():
         self.gripper_mask_ids = gripper_ids
         logger.info(f"robot_mask_ids: {len(robot_ids)} geoms (arm={len(arm_ids)}, gripper={len(gripper_ids)})")
 
+        # Floor geom mask — same pattern as robot_mask_ids. Excludes floor
+        # surface points from get_scene_3d_obs so they don't pollute the
+        # scene_collision pipeline (without floor exclusion, the entire
+        # workspace gets marked as obstacle and the avoidance signal collapses).
+        floor_ids = []
+        for i in range(self.env.sim.model.ngeom):
+            name = (self.env.sim.model.geom_id2name(i) or '').lower()
+            if 'floor' in name:
+                floor_ids.append(i)
+        self.floor_mask_ids = floor_ids
+        logger.info(f"floor_mask_ids: {len(floor_ids)} geoms")
+
     # Default cameras for VLM: top-down, front view, agent center, human 1st-person
     _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_person_main_group_1stview']
     # Cameras whose per-step frames we record into mp4 for downstream review.
@@ -504,14 +516,11 @@ class VoxPoserRobocasa():
                     self.workspace_bounds_min = np.minimum(body_min, fmin).copy()
                     self.workspace_bounds_max = np.maximum(body_max, fmax).copy()
                 else:
-                    # Fallback: no floor geom found
                     self.workspace_bounds_min = body_min.copy()
                     self.workspace_bounds_max = body_max.copy()
-                # Floor-surface filter: clamp z_min to ~5cm above floor so the
-                # scene_collision pipeline doesn't include floor points (which
-                # would mark the entire workspace as obstacle and collapse the
-                # avoidance signal). Anything below this is the floor surface.
-                self.workspace_bounds_min[2] = max(self.workspace_bounds_min[2], 0.05)
+                # Floor surface points are excluded by floor_mask_ids in
+                # get_scene_3d_obs (geom-mask filter, same pattern as
+                # robot_mask_ids) — no z-range hack needed.
                 logger.info(
                     f"workspace_bounds (locked): "
                     f"x=[{self.workspace_bounds_min[0]:.2f},{self.workspace_bounds_max[0]:.2f}] "
@@ -636,6 +645,16 @@ class VoxPoserRobocasa():
         points = points[(chosen_idx_x & chosen_idx_y & chosen_idx_z)]
         colors = colors[(chosen_idx_x & chosen_idx_y & chosen_idx_z)]
         masks = masks[(chosen_idx_x & chosen_idx_y & chosen_idx_z)]
+
+        # Always exclude floor geoms — same pattern as ignore_robot. The floor
+        # is part of the scene but it's a navigable surface, not an obstacle;
+        # if floor points stay in scene_collision, the entire workspace becomes
+        # marked as obstacle.
+        if getattr(self, 'floor_mask_ids', None):
+            floor_mask = np.isin(masks, self.floor_mask_ids)
+            points = points[~floor_mask]
+            colors = colors[~floor_mask]
+            masks = masks[~floor_mask]
 
         if ignore_robot:
             robot_mask = np.isin(masks, self.robot_mask_ids)
