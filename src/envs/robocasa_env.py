@@ -450,36 +450,75 @@ class VoxPoserRobocasa():
     
         # Set workspace bound min/max at initial stage
         if query_name is None:
+            # Compute bounds ONCE (at first call) — subsequent calls are no-op so
+            # downstream consumers (visualizer, scene_collision pixel mapping)
+            # see consistent bounds across the whole task. Recomputing produced
+            # different x/y bounds on first vs later calls (cat spawn changes
+            # body bbox) and the visualizer cached the earlier (smaller) one.
+            if getattr(self, '_workspace_bounds_locked', False):
+                return
             if not self.navigate_task: # Manipulation
                 self.workspace_bounds_min = np.array([points[:,0].min(), points[:,1].min(), points[:,2].min()])
                 self.workspace_bounds_max = np.array([points[:,0].max(), points[:,1].max(), points[:,2].max()])
+                self._workspace_bounds_locked = True
             else: # Navigation
-                # Per-axis bounds (rectangular allowed) — the previous logic forced
-                # a cube via half_size = (max - min).max(), which made cells huge
-                # whenever any layout had an outlier body (e.g. standing_table at
-                # y=-7.5 in L8). Now each axis is sized to its own scene span.
-                # Exclude bodies that don't belong to the floor scene:
-                #   - world (origin marker)
-                #   - *eef_target* (placed at z=-1, below the floor)
-                #   - *standing_table* (room furniture far outside the kitchen,
-                #     consistently the y/x-axis outlier in L1/L3/L6/L7/L8/L9)
-                xpos = self.env.sim.data.xpos
+                # Workspace bounds = union of (a) body centroid bbox + (b) floor
+                # geom AABB. The previous body-centroid-only version missed
+                # floor extent — fixtures at the kitchen edge have centroids
+                # well inside the actual floor area, so the planner's 100×100
+                # grid only covered the centre of the room.
                 model = self.env.sim.model
+                data  = self.env.sim.data
+
+                # (a) Body-centroid bbox, excluding outliers
+                xpos = data.xpos
                 keep = np.ones(len(xpos), dtype=bool)
-                # Exclude only standing_table — it's consistently the outlier
-                # stretching the bbox in L1/L3/L6/L7/L8/L9 (always at y=±7m or
-                # x=7.5m, far outside the kitchen). Keep world (some layouts like
-                # L2 use origin as x_min — excluding it shrinks the workspace
-                # and breaks the navigation corridor) and eef_target (z=-1 only
-                # nudges z bound, harmless for XY).
+                # standing_table sits at y=±7m / x=7.5m far outside the kitchen
+                # and consistently stretches the bbox in L1/L3/L6/L7/L8/L9.
+                # Keep world (origin) and eef_target (z=-1 only) — both harmless.
                 exclude_patterns = ('standing_table',)
                 for i in range(model.nbody):
                     n = (model.body_id2name(i) or '').lower()
                     if any(p in n for p in exclude_patterns):
                         keep[i] = False
                 xpos_clean = xpos[keep]
-                self.workspace_bounds_min = xpos_clean.min(axis=0).copy()
-                self.workspace_bounds_max = xpos_clean.max(axis=0).copy()
+                body_min = xpos_clean.min(axis=0)
+                body_max = xpos_clean.max(axis=0)
+
+                # (b) Floor geom AABB — use the actual floor extent (geom_size
+                # is half-extent). Take union across all floor geoms (multi-piece
+                # G_SHAPED / U_SHAPED layouts have several floor pieces).
+                floor_xs, floor_ys = [], []
+                for i in range(model.ngeom):
+                    name = (model.geom_id2name(i) or '').lower()
+                    if 'floor' not in name:
+                        continue
+                    g_pos  = data.geom_xpos[i]
+                    g_size = model.geom_size[i]
+                    floor_xs.extend([g_pos[0] - g_size[0], g_pos[0] + g_size[0]])
+                    floor_ys.extend([g_pos[1] - g_size[1], g_pos[1] + g_size[1]])
+
+                if floor_xs and floor_ys:
+                    fmin = np.array([min(floor_xs), min(floor_ys), body_min[2]])
+                    fmax = np.array([max(floor_xs), max(floor_ys), body_max[2]])
+                    self.workspace_bounds_min = np.minimum(body_min, fmin).copy()
+                    self.workspace_bounds_max = np.maximum(body_max, fmax).copy()
+                else:
+                    # Fallback: no floor geom found
+                    self.workspace_bounds_min = body_min.copy()
+                    self.workspace_bounds_max = body_max.copy()
+                # Floor-surface filter: clamp z_min to ~5cm above floor so the
+                # scene_collision pipeline doesn't include floor points (which
+                # would mark the entire workspace as obstacle and collapse the
+                # avoidance signal). Anything below this is the floor surface.
+                self.workspace_bounds_min[2] = max(self.workspace_bounds_min[2], 0.05)
+                logger.info(
+                    f"workspace_bounds (locked): "
+                    f"x=[{self.workspace_bounds_min[0]:.2f},{self.workspace_bounds_max[0]:.2f}] "
+                    f"y=[{self.workspace_bounds_min[1]:.2f},{self.workspace_bounds_max[1]:.2f}] "
+                    f"z=[{self.workspace_bounds_min[2]:.2f},{self.workspace_bounds_max[2]:.2f}] "
+                    f"floor_geoms={len(floor_xs)//2 if floor_xs else 0}")
+                self._workspace_bounds_locked = True
             return
 
         # get object points
@@ -828,6 +867,9 @@ class VoxPoserRobocasa():
         self.latest_obs = None
         self.latest_reward = None
         self.latest_terminate = None
+        # Re-arm bounds computation for the next task — without this each task
+        # would inherit the previous task's bounds (different layout = wrong).
+        self._workspace_bounds_locked = False
         self.latest_action = None
         self.grasped_obj_ids = None
         self._trajectory = []
