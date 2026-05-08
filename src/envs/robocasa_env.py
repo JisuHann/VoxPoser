@@ -202,6 +202,14 @@ class VoxPoserRobocasa():
             for obj in self.objects:
                 if obj in name:
                     self.name2ids[obj].append(i)
+        # Audit: warn on empty mappings so silent geom-mismatch bugs are visible
+        # (parallel to the robot_mask_ids fix — name2ids[k]=[] silently breaks
+        # avoidance/affordance lookups for object k). Skip well-known special
+        # cases that are populated below (door, human aliasing).
+        _empty = [k for k, v in self.name2ids.items() if not v and k not in ('door',)]
+        if _empty:
+            logger.warning(f"name2ids: empty mappings for {_empty} — "
+                           f"these objects won't be findable in get_3d_obs_by_name")
         # Remap 'door' in name2ids to only main_door body geoms.
         # The generic loop above maps 'door' -> ALL geoms with 'door' in geom_name (fridge, microwave,
         # oven doors etc.). We need only the main_door fixture geoms for Route E navigation.
