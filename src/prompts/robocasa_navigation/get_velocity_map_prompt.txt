@@ -16,15 +16,15 @@ velocity_map = get_empty_velocity_map(task='navigation')
 velocity_map[:] = 0.75
 ret_val = velocity_map
 
-# Query: slow down by a half when you're near anything fragile (objects: ['block', 'fork', 'mug', 'bowl', 'chips']).
+# Query: slow down by a half when you're near the mug and bowl.
 # IMPORTANT: pass the object (not .position) to set_pixel_by_radius — the
 # function dilates the actual mesh by radius_cm. Passing .position works
 # but produces a centroid-disk which is wrong for extended/grouped fixtures.
 velocity_map = get_empty_velocity_map(task='navigation')
 mug = parse_query_obj('mug')
-set_pixel_by_radius(velocity_map, mug, radius_cm=30, value=0.5)
+set_pixel_by_radius(velocity_map, mug, radius_cm=53, value=0.5)
 bowl = parse_query_obj('bowl')
-set_pixel_by_radius(velocity_map, bowl, radius_cm=30, value=0.5)
+set_pixel_by_radius(velocity_map, bowl, radius_cm=42, value=0.5)
 ret_val = velocity_map
 
 # Query: quarter of the velocity when within 9cm from the yellow line.
@@ -33,16 +33,23 @@ yellow_line = parse_query_obj('yellow_line')
 set_pixel_by_radius(velocity_map, yellow_line, radius_cm=9, value=0.25)
 ret_val = velocity_map
 
-# Query: slow down to 30% velocity within 50cm of the rabbit.
+# Query: slow down to 30% velocity within 68cm of the rabbit.
 velocity_map = get_empty_velocity_map(task='navigation')
 velocity_map[:] = 1.0
 rabbit = parse_query_obj('rabbit')
-set_pixel_by_radius(velocity_map, rabbit, radius_cm=50, value=0.3)
+set_pixel_by_radius(velocity_map, rabbit, radius_cm=68, value=0.3)
 ret_val = velocity_map
 
-# Query: move at 20% velocity near the bird and 80% velocity elsewhere.
+# Query: move at 20% velocity near the parrot and 80% velocity elsewhere.
 velocity_map = get_empty_velocity_map(task='navigation')
 velocity_map[:] = 0.8
-bird = parse_query_obj('bird')
-set_pixel_by_radius(velocity_map, bird, radius_cm=45, value=0.2)
+parrot = parse_query_obj('parrot')
+set_pixel_by_radius(velocity_map, parrot, radius_cm=78, value=0.2)
+ret_val = velocity_map
+
+# Query: slow down to 60% velocity within 32cm of the iron skillet.
+velocity_map = get_empty_velocity_map(task='navigation')
+velocity_map[:] = 1.0
+iron_skillet = parse_query_obj('iron skillet')
+set_pixel_by_radius(velocity_map, iron_skillet, radius_cm=32, value=0.6)
 ret_val = velocity_map

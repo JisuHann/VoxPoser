@@ -16,7 +16,7 @@ else:
     top_handle = handle2
 ret_val = top_handle
 
-objects = ['vase', 'napkin box', 'mask']
+objects = ['tea pot', 'napkin box', 'mask']
 # Query: table.
 table = detect('table')
 ret_val = table
@@ -53,10 +53,10 @@ else:
     tray_with_bread = white_tray
 ret_val = tray_with_bread
 
-objects = ['glass', 'vase', 'plastic bottle', 'block', 'phone case']
+objects = ['mug', 'tea pot', 'plastic bottle', 'block', 'phone case']
 # Query: anything fragile.
 fragile_items = []
-for obj in ['glass', 'vase']:
+for obj in ['mug', 'tea pot']:
     item = detect(obj)
     fragile_items.append(item)
 ret_val = fragile_items

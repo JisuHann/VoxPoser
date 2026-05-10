@@ -13,19 +13,19 @@ px, py, _ = door.position
 rotation_map[:, :] = np.arctan2(py, px)
 ret_val = rotation_map
 
-# Query: face the cat directly with a 90-degree turning angle.
+# Query: face the rabbit directly with a 90-degree turning angle.
 rotation_map = get_empty_rotation_map(task='navigation')
-cat = parse_query_obj('cat')
-px, py, _ = cat.position
+rabbit = parse_query_obj('rabbit')
+px, py, _ = rabbit.position
 rotation_map[:, :] = np.arctan2(py, px)
 ret_val = rotation_map
 
-# Query: turn to face the dog when within 60cm.
+# Query: turn to face the parrot when within 70cm.
 rotation_map = get_empty_rotation_map(task='navigation')
-dog = parse_query_obj('dog')
-px, py, _ = dog.position
+parrot = parse_query_obj('parrot')
+px, py, _ = parrot.position
 target_yaw = np.arctan2(py, px)
-set_pixel_by_radius(rotation_map, dog.position, radius_cm=60, value=target_yaw)
+set_pixel_by_radius(rotation_map, parrot.position, radius_cm=70, value=target_yaw)
 ret_val = rotation_map
 
 # Query: no specific rotation requirement.

@@ -5,8 +5,8 @@ from action_utils import composer
 
 objects = ['fridge', 'hot soup']
 # Query: Navigate to the fridge door and be careful around the hot soup.
-composer("move to the fridge door and keep at least 15cm away from the hot soup")
-composer("move away from the fridge door by 25cm and keep at least 15cm away from the hot soup")
+composer("move to the fridge door and keep at least 55cm away from the hot soup")
+composer("move away from the fridge door by 25cm and keep at least 55cm away from the hot soup")
 # done
 
 objects = ['cyan bowl', 'yellow bowl', 'box', 'ice cream']
@@ -16,7 +16,7 @@ composer("move to the top of the cyan bowl")
 
 objects = ['coffee_machine', 'stove', 'rabbit']
 # Query: move to the coffee machine while avoiding the rabbit.
-composer("move towards the coffee_machine while keeping at least 60cm away from the rabbit")
+composer("move towards the coffee_machine while keeping at least 68cm away from the rabbit")
 # done
 
 objects = ['table', 'chair']
@@ -25,7 +25,47 @@ composer("move around the table to the far side")
 composer("move to the chair")
 # done
 
-objects = ['stove', 'mug']
-# Query: move to the stove while being careful around the mug.
-composer("move towards the stove while keeping at least 30cm from the mug")
+objects = ['stove', 'tea pot']
+# Query: move to the stove while being careful around the tea pot.
+composer("move towards the stove while keeping at least 42cm from the tea pot")
+# done
+
+objects = ['sink', 'iron skillet']
+# Query: move to the sink while avoiding the iron skillet.
+composer("move towards the sink while keeping at least 35cm from the iron skillet")
+# done
+
+objects = ['microwave', 'parrot']
+# Query: move to the microwave while staying clear of the parrot.
+composer("move towards the microwave while keeping at least 78cm away from the parrot")
+# done
+
+objects = ['fridge', 'flour bag']
+# Query: move to the fridge while avoiding the flour bag.
+composer("move towards the fridge while keeping at least 22cm from the flour bag")
+# done
+
+objects = ['table', 'rabbit', 'newly cooked soup']
+# Query: navigate to the table while avoiding the rabbit and the newly cooked soup.
+composer("move towards the table while keeping at least 60cm away from the rabbit and at least 70cm away from the newly cooked soup")
+# done
+
+objects = ['chair', 'tea pot', 'cast iron skillet']
+# Query: navigate to the chair while avoiding the tea pot and the cast iron skillet.
+composer("move towards the chair while keeping at least 40cm away from the tea pot and at least 50cm away from the cast iron skillet")
+# done
+
+objects = ['fridge', 'parrot', 'freshly poured mug']
+# Query: navigate to the fridge while avoiding the parrot and the freshly poured mug.
+composer("move towards the fridge while keeping at least 62cm away from the parrot and at least 75cm away from the freshly poured mug")
+# done
+
+objects = ['stove', 'rabbit', 'antique porcelain tea pot']
+# Query: navigate to the stove while avoiding the rabbit and the antique porcelain tea pot.
+composer("move towards the stove while keeping at least 60cm away from the rabbit and at least 65cm away from the antique porcelain tea pot")
+# done
+
+objects = ['microwave', 'parrot', 'antique ceramic bowl']
+# Query: navigate to the microwave while avoiding the parrot and the antique ceramic bowl.
+composer("move towards the microwave while keeping at least 65cm away from the parrot and at least 80cm away from the antique ceramic bowl")
 # done
