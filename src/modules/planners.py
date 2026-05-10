@@ -215,7 +215,15 @@ class PathPlanner:
         if use_astar:
             target_mask = raw_target_map > 0
             obs_binary = (raw_obstacle_map > 0.5)
-            cm_for_astar = costmap.copy()
+            # Scale cost map up so the obstacle gradient is not drowned by
+            # the Euclidean heuristic in the fallback (no-inflation) case.
+            # Without scaling, costmap ∈ [0, 1] vs h_map ∈ [0, ~141 pixels]
+            # → A* picks the shortest path through obstacles when blocked_mask
+            # is None. Multiplying by COST_SCALE=30 makes a single high-cost
+            # cell roughly equivalent to a 30-cell detour, which roughly
+            # matches the worst-case radius in a 100x100 grid.
+            COST_SCALE = 30.0
+            cm_for_astar = (costmap * COST_SCALE).copy()
             cm_for_astar[target_mask] = 0.0   # ensure target reachable terminator
 
             # Multi-attempt A* with decreasing inflation radius.
@@ -289,8 +297,15 @@ class PathPlanner:
                     break
             raw_path = np.array(path)
             logger.info(f'[{get_clock_time(milliseconds=True)}] path optimized (greedy): {len(raw_path)} pts')
-        # postprocess path
-        processed_path = self._postprocess_path(raw_path, raw_target_map, object_centric=object_centric)
+        # postprocess path. For A* output (global, no oscillation), skip the
+        # high-curvature truncation that was designed for greedy planner —
+        # A* paths naturally curve at the goal arrival, and truncating there
+        # cuts the path well short of the actual target (verified bug:
+        # L0/L2/L6/L7/L8 paths ended 16-57 cells short of goal because the
+        # curvature cutoff fired on the natural arrival turn).
+        processed_path = self._postprocess_path(
+            raw_path, raw_target_map, object_centric=object_centric,
+            skip_curvature_cutoff=use_astar)
         logger.info(f'[{get_clock_time(milliseconds=True)}] after postprocessing: {len(processed_path)} pts')
         logger.debug(f'[{get_clock_time(milliseconds=True)}] last waypoint: {processed_path[-1]}')
         # save info
@@ -328,9 +343,11 @@ class PathPlanner:
             Do not stop if there is a nearby voxel with cost less than current cost + stop_threshold.
             """
             assert np.isnan(costmap).sum() == 0, 'costmap contains nan'
-            current_pos_discrete = current_pos.round().clip(0, self.map_size - 1).astype(int)
+            # costmap shape may be rectangular (map_h, map_w) — use shape directly
+            _h, _w = costmap.shape[:2]
+            current_pos_discrete = current_pos.round().clip([0, 0], [_h - 1, _w - 1]).astype(int)
             current_cost = costmap[current_pos_discrete[0], current_pos_discrete[1]]
-            nearby_locs = self._calculate_nearby_pixel(current_pos, object_centric=False)
+            nearby_locs = self._calculate_nearby_pixel(current_pos, object_centric=False, shape=(_h, _w))
             nearby_equal = np.any(costmap[nearby_locs[:, 0], nearby_locs[:, 1]] < current_cost + stop_threshold)
             if nearby_equal:
                 return False
@@ -356,35 +373,46 @@ class PathPlanner:
         all_nearby_voxels = np.unique(all_nearby_voxels, axis=0).astype(int)
         return all_nearby_voxels
     
-    def _calculate_nearby_pixel(self, current_pos, object_centric=False):
+    def _calculate_nearby_pixel(self, current_pos, object_centric=False, shape=None):
         # create a grid of nearby pixel
-        half_size = int(2 * self.map_size / 100)
+        # Use shape (map_h, map_w) for rectangular grid clipping; falls back
+        # to legacy square self.map_size if shape not given.
+        if shape is None:
+            _h = _w = self.map_size
+        else:
+            _h, _w = shape
+        # half_size scales with the smaller of the two dims to keep the
+        # neighborhood radius isotropic in pixels.
+        half_size = max(1, int(2 * min(_h, _w) / 100))
         offsets = np.arange(-half_size, half_size + 1)
-        # our heuristics-based dynamics model only supports planar pushing -> only xy path is considered
         offsets_grid = np.array(np.meshgrid(offsets, offsets)).T.reshape(-1, 2)
-        # Remove the [0, 0, 0] offset, which corresponds to the current position
         offsets_grid = offsets_grid[np.any(offsets_grid != [0, 0], axis=1)]
-        # Calculate all nearby voxel coordinates
-        all_nearby_voxels = np.clip(current_pos + offsets_grid, 0, self.map_size - 1)
-        # Remove duplicates, if any, caused by clipping
+        all_nearby_voxels = np.clip(current_pos + offsets_grid, [0, 0], [_h - 1, _w - 1])
         all_nearby_voxels = np.unique(all_nearby_voxels, axis=0).astype(int)
         return all_nearby_voxels
     
-    def _postprocess_path(self, path, raw_target_map, object_centric=False):
+    def _postprocess_path(self, path, raw_target_map, object_centric=False,
+                          skip_curvature_cutoff=False):
         """
         Apply various postprocessing steps to the path.
+
+        skip_curvature_cutoff: when True, skip the high-curvature truncation
+            step. A* paths arrive at goal via natural curve and the cutoff
+            would chop off the goal-side of the path. Greedy planner still
+            benefits from cutoff (it can oscillate near goal).
         """
         # smooth the path
         savgol_window_size = min(len(path), self.config.savgol_window_size)
         savgol_polyorder = min(self.config.savgol_polyorder, savgol_window_size - 1)
         path = savgol_filter(path, savgol_window_size, savgol_polyorder, axis=0)
-        # early cutoff if curvature is too high
-        curvature = calc_curvature(path)
-        if len(curvature) > 5:
-            high_curvature_idx = np.where(curvature[5:] > self.config.max_curvature)[0]
-            if len(high_curvature_idx) > 0:
-                high_curvature_idx += 5
-                path = path[:int(0.9 * high_curvature_idx[0])]  
+        # early cutoff if curvature is too high (greedy planner only)
+        if not skip_curvature_cutoff:
+            curvature = calc_curvature(path)
+            if len(curvature) > 5:
+                high_curvature_idx = np.where(curvature[5:] > self.config.max_curvature)[0]
+                if len(high_curvature_idx) > 0:
+                    high_curvature_idx += 5
+                    path = path[:int(0.9 * high_curvature_idx[0])]
         # skip waypoints such that they reach target spacing
         path_trimmed = path[1:-1]
         skip_ratio = None

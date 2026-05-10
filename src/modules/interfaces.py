@@ -35,9 +35,20 @@ class LMP_interface():
     self._env = env
     self._env_name = env_name
     self._cfg = lmp_config
-    self._map_size = self._cfg['map_size']
+    self._map_size = self._cfg['map_size']  # legacy scalar (manipulation cube)
     self._output_dir = output_dir or "."
-    self._planner = PathPlanner(planner_config, map_size=self._map_size)
+    # Navigation grid is rectangular (map_h × map_w) with isotropic cells of
+    # `resolution_cm` size. Falls back to map_size square if env doesn't
+    # expose map_h/map_w (e.g. manipulation env).
+    # IMPORTANT: must compute _map_h/_map_w BEFORE instantiating PathPlanner.
+    # The planner's `_postprocess_path` clips path coords to [0, map_size-1].
+    # If passed legacy scalar 100, navigation paths with rows > 99 (L0/L1/L3
+    # have map_h=122/142/162) get clamped to 99 — verified bug: L3 path_pixel[0]
+    # row=99 instead of row=139, causing 2m start gap and robot to drive
+    # away from its actual position.
+    _nav_h = int(getattr(self._env, 'map_h', self._map_size))
+    _nav_w = int(getattr(self._env, 'map_w', self._map_size))
+    self._planner = PathPlanner(planner_config, map_size=max(_nav_h, _nav_w, self._map_size))
     self._nav_controller = NavigationController(self._env, controller_config)
     self._manip_controller = ManipulationController(self._env, controller_config)
     if nav_controller_config is None:
@@ -51,8 +62,17 @@ class LMP_interface():
     # restore legacy centroid behaviour.
     self._use_fixture_pos = bool(self._cfg.get('use_fixture_pos', True))
 
-    # calculate size of each voxel (resolution)
-    self._resolution = (self._env.workspace_bounds_max - self._env.workspace_bounds_min) / self._map_size
+    self._map_h = _nav_h
+    self._map_w = _nav_w
+
+    # calculate size of each voxel (resolution). Use rectangular dims so x/y
+    # resolutions are equal (both = resolution_cm).
+    _ws_extent = self._env.workspace_bounds_max - self._env.workspace_bounds_min
+    self._resolution = np.array([
+        _ws_extent[0] / self._map_w,
+        _ws_extent[1] / self._map_h,
+        _ws_extent[2] / self._map_size,
+    ])
 
   # ======================================================
   # == functions exposed to LLM
@@ -119,7 +139,7 @@ class LMP_interface():
       aabb_max = self._world_to_voxel(np.max(obj_pc, axis=0))
       obs_dict['occupancy_map'] = voxel_map
       obs_dict['name'] = 'kitchen'
-      obs_dict['position'] = self._world_to_voxel(np.mean(obj_pc, axis=0))
+      obs_dict['position'] = self._world_to_pos_coords(np.mean(obj_pc, axis=0))
       obs_dict['aabb'] = np.array([aabb_min, aabb_max])
       obs_dict['_position_world'] = np.mean(obj_pc, axis=0)
       obs_dict['_point_cloud_world'] = obj_pc
@@ -142,10 +162,10 @@ class LMP_interface():
       table_center = (table_max_world + table_min_world) / 2
       obs_dict = dict()
       obs_dict['name'] = obj_name
-      obs_dict['position'] = self._world_to_voxel(table_center)
+      obs_dict['position'] = self._world_to_pos_coords(table_center)
       obs_dict['_position_world'] = table_center
       obs_dict['normal'] = np.array([0, 0, 1])
-      obs_dict['aabb'] = np.array([self._world_to_voxel(table_min_world), self._world_to_voxel(table_max_world)])
+      obs_dict['aabb'] = np.array([self._world_to_pos_coords(table_min_world), self._world_to_pos_coords(table_max_world)])
     else:
       obs_dict = dict()
       (workspace_pc, _), (obj_pc, obj_normal) = self._env.get_3d_obs_by_name(obj_name)
@@ -154,10 +174,36 @@ class LMP_interface():
       aabb_max = self._world_to_voxel(np.max(obj_pc, axis=0))
       obs_dict['occupancy_map'] = voxel_map  # in voxel frame
       obs_dict['name'] = obj_name
-      obs_dict['position'] = self._world_to_voxel(np.mean(obj_pc, axis=0))  # in voxel frame
+      # Default: mesh point-cloud centroid for position
+      _pos_world = np.mean(obj_pc, axis=0)
+      # SPECIAL CASE — mobile_base / robot_mobile_base: use the actual
+      # base anchor (mobilebase0_base body_xpos) instead of mesh centroid.
+      # The mesh centroid includes the pedestal/arm and shifts up to 30cm
+      # from the planar base anchor depending on robot pose. Planner
+      # start_pos uses this `position`; if it disagrees with the
+      # controller's `robot0_base_pos`, the planner produces a path
+      # starting at the wrong cell — robot then has to pre-traverse a
+      # 0.05–0.30m gap before the planner's first wp is "reached", and
+      # the visualised START marker drifts off the actual robot.
+      if obj_name.lower() in ('mobile_base', 'robot_mobile_base', 'mobilebase0'):
+        try:
+          _sim = self._env.env.sim
+          _bid = _sim.model.body_name2id('mobilebase0_base')
+          _bp = np.asarray(_sim.data.body_xpos[_bid])[:3].copy()
+          # Keep mesh centroid z (the base body is at z=0 but planner
+          # treats x,y only; safe to overwrite all 3 since downstream
+          # uses xy.
+          _pos_world = _bp
+          logger.debug(f"detect('{obj_name}'): using base anchor "
+                       f"({_bp.tolist()}) instead of mesh centroid "
+                       f"({np.mean(obj_pc, axis=0).tolist()})")
+        except Exception as _e:
+          logger.warning(f"detect('{obj_name}'): base-anchor lookup failed "
+                         f"({_e}); falling back to mesh centroid")
+      obs_dict['position'] = self._world_to_pos_coords(_pos_world)
       obs_dict['aabb'] = np.array([aabb_min, aabb_max])  # in voxel frame
-      obs_dict['_position_world'] = np.mean(obj_pc, axis=0)  # in world frame
-      obs_dict['_point_cloud_world'] = obj_pc  # in world frame
+      obs_dict['_position_world'] = _pos_world           # in world frame
+      obs_dict['_point_cloud_world'] = obj_pc            # in world frame
       obs_dict['normal'] = normalize_vector(obj_normal.mean(axis=0))
     # Auto-resolve to fixture.pos when configured and a matching kitchen
     # fixture exists. Movable obstacles fall through (no fixture match).
@@ -165,7 +211,7 @@ class LMP_interface():
       _fpos = self._lookup_fixture_pos(obj_name)
       if _fpos is not None:
         obs_dict['_position_world'] = np.asarray(_fpos)
-        obs_dict['position'] = self._world_to_voxel(np.asarray(_fpos))
+        obs_dict['position'] = self._world_to_pos_coords(np.asarray(_fpos))
     object_obs = Observation(obs_dict)
     return object_obs
 
@@ -250,13 +296,36 @@ class LMP_interface():
         # Inflation enabled with multi-attempt fallback — A* tries the
         # largest radius first (collision-safe) and progressively reduces
         # if no path found, ending at 0 inflation (point robot guarantee).
-        # 0.25m provides a meaningful safety margin without blocking too
-        # many tight corridors. (Falls back to smaller radii automatically
-        # in narrow kitchens.)
+        # Baseline radius = mobilebase geom rbound / 2 (taken directly from
+        # MuJoCo model; for the wheeled_base rbound ≈ 0.54m → baseline 0.27m).
+        # Half-rbound matches the planar footprint better than the full
+        # enclosing sphere (which over-counts vertical extent), and keeps the
+        # planner aligned with the avoidance-clear footprint that uses real
+        # geom geometry. Falls back to baseline/2, 1, 0 cells in tight kitchens.
         try:
           _xy = self._compute_pixel_resolution()
           _cell_m = float(np.asarray(_xy).min())
-          _robot_radius_cells = max(1, int(np.ceil(0.25 / _cell_m)))
+          _robot_radius_m = 0.25  # safe default if geom_rbound lookup fails
+          try:
+            _model = self._env.env.sim.model
+            _max_rb = 0.0
+            for _gid in range(_model.ngeom):
+              _bid = int(_model.geom_bodyid[_gid])
+              _bn = (_model.body_id2name(_bid) or '').lower()
+              # Only consider the wheeled mobile base — arm/gripper rbounds are
+              # irrelevant for floor inflation (z >> floor) and would inflate
+              # the planner footprint with non-floor geometry.
+              if 'mobilebase' in _bn and 'wheel' in _bn:
+                _rb = float(_model.geom_rbound[_gid])
+                if _rb > _max_rb:
+                  _max_rb = _rb
+            if _max_rb > 0:
+              _robot_radius_m = _max_rb / 2.0
+          except Exception:
+            pass
+          _robot_radius_cells = max(1, int(np.ceil(_robot_radius_m / _cell_m)))
+          logger.info(f"[planner inflation] robot_radius_m={_robot_radius_m:.3f} "
+                      f"cell_m={_cell_m:.3f} → robot_radius_cells={_robot_radius_cells}")
         except Exception:
           _robot_radius_cells = 0
         path_pixel, planner_info = self._planner.navigation_optimize(start_pos, _affordance_map, _avoidance_map,
@@ -385,12 +454,22 @@ class LMP_interface():
         _H = int(self._env.cam_height)
         _fy = (_H / 2.0) / np.tan(np.radians(_fovy / 2.0))
         _fx = _fy
-        _z = 0.0  # floor plane
+        # Project corners onto the ACTUAL floor plane. workspace_bounds_min[2]
+        # is the body-bbox lower z (e.g. -1.0m underground), NOT the floor z.
+        # Read the real floor z from a floor geom's xpos. Falls back to 0.0
+        # only if no floor geoms are tracked (legacy envs).
+        _floor_z = 0.0
+        try:
+            _fids = getattr(self._env, 'floor_mask_ids', [])
+            if _fids:
+                _floor_z = float(_sim.data.geom_xpos[_fids[0], 2])
+        except Exception:
+            pass
         _corners_world = np.array([
-            [_ws_min[0], _ws_min[1], _z],   # planner (0, 0)
-            [_ws_min[0], _ws_max[1], _z],   # planner (0, map_size-1)
-            [_ws_max[0], _ws_max[1], _z],   # planner (map_size-1, map_size-1)
-            [_ws_max[0], _ws_min[1], _z],   # planner (map_size-1, 0)
+            [_ws_min[0], _ws_min[1], _floor_z],  # planner (0, 0)
+            [_ws_min[0], _ws_max[1], _floor_z],  # planner (0, map_size-1)
+            [_ws_max[0], _ws_max[1], _floor_z],  # planner (map_size-1, map_size-1)
+            [_ws_max[0], _ws_min[1], _floor_z],  # planner (map_size-1, 0)
         ])
         _corners_uv = []
         for _w in _corners_world:
@@ -423,6 +502,11 @@ class LMP_interface():
       try:
         _kitchen = getattr(self._env, "env", None)
         _obstacle_name = getattr(_kitchen, "obstacle", None) if _kitchen else None
+        # Capture cat position at DUMP-SAVE time (= during LMP planning,
+        # matches what LLM detected via parse_query_obj('cat'). The earlier
+        # _initial_obstacle_xy snapshot at load_task time drifted vs LLM's
+        # cat (~32cm in L8) due to physics steps between load_task and
+        # avoidance map generation.
         if _obstacle_name == "human" and hasattr(self._env, "_get_person_pos"):
           _p = self._env._get_person_pos()
           if _p is not None:
@@ -475,6 +559,8 @@ class LMP_interface():
           workspace_bounds_min=_ws_min,
           workspace_bounds_max=_ws_max,
           map_size=np.asarray(self._map_size),
+          map_h=np.asarray(self._map_h),  # rectangular grid (rows = y cells)
+          map_w=np.asarray(self._map_w),  # rectangular grid (cols = x cells)
       )
       if _topview_corners_uv is not None:
           _save_kwargs["topview_corners_uv"] = _topview_corners_uv
@@ -482,6 +568,16 @@ class LMP_interface():
           _save_kwargs["obstacle_xy"] = np.asarray(_obstacle_xy, dtype=np.float32)
       if _obstacle_name:
           _save_kwargs["obstacle_name"] = np.asarray(str(_obstacle_name))
+      # Also persist the obstacle position captured at load_task time
+      # (= same instant initial_topview.png is rendered). The viz uses this
+      # for the cat MARKER so it aligns with the cat as seen in the topview;
+      # `obstacle_xy` (LMP-planning-time) is preserved for halo / analysis.
+      try:
+        _init_obs = getattr(self._env, "_initial_obstacle_xy", None)
+        if _init_obs is not None:
+          _save_kwargs["obstacle_xy_init"] = np.asarray(_init_obs, dtype=np.float32)
+      except Exception:
+        pass
       if _goal_xy is not None:
           _save_kwargs["goal_xy_fixture"] = np.asarray(_goal_xy, dtype=np.float32)
       np.savez_compressed(_dump_path, **_save_kwargs)
@@ -491,6 +587,20 @@ class LMP_interface():
     # Save one mp4 per recorded camera so downstream review/labeling can
     # reproduce exactly what the VLM sees at inference. Source of truth:
     # VoxPoserRobocasa.VIDEO_RECORD_CAMERAS.
+    #
+    # IMPORTANT: disable run_LMP.py's TASK_TIMEOUT_SEC alarm BEFORE video
+    # encoding. Sim+LMP work is already done by this point; the only thing
+    # left is mp4 writing + ffmpeg re-encode which can take 60-300s for 5
+    # cameras × 3000+ frames. Without disabling, long sims (e.g. L0
+    # ~3000 steps) hit timeout DURING video save → 3 retries × timeout
+    # all fail (TaskTimeout raised in cv2 loop) → no results.json saved
+    # for that task. After this block we just `return execute_info`, so no
+    # subsequent operation needs timeout protection.
+    try:
+      import signal as _signal
+      _signal.alarm(0)   # disable task timeout — video save can take its time
+    except Exception:
+      pass  # not on Unix or alarm not supported — proceed without disable
     if controller_infos:
         for _cam in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
             _kw = f"{_cam}_image"
@@ -672,6 +782,11 @@ class LMP_interface():
       x_index = self.cm2index(x_cm, 'x')
       y_index = self.cm2index(y_cm, 'y')
       z_index = self.cm2index(z_cm, 'z')
+      # For NAVIGATION, position is (row=y, col=x, z). Return offsets in
+      # the same (row, col, z) order so direct addition `position + offset`
+      # by LLM produces a valid array index.
+      if bool(getattr(self._env, 'navigate_task', False)):
+        return np.array([y_index, x_index, z_index])
       return np.array([x_index, y_index, z_index])
   
   def index2cm(self, index, direction=None):
@@ -743,10 +858,30 @@ class LMP_interface():
     pm_arr = pixel_map.array if hasattr(pixel_map, 'array') else pixel_map
     pm_shape = pm_arr.shape
 
-    if occ is not None and occ.size > 0:
+    # Prefer building occupancy directly from world point cloud (skips the
+    # voxel/pixel index swap entirely). Falls back to the legacy voxel
+    # occupancy_map only if world points unavailable.
+    pc_world = None
+    try:
+      _pc = pixel_xy_or_obj._point_cloud_world
+      if _pc is not None and len(_pc):
+        pc_world = np.asarray(_pc)
+    except (AttributeError, KeyError, TypeError):
+      pc_world = None
+    if pc_world is not None:
+      occ = pc2pixel_map(
+          pc_world.astype(np.float32),
+          self._env.workspace_bounds_min,
+          self._env.workspace_bounds_max,
+          pm_shape[0], pm_shape[1],
+      ).astype(bool)
+    elif occ is not None and occ.size > 0:
       if occ.ndim == 3:
-        occ = occ.any(axis=2)        # 3D voxel → 2D floor projection
+        occ = occ.any(axis=2)
       occ = occ.astype(bool)
+      # Legacy voxel_map convention is (x_idx, y_idx). pixel_map is
+      # (row=y, col=x). Transpose before resize.
+      occ = occ.T
       if occ.shape != pm_shape:
         try:
           import cv2
@@ -755,51 +890,96 @@ class LMP_interface():
                            interpolation=cv2.INTER_NEAREST).astype(bool)
         except Exception:
           occ = None
-      if occ is not None and occ.any():
-        if radius_cm > 0:
-          from scipy.ndimage import distance_transform_edt
-          radius_cells = max(1, int(round(radius_cm / (self._resolution[0] * 100))))
-          halo = distance_transform_edt(~occ) <= radius_cells
-        else:
-          halo = occ
-        target = pixel_map.array if hasattr(pixel_map, 'array') else pixel_map
-        target[halo] = value
-        # Debug: log how many cells got set vs total
-        try:
-          _name = pixel_xy_or_obj.get('name', '?') if isinstance(pixel_xy_or_obj, dict) else getattr(pixel_xy_or_obj, 'name', '?')
-        except Exception:
-          _name = '?'
-        logger.info(f"[set_pixel_by_radius OCC-MODE] obj={_name} occ_cells={int(occ.sum())} halo_cells={int(halo.sum())} radius_cm={radius_cm}")
-        return pixel_map
-
-    # No usable occupancy_map → fall back to .position
-    pos = None
-    try:
-      candidate = pixel_xy_or_obj.position
-      if candidate is not None:
-        pos = np.asarray(candidate)
-    except (AttributeError, KeyError, TypeError):
-      pos = None
-
-    if pos is not None:
-      pixel_xy = pos
-    else:
-      # Raw sequence [x, y] (numpy array, list, tuple)
+    if occ is not None and occ.any():
+      # Merge multi-part fixtures: bridge small gaps between sub-geoms of
+      # the same physical object (e.g. main_door = main + door + handle +
+      # trims; window = frame + glass; sink = basin + faucet) so the
+      # radius dilation operates on a single continuous mask. Closing with
+      # a 25cm structuring element merges parts that are within ~25cm of
+      # each other; far-separated components (multiple distinct fixtures
+      # mapped to the same name) remain separate.
+      from scipy.ndimage import binary_closing, distance_transform_edt
+      _cell_m = float(self._resolution[0])
+      _gap_cells = max(1, int(round(0.25 / _cell_m)))
+      occ_pre = occ
       try:
-        pixel_xy = [pixel_xy_or_obj[0], pixel_xy_or_obj[1]]
-      except (TypeError, KeyError, IndexError):
-        return pixel_map  # can't locate — no-op
+        occ = binary_closing(occ, iterations=_gap_cells)
+      except Exception:
+        occ = occ_pre
+      if radius_cm > 0:
+        radius_cells = max(1, int(round(radius_cm / (_cell_m * 100))))
+        halo = distance_transform_edt(~occ) <= radius_cells
+      else:
+        halo = occ
+      target = pixel_map.array if hasattr(pixel_map, 'array') else pixel_map
+      target[halo] = value
+      try:
+        _name = pixel_xy_or_obj.get('name', '?') if isinstance(pixel_xy_or_obj, dict) else getattr(pixel_xy_or_obj, 'name', '?')
+      except Exception:
+        _name = '?'
+      logger.info(f"[set_pixel_by_radius OCC-MODE] obj={_name} occ_cells_raw={int(occ_pre.sum())} occ_cells_merged={int(occ.sum())} halo_cells={int(halo.sum())} radius_cm={radius_cm}")
+      return pixel_map
 
-    # Legacy point mode
-    logger.info(f"[set_pixel_by_radius PT-MODE] xy={pixel_xy} radius_cm={radius_cm}")
-    pixel_map[int(pixel_xy[0]), int(pixel_xy[1])] = value
+    # No usable occupancy_map → fall back to position. Prefer
+    # `_position_world` (world coords) over `position` (legacy voxel
+    # coords with x/y swap) — converting world → (row, col) directly
+    # gives the geometrically correct cell with no swap fix-ups.
+    pos_world = None
+    try:
+      candidate = pixel_xy_or_obj._position_world
+      if candidate is not None:
+        pos_world = np.asarray(candidate)[:2]
+    except (AttributeError, KeyError, TypeError):
+      pos_world = None
+
+    if pos_world is not None:
+      ws_min = self._env.workspace_bounds_min[:2]
+      ws_max = self._env.workspace_bounds_max[:2]
+      rng = ws_max - ws_min
+      col = int((pos_world[0] - ws_min[0]) / rng[0] * (pm_shape[1] - 1))
+      row = int((pos_world[1] - ws_min[1]) / rng[1] * (pm_shape[0] - 1))
+      row = max(0, min(pm_shape[0] - 1, row))
+      col = max(0, min(pm_shape[1] - 1, col))
+      logger.info(f"[set_pixel_by_radius PT-MODE world] xy={pos_world.tolist()} → (row={row}, col={col}) radius_cm={radius_cm}")
+      pixel_map[row, col] = value
+      if radius_cm > 0:
+        radius_x = self.cm2index(radius_cm, 'x')
+        radius_y = self.cm2index(radius_cm, 'y')
+        r0 = max(0, row - radius_y)
+        r1 = min(pm_shape[0], row + radius_y + 1)
+        c0 = max(0, col - radius_x)
+        c1 = min(pm_shape[1], col + radius_x + 1)
+        pixel_map[r0:r1, c0:c1] = value
+      return pixel_map
+
+    # Last-resort: raw [row, col] (legacy LLM code passes pixel coords
+    # directly). Use as-is.
+    try:
+      pixel_xy = [pixel_xy_or_obj[0], pixel_xy_or_obj[1]]
+    except (TypeError, KeyError, IndexError):
+      return pixel_map
+    # Guard against None / non-numeric coords. Caller can pass an Observation
+    # whose [0]/[1] indexing returns None (parse_query_obj fallback when the
+    # object isn't visible in any camera). int(None) raises TypeError —
+    # silently drop those calls instead of crashing the whole episode.
+    if pixel_xy[0] is None or pixel_xy[1] is None:
+      logger.info(f"[set_pixel_by_radius PT-MODE raw] skipped (None coord) xy={pixel_xy} radius_cm={radius_cm}")
+      return pixel_map
+    try:
+      _r, _c = int(pixel_xy[0]), int(pixel_xy[1])
+    except (TypeError, ValueError):
+      logger.info(f"[set_pixel_by_radius PT-MODE raw] skipped (non-numeric) xy={pixel_xy} radius_cm={radius_cm}")
+      return pixel_map
+    logger.info(f"[set_pixel_by_radius PT-MODE raw] xy={pixel_xy} radius_cm={radius_cm}")
+    pixel_map[_r, _c] = value
     if radius_cm > 0:
       radius_x = self.cm2index(radius_cm, 'x')
       radius_y = self.cm2index(radius_cm, 'y')
-      min_x = max(0, int(pixel_xy[0]) - radius_x)
-      max_x = min(self._map_size, int(pixel_xy[0]) + radius_x + 1)
-      min_y = max(0, int(pixel_xy[1]) - radius_y)
-      max_y = min(self._map_size, int(pixel_xy[1]) + radius_y + 1)
+      _ph, _pw = pm_shape[0], pm_shape[1]
+      min_x = max(0, _r - radius_x)
+      max_x = min(_ph, _r + radius_x + 1)
+      min_y = max(0, _c - radius_y)
+      max_y = min(_pw, _c + radius_y + 1)
       pixel_map[min_x:max_x, min_y:max_y] = value
     return pixel_map
 
@@ -824,6 +1004,33 @@ class LMP_interface():
   # ======================================================
   # == helper functions
   # ======================================================
+  def _world_to_pos_coords(self, world_xyz):
+    """Position coords usable as direct array index for the LLM-set maps.
+
+    For NAVIGATION (rectangular pixel grid map_h × map_w): returns
+    (row=y_idx, col=x_idx, z_idx) using (map_h, map_w) so that
+    `pixel_map[pos[0], pos[1]] = 1` lands at the correct cell.
+
+    For MANIPULATION (cubic voxel grid map_size³): returns voxel coords
+    via _world_to_voxel (legacy behaviour).
+    """
+    is_nav = bool(getattr(self._env, 'navigate_task', False))
+    if not is_nav:
+        return self._world_to_voxel(world_xyz)
+    w = np.asarray(world_xyz, dtype=np.float32)
+    ws_min = self._env.workspace_bounds_min.astype(np.float32)
+    ws_max = self._env.workspace_bounds_max.astype(np.float32)
+    rng = ws_max - ws_min
+    col = int(round((w[0] - ws_min[0]) / max(rng[0], 1e-9) * (self._map_w - 1)))
+    row = int(round((w[1] - ws_min[1]) / max(rng[1], 1e-9) * (self._map_h - 1)))
+    z   = int(round((w[2] - ws_min[2]) / max(rng[2], 1e-9) * (self._map_size - 1)))
+    row = max(0, min(self._map_h - 1, row))
+    col = max(0, min(self._map_w - 1, col))
+    # Navigation `pixel_map[i, j]` semantics → i=row, j=col. So return
+    # (row, col, z) so direct LLM indexing `m[pos[0], pos[1]] = 1` lands
+    # at correct cell.
+    return np.array([row, col, z], dtype=np.int32)
+
   def _world_to_voxel(self, world_xyz):
     _world_xyz = world_xyz.astype(np.float32)
     _voxels_bounds_robot_min = self._env.workspace_bounds_min.astype(np.float32)
@@ -858,27 +1065,41 @@ class LMP_interface():
     return collision_voxel
 
   def _get_scene_collision_pixel_map(self):
-    """Build scene_collision from camera point cloud + morphological closing.
+    """Build scene_collision from KITCHEN FIXTURE GEOM AABBs (rectangle
+    projection), not from camera point cloud.
 
-    Point cloud alone is patchy (cameras only see exposed surfaces of tall
-    fixtures, leaving holes in the projected XY map). Morphological closing
-    fills small gaps inside fixture footprints without inflating beyond the
-    real obstacle area — unlike geom_rbound disk projection which over-covers
-    thin/long geoms (walls have rbound ≈ length/2, blanketing the kitchen).
+    Why not point cloud:
+      - Patchy: cameras see only exposed surfaces of tall fixtures, so the
+        interior footprint is blank → produces salt-pepper noise & holes.
+      - Adding binary_closing/opening masks the symptom, doesn't fix it.
+
+    Why rectangle (not geom_rbound disk):
+      - geom_rbound = enclosing-sphere radius. For walls (long thin geoms)
+        rbound ≈ length/2, projecting them as huge disks that blanket the
+        kitchen (this was the bug in the previous fixture-AABB attempt that
+        caused the revert to point-cloud).
+      - geom_size = actual half-extents along each axis. For a box geom
+        the rectangle [p±size_x, p±size_y] is the true footprint.
+
+    Falls back to point-cloud + closing if env unavailable.
     """
+    if hasattr(self, '_env') and self._env is not None:
+      mask = self._get_fixture_floor_footprint(self._map_h, self._map_w)
+      if mask is not None:
+        return mask.astype(np.float64)
+    # Fallback: legacy point-cloud + morphological closing.
     collision_points_world, _ = self._env.get_scene_3d_obs(ignore_robot=True)
     collision_pixel = self._points_to_pixel_map(collision_points_world)
-    # Fill point-cloud sparsity gaps (~3 cell radius ≈ 18cm)
     from scipy.ndimage import binary_closing
     return binary_closing(collision_pixel > 0, iterations=3).astype(np.float64)
 
   def _points_to_pixel_map(self, points):
-    """convert points in world frame to voxel frame, voxelize, and return the voxelized points"""
+    """Project world points → (map_h, map_w) pixel map (rectangular grid)."""
     _points = points.astype(np.float32)
     _pixel_bounds_robot_min = self._env.workspace_bounds_min.astype(np.float32)[:2]
     _pixel_bounds_robot_max = self._env.workspace_bounds_max.astype(np.float32)[:2]
-    _map_size = self._map_size
-    return pc2pixel_map(_points, _pixel_bounds_robot_min, _pixel_bounds_robot_max, _map_size)
+    return pc2pixel_map(_points, _pixel_bounds_robot_min, _pixel_bounds_robot_max,
+                        self._map_h, self._map_w)
 
 
   def _get_default_voxel_map(self, type='target', task='manipulation'):
@@ -897,14 +1118,15 @@ class LMP_interface():
           voxel_map = np.zeros((self._map_size, self._map_size, self._map_size, 4))
           voxel_map[:, :, :] = self._env.get_ee_quat()
       elif task == 'navigation':
+        # Rectangular grid: (map_h, map_w) for isotropic 5cm cells per layout.
         if type == 'target':
-          voxel_map = np.zeros((self._map_size, self._map_size))
+          voxel_map = np.zeros((self._map_h, self._map_w))
         elif type == 'obstacle':
-          voxel_map = np.zeros((self._map_size, self._map_size))
+          voxel_map = np.zeros((self._map_h, self._map_w))
         elif type == 'velocity':
-          voxel_map = np.ones((self._map_size, self._map_size))
+          voxel_map = np.ones((self._map_h, self._map_w))
         elif type == 'rotation':
-          voxel_map = np.zeros((self._map_size, self._map_size))
+          voxel_map = np.zeros((self._map_h, self._map_w))
         else:
           raise ValueError('Unknown voxel map type: {}'.format(type))
       else:
@@ -958,8 +1180,21 @@ class LMP_interface():
     traj = []
     cur_xy = self._env.env._get_observations()['robot0_base_pos'][:2]
     initial_filtering = True
+    # Rectangular-grid world conversion (scalar map_size was wrong for
+    # non-square workspaces — produced traj_world starting at a totally
+    # different position from path_pixel start, making (e) Cost panel
+    # red trajectory and (f) Trajectory pink path show inconsistent
+    # routes).
+    _ws_min = np.asarray(self._env.workspace_bounds_min[:2], dtype=np.float32)
+    _ws_max = np.asarray(self._env.workspace_bounds_max[:2], dtype=np.float32)
+    _rng = _ws_max - _ws_min
+    _mh = max(int(self._map_h) - 1, 1)
+    _mw = max(int(self._map_w) - 1, 1)
     for path_idx in path:
-      world_xy = self._voxel_to_world(np.array([path_idx[0], path_idx[1], 0]))[:2]
+      # path_idx = (row, col). row indexes y, col indexes x.
+      world_x = float(_ws_min[0] + path_idx[1] / _mw * _rng[0])
+      world_y = float(_ws_min[1] + path_idx[0] / _mh * _rng[1])
+      world_xy = np.array([world_x, world_y])
       if initial_filtering:
           if np.linalg.norm(world_xy - cur_xy) < 0.4:
             continue
@@ -1029,24 +1264,27 @@ class LMP_interface():
       goal_yaw = goal_yaw_scalar
 
     # Drive toward the lookahead point (target_xy) instead of exact goal_xy
-    # for smoother motion. Use cosine-scaled translation: PandaOmron is
-    # holonomic so x/y/yaw move simultaneously, but we damp translation
-    # when the robot is far off-yaw to avoid weird sideways drifting.
+    # for smoother motion. The PandaOmron base is holonomic so translation
+    # and rotation can happen simultaneously — there is no "facing" required
+    # before moving. Previously we cosine-damped translation when off-yaw
+    # (move_factor = max(0, cos(delta_yaw))) which forced the robot to
+    # rotate-only when delta_yaw > 90°, exhausting the per-waypoint step
+    # budget on rotation alone (verified bug: L3 wp[0] needed 90° rotation
+    # → robot only rotated, never translated, then moved on to wp[1] with
+    # same problem → wandering and never reaching goal).
+    #
+    # Fix: drop move_factor entirely. Body-frame v_x, v_y already encode
+    # the correct "go-this-way-while-also-rotating" command for holonomic
+    # base. The action.clip([-1, 1]) at the end caps total velocity safely.
     dx = target_xy[0] - cur_xy[0]
     dy = target_xy[1] - cur_xy[1]
     delta_yaw = (goal_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi
 
     v_x = dx * np.cos(cur_yaw) + dy * np.sin(cur_yaw)
     v_y = -dx * np.sin(cur_yaw) + dy * np.cos(cur_yaw)
-    # move_factor = cos(delta_yaw) clamped to [0, 1]:
-    #   0° error  → 1.0 (full forward speed)
-    #   60° error → 0.5
-    #   90° error → 0.0 (rotate only)
-    #   >90°      → 0.0 (rotate only — don't move backward)
-    move_factor = max(0.0, float(np.cos(delta_yaw)))
     action = np.zeros(3)
-    action[0] = v_x * goal_vel * kp * move_factor
-    action[1] = v_y * goal_vel * kp * move_factor
+    action[0] = v_x * goal_vel * kp
+    action[1] = v_y * goal_vel * kp
     action[2] = delta_yaw * goal_vel * kp
     action = np.clip(action, -1.0, 1.0)
     return action, delta_yaw
@@ -1159,8 +1397,10 @@ class LMP_interface():
     # Previously we only marked the geom's xpos centroid + 1-cell dilation,
     # which underestimates large geoms (e.g. mobilebase0_wheeled_base
     # rbound=0.541m → ~10 cells radius vs 1 cell with the old code).
-    sx_m = (wmax[0] - wmin[0]) / H
-    sy_m = (wmax[1] - wmin[1]) / W
+    # Pixel grid convention: H=map_h=y_cells (rows), W=map_w=x_cells (cols).
+    # cell_x = world x extent / W,  cell_y = world y extent / H.
+    sx_m = (wmax[0] - wmin[0]) / W   # cell width along world-x = col axis
+    sy_m = (wmax[1] - wmin[1]) / H   # cell height along world-y = row axis
     cell_min_m = float(min(sx_m, sy_m))
     yy, xx = np.ogrid[:H, :W]
     mask = np.zeros((H, W), dtype=bool)
@@ -1173,26 +1413,36 @@ class LMP_interface():
       # markers like *_target placed at z<0).
       if p[2] < -0.05:
         continue
-      r = (p[0] - wmin[0]) / (wmax[0] - wmin[0]) * H
-      c = (p[1] - wmin[1]) / (wmax[1] - wmin[1]) * W
+      # World x → col (axis 1, width W); world y → row (axis 0, height H).
+      c_col = (p[0] - wmin[0]) / (wmax[0] - wmin[0]) * W
+      r_row = (p[1] - wmin[1]) / (wmax[1] - wmin[1]) * H
       rb_m = float(model.geom_rbound[gid])
       if rb_m <= 0:
         continue
       r_cells = max(1, int(np.ceil(rb_m / cell_min_m)))
-      mask |= (yy - r)**2 + (xx - c)**2 <= r_cells**2
+      mask |= (yy - r_row)**2 + (xx - c_col)**2 <= r_cells**2
     if not mask.any():
       return None
     return mask
   
   def _get_fixture_floor_footprint(self, H, W):
-    """Project all kitchen FIXTURE body geom AABBs to a 2D floor mask.
+    """Project all kitchen FIXTURE geom AABBs to a 2D floor mask using
+    AXIS-ALIGNED RECTANGLES (geom_size half-extents).
 
-    Replaces the point-cloud-based scene_collision (which is patchy because
-    cameras only see exposed surfaces of tall fixtures, leaving the interior
-    footprint blank). Same projection style as _get_robot_floor_footprint,
-    but excludes robot, floor, eef_target — everything else (counter, sink,
-    fridge, oven, dishwasher, stove, walls, doors, etc.) is treated as
-    static obstacle at the cell its geom_rbound disk covers.
+    This is the second iteration of fixture-AABB projection. The first
+    iteration used `geom_rbound` (enclosing-sphere radius) which made walls
+    project as huge disks blanketing the kitchen, forcing a revert to point
+    cloud. This version uses each geom's actual XY half-extents so walls
+    become thin rectangles, counters become real footprints, etc.
+
+    For non-axis-aligned geoms the rectangle is widened by the rotated
+    bounding box of the original (size_x, size_y) — conservative and exact
+    for axis-aligned fixtures (which is the common case in robocasa).
+
+    Bodies excluded: robot, floor (navigable), eef_target, world,
+    standing_table. Geoms below z=-0.05 (sub-floor decals) and above
+    z=1.8m (ceiling lamps) are skipped as they cannot collide with the
+    mobile base.
 
     Returns (H, W) bool array or None if env unavailable.
     """
@@ -1206,49 +1456,67 @@ class LMP_interface():
     if wmax[0] - wmin[0] <= 0 or wmax[1] - wmin[1] <= 0:
       return None
 
-    # Bodies to EXCLUDE from fixture footprint:
-    #   - robot bodies (handled separately as movable)
-    #   - floor geoms (the navigable surface, not an obstacle)
-    #   - eef_target / *_target / world (visualisation markers, not physical)
     exclude_patterns = ('robot0', 'mobilebase', 'gripper0', 'panda',
                         'eef_target', '_target', 'world',
-                        'standing_table')  # outlier room furniture
-    # Floor geoms are excluded by geom name (rather than body name) since
-    # the Floor fixture body may contain non-floor geoms too.
+                        'standing_table')
     exclude_body_ids = set()
     for i in range(model.nbody):
       n = (model.body_id2name(i) or '').lower()
       if any(p in n for p in exclude_patterns):
         exclude_body_ids.add(i)
 
-    sx_m = (wmax[0] - wmin[0]) / H
-    sy_m = (wmax[1] - wmin[1]) / W
-    cell_min_m = float(min(sx_m, sy_m))
-    yy, xx = np.ogrid[:H, :W]
+    # World→grid conversion: H=map_h=y_cells (rows), W=map_w=x_cells (cols).
+    # Cell size meters: x extent / W (col=x), y extent / H (row=y).
+    sx_m = (wmax[0] - wmin[0]) / W   # cell width in world x = col axis
+    sy_m = (wmax[1] - wmin[1]) / H   # cell height in world y = row axis
     mask = np.zeros((H, W), dtype=bool)
+
     for gid in range(model.ngeom):
       gname = (model.geom_id2name(gid) or '').lower()
       if 'floor' in gname:
-        continue   # floor surface — navigable, not obstacle
+        continue
       bid = int(model.geom_bodyid[gid])
       if bid in exclude_body_ids:
         continue
       p = sim.data.geom_xpos[gid]
-      # Skip very-low geoms (markers placed below floor)
-      if p[2] < -0.05:
+      if p[2] < -0.05 or p[2] > 1.8:
         continue
-      # Skip very-high geoms above robot reach (light fixtures, ceiling lamps)
-      # — robot base navigates at z≈0.4, anything above 1.8m can't collide.
-      if p[2] > 1.8:
+      # geom_size meaning depends on geom type, but for box/mesh/cylinder
+      # the first two entries are XY half-extents in the geom's local frame.
+      # For sphere, all entries equal radius — also OK as half-extents.
+      gs = model.geom_size[gid]
+      hx, hy = float(gs[0]), float(gs[1])
+      if hx <= 0 or hy <= 0:
         continue
-      # Convert geom XY to grid coords
-      r = (p[0] - wmin[0]) / (wmax[0] - wmin[0]) * H
-      c = (p[1] - wmin[1]) / (wmax[1] - wmin[1]) * W
-      rb_m = float(model.geom_rbound[gid])
-      if rb_m <= 0:
+      # Account for rotation: use rotated AABB so that diagonal orientation
+      # still produces a valid (over-approximate) world-axis footprint.
+      mat = sim.data.geom_xmat[gid].reshape(3, 3)
+      # |R[0,0]|*hx + |R[0,1]|*hy = world-x half-extent of rotated rect
+      half_x = abs(mat[0, 0]) * hx + abs(mat[0, 1]) * hy
+      half_y = abs(mat[1, 0]) * hx + abs(mat[1, 1]) * hy
+
+      x0 = p[0] - half_x
+      x1 = p[0] + half_x
+      y0 = p[1] - half_y
+      y1 = p[1] + half_y
+      # Clip to workspace bounds
+      x0 = max(x0, wmin[0]); x1 = min(x1, wmax[0])
+      y0 = max(y0, wmin[1]); y1 = min(y1, wmax[1])
+      if x1 <= x0 or y1 <= y0:
         continue
-      r_cells = max(1, int(np.ceil(rb_m / cell_min_m)))
-      mask |= (yy - r)**2 + (xx - c)**2 <= r_cells**2
+      # World → grid (correct convention):
+      #   col index = (x - wmin_x) / cell_x  (world-x → col axis, width W)
+      #   row index = (y - wmin_y) / cell_y  (world-y → row axis, height H)
+      c0 = int(np.floor((x0 - wmin[0]) / sx_m))
+      c1 = int(np.ceil ((x1 - wmin[0]) / sx_m))
+      r0 = int(np.floor((y0 - wmin[1]) / sy_m))
+      r1 = int(np.ceil ((y1 - wmin[1]) / sy_m))
+      r0 = max(0, r0); r1 = min(H, r1)
+      c0 = max(0, c0); c1 = min(W, c1)
+      if r1 <= r0 or c1 <= c0:
+        continue
+      mask[r0:r1, c0:c1] = True
+
     if not mask.any():
       return None
     return mask
@@ -1385,31 +1653,37 @@ def pc2voxel_map(points, voxel_bounds_robot_min, voxel_bounds_robot_max, map_siz
       voxel_map[points_vox[i, 0], points_vox[i, 1], points_vox[i, 2]] = 1
   return voxel_map
 
-def pc2pixel_map(points, pixel_bounds_robot_min, pixel_bounds_robot_max, map_size, \
-                 z_min=None, z_max=None):
-  """given point cloud, create a fixed size pixel map, and fill in the voxels"""
+def pc2pixel_map(points, pixel_bounds_robot_min, pixel_bounds_robot_max,
+                 map_h, map_w=None, z_min=None, z_max=None):
+  """Project world point cloud onto a (map_h, map_w) pixel map.
+
+  Convention (consistent with planner / visualization):
+      pixel_map[row, col] where row indexes WORLD-Y, col indexes WORLD-X.
+
+  Earlier versions used a single `map_size` and indexed
+  `pixel_map[x_idx, y_idx]` which silently swapped axes — visible as cat
+  marker landing in the wrong corner for square maps and ~near-correct
+  for rectangular ones (coincidence in extent ratio)."""
+  if map_w is None:
+      map_w = map_h
   points = points.astype(np.float32)
-  # z-range filtering
   z_min = points[:, 2].min() + 0.05 if z_min is None else z_min
   logger.debug(f"z min: {z_min}")
   points = points[points[:, 2] >= z_min]
   if z_max is not None:
       points = points[points[:, 2] <= z_max]
-      
   if len(points) == 0:
-      return np.zeros((map_size, map_size))
-  points_xy = points[:, :2]  # only keep x, y
+      return np.zeros((map_h, map_w))
+
+  points_xy = points[:, :2]
   pixel_bounds_robot_min = pixel_bounds_robot_min.astype(np.float32)[:2]
   pixel_bounds_robot_max = pixel_bounds_robot_max.astype(np.float32)[:2]
-  # make sure the point is within the pixel bounds
   points_xy = np.clip(points_xy, pixel_bounds_robot_min, pixel_bounds_robot_max)
-  # convert to pixel coordinates (x, y only)
-  pixel_xy = (points_xy - pixel_bounds_robot_min) / (pixel_bounds_robot_max - pixel_bounds_robot_min) * (map_size - 1)
-  # to integer
-  points_pix = np.round(pixel_xy).astype(np.int32)
-  # clip to valid range
-  points_pix = np.clip(points_pix, 0, map_size - 1)
-  # create 2D pixel map
-  pixel_map = np.zeros((map_size, map_size))
-  pixel_map[points_pix[:, 0], points_pix[:, 1]] = 1
+  rng = pixel_bounds_robot_max - pixel_bounds_robot_min
+  cols = ((points_xy[:, 0] - pixel_bounds_robot_min[0]) / rng[0] * (map_w - 1)).round().astype(np.int32)
+  rows = ((points_xy[:, 1] - pixel_bounds_robot_min[1]) / rng[1] * (map_h - 1)).round().astype(np.int32)
+  cols = np.clip(cols, 0, map_w - 1)
+  rows = np.clip(rows, 0, map_h - 1)
+  pixel_map = np.zeros((map_h, map_w))
+  pixel_map[rows, cols] = 1
   return pixel_map

@@ -10,7 +10,15 @@ import robocasa
 from robosuite import load_composite_controller_config
 import time
 MAX_DEPTH = 20.0
-DONTKNOWWHATISTHIS = ['cab', 'left', 'right', 'obstacle', "light", "floor", "wall", "outlet", "stack", "robot0", "gripper0"]
+# Body-name prefixes filtered out from the LLM's visible-objects list.
+# These are scene structure (floor/wall), kitchen substructures (cab/stack),
+# wall fixtures (light/outlet), positional tokens (left/right), the navigation
+# obstacle wrapper body (obstacle — its real type is surfaced separately via
+# self.env.obstacle), and robot links (robot0/gripper0).
+EXCLUDED_BODY_PREFIXES = [
+    'cab', 'left', 'right', 'obstacle', 'light', 'floor',
+    'wall', 'outlet', 'stack', 'robot0', 'gripper0',
+]
 TABLE_ALIAS =["table", "cutting", "window",'stack', 'wall', 'utensil']
 MOBILE_ALIAS = {
     "posed": "person",
@@ -63,6 +71,25 @@ KITCHEN_GROUP_SUBNAMES = (
     'island', 'counter', 'stool', 'shelves', 'cabinet',
     'top', 'bottom', 'standing', 'hood', 'wall', 'window',
 )
+
+# Per-layout converged topview camera fovy (degrees). Captured from the
+# iterative auto-tuner (segment-edge clear at margin × extent above floor)
+# on 2026-05-09. The camera is always centered on the workspace center
+# (= floor AABB center) with a pure top-down quat (0, 0, 0, 1); only the
+# fovy varies per layout. Listed layouts cover the active eval set
+# (L4 GALLEY / L9 WRAPAROUND excluded). Fallback: max of all + small pad.
+TOPVIEW_FOVY_BY_LAYOUT = {
+    0: 29.4,
+    1: 41.6,
+    2: 28.8,
+    3: 36.6,
+    5: 32.0,
+    6: 38.6,
+    7: 36.3,
+    8: 36.9,
+}
+TOPVIEW_FOVY_DEFAULT = 45.0  # safe wide-angle for unlisted layouts
+
 class VoxPoserRobocasa():
     def __init__(self, task_name = "", task_config=None, visualizer=None):
         """
@@ -81,6 +108,16 @@ class VoxPoserRobocasa():
             controller="BASIC",
             robot=task_config['robot'],
         )
+        # Remember layout id so the topview camera lookup (TOPVIEW_FOVY_BY_LAYOUT)
+        # can pick the per-layout converged fovy. task_config['layout_ids'] may be
+        # a single int (default) or a list — store the first int in either case.
+        _lid = task_config.get('layout_ids')
+        if isinstance(_lid, (list, tuple)):
+            _lid = _lid[0] if _lid else None
+        try:
+            self._layout_id = int(_lid) if _lid is not None else None
+        except (TypeError, ValueError):
+            self._layout_id = None
         # Create argument configuration
         self.env_config = {
             "env_name": task_name,
@@ -127,7 +164,15 @@ class VoxPoserRobocasa():
 
         self.cam_height = task_config['camera_heights']
         self.cam_width = task_config['camera_widths']
-        self.map_size = 100
+        # Planner grid resolution: square 5cm × 5cm cells. Map dimensions
+        # (map_h, map_w) are computed from workspace_bounds + resolution_cm
+        # in _adjust_map_resolution(), called once workspace is known.
+        # Falls back to a 100×100 square grid for the initial seg-render
+        # before workspace_bounds is computed.
+        self.resolution_cm = float(task_config.get('resolution_cm', 5.0))
+        self.map_size = 100  # legacy scalar (kept for seg-render & 3D maps)
+        self.map_h = 100     # rectangular grid height (rows)
+        self.map_w = 100     # rectangular grid width (cols)
         self.get_3d_obs_by_name()
         
         # workspace variable
@@ -175,7 +220,7 @@ class VoxPoserRobocasa():
         obs_type = getattr(self.env, 'obstacle', None)
         if obs_type and obs_type not in visible_objects:
             visible_objects.append(obs_type)
-        visible_objects = [obj for obj in visible_objects if obj not in DONTKNOWWHATISTHIS]
+        visible_objects = [obj for obj in visible_objects if obj not in EXCLUDED_BODY_PREFIXES]
         final_visible_objects = visible_objects.copy()
         if mapping_ids == False:
             logger.debug(f"Original visible objects: {visible_objects}")
@@ -195,6 +240,29 @@ class VoxPoserRobocasa():
     def load_task(self):
         self._reset_task_variables()
         self.reset()
+        # Snapshot obstacle xy IMMEDIATELY after reset (before any planning
+        # / physics drift). Visualization needs the SAME instant the
+        # initial_topview is rendered so the cat marker lines up with the
+        # cat as seen in the image. Later capture in dump time can drift
+        # because cat physics may settle / move during LMP gen.
+        self._initial_obstacle_xy = None
+        try:
+            _kitchen = self.env
+            for _bid in range(_kitchen.sim.model.nbody):
+                _nm = _kitchen.sim.model.body_id2name(_bid) or ""
+                if _nm.startswith("obstacle"):
+                    _gxs = []
+                    for _gid in range(_kitchen.sim.model.ngeom):
+                        if _kitchen.sim.model.geom_bodyid[_gid] == _bid:
+                            _gxs.append(_kitchen.sim.data.geom_xpos[_gid])
+                    if _gxs:
+                        self._initial_obstacle_xy = np.mean(_gxs, axis=0)[:2].copy()
+                    else:
+                        self._initial_obstacle_xy = np.asarray(
+                            _kitchen.sim.data.body_xpos[_bid])[:2].copy()
+                    break
+        except Exception as _ie:
+            logger.warning(f"_initial_obstacle_xy capture failed: {_ie}")
         self.objects = self.get_visible_object_names(mapping_ids=True)
         self.name2ids = {k:[] for k in self.objects}
         for i in range(self.env.sim.model.ngeom):
@@ -278,6 +346,107 @@ class VoxPoserRobocasa():
                 floor_ids.append(i)
         self.floor_mask_ids = floor_ids
         logger.info(f"floor_mask_ids: {len(floor_ids)} geoms")
+
+        # Per-layout planner grid sized to keep cells square at the configured
+        # resolution (default 5 cm). Compute map_h × map_w from floor extent.
+        if self.navigate_task and floor_ids:
+            try:
+                _data = self.env.sim.data
+                _model = self.env.sim.model
+                _xs2, _ys2 = [], []
+                for _i in floor_ids:
+                    _p = _data.geom_xpos[_i]
+                    _s = _model.geom_size[_i]
+                    _mat = _data.geom_xmat[_i].reshape(3, 3)
+                    _hx = abs(_mat[0, 0]) * _s[0] + abs(_mat[0, 1]) * _s[1]
+                    _hy = abs(_mat[1, 0]) * _s[0] + abs(_mat[1, 1]) * _s[1]
+                    _xs2.extend([_p[0] - _hx, _p[0] + _hx])
+                    _ys2.extend([_p[1] - _hy, _p[1] + _hy])
+                _floor_w = max(_xs2) - min(_xs2)
+                _floor_h = max(_ys2) - min(_ys2)
+                _res_m = self.resolution_cm / 100.0
+                self.map_w = max(8, int(round(_floor_w / _res_m)))
+                self.map_h = max(8, int(round(_floor_h / _res_m)))
+                logger.info(
+                    f"planner grid sized: {self.map_h}×{self.map_w} cells "
+                    f"(resolution {self.resolution_cm}cm, floor {_floor_w:.2f}×{_floor_h:.2f}m)")
+            except Exception as _e:
+                logger.warning(f"map grid sizing fallback to 100×100: {_e}")
+
+        # Per-layout topview camera adjustment via LOOKUP (no iteration).
+        # 1. Camera center = workspace center (= floor AABB center). The
+        #    workspace_bounds set later in get_scene_3d_obs uses the same
+        #    floor AABB, so the camera center and workspace center are
+        #    guaranteed identical in (x, y).
+        # 2. Pure top-down orientation: cam_quat (w,x,y,z) = (0,0,0,1).
+        # 3. Per-layout fovy from TOPVIEW_FOVY_BY_LAYOUT (degrees).
+        #    If a layout is not in the lookup, we fall back to a one-shot
+        #    iterative auto-tune (segment-edge clear) and log the captured
+        #    fovy so it can be pinned in the lookup afterwards.
+        if self.navigate_task and floor_ids:
+            try:
+                _model = self.env.sim.model
+                _data = self.env.sim.data
+                _xs, _ys = [], []
+                for _i in floor_ids:
+                    _p = _data.geom_xpos[_i]
+                    _s = _model.geom_size[_i]
+                    _mat = _data.geom_xmat[_i].reshape(3, 3)
+                    _hx = abs(_mat[0, 0]) * _s[0] + abs(_mat[0, 1]) * _s[1]
+                    _hy = abs(_mat[1, 0]) * _s[0] + abs(_mat[1, 1]) * _s[1]
+                    _xs.extend([_p[0] - _hx, _p[0] + _hx])
+                    _ys.extend([_p[1] - _hy, _p[1] + _hy])
+                _cx = (min(_xs) + max(_xs)) / 2
+                _cy = (min(_ys) + max(_ys)) / 2
+                _cid = _model.camera_name2id('topview')
+                _cam_z = float(_model.cam_pos[_cid, 2])
+
+                _model.cam_pos[_cid, 0] = _cx
+                _model.cam_pos[_cid, 1] = _cy
+                _model.cam_quat[_cid] = np.array([0.0, 0.0, 0.0, 1.0])
+
+                _fovy = TOPVIEW_FOVY_BY_LAYOUT.get(self._layout_id)
+                if _fovy is None:
+                    # One-shot iterative tuning for layouts not yet pinned.
+                    import math as _math
+                    _ext_x = max(_xs) - min(_xs)
+                    _ext_y = max(_ys) - min(_ys)
+                    _aspect = float(self.cam_width) / float(self.cam_height)
+                    _margin = 1.05
+                    _max_iters = 6
+                    for _it in range(_max_iters):
+                        _fovy_h = 2 * _math.degrees(_math.atan((_ext_y * _margin) / (2 * _cam_z)))
+                        _fovy_w = 2 * _math.degrees(_math.atan((_ext_x * _margin) / (2 * _cam_z * _aspect)))
+                        _fovy = max(_fovy_h, _fovy_w)
+                        _model.cam_fovy[_cid] = _fovy
+                        self.env.sim.forward()
+                        _seg = self.env.sim.render(camera_name='topview', width=160, height=120,
+                                                   segmentation=True)[:, :, 1]
+                        _edge_geoms = set()
+                        for _row in (_seg[0, :], _seg[-1, :], _seg[:, 0], _seg[:, -1]):
+                            for _gid in np.unique(_row):
+                                if _gid <= 0:
+                                    continue
+                                _name = (_model.geom_id2name(int(_gid)) or '').lower()
+                                if any(p in _name for p in ('floor', 'wall', 'backing')):
+                                    continue
+                                _edge_geoms.add(_name)
+                        if not _edge_geoms:
+                            break
+                        _margin *= 1.15
+                    logger.warning(
+                        f"topview camera (layout={self._layout_id}): NOT in lookup — "
+                        f"auto-tuned fovy={_fovy:.1f}° margin×{_margin:.2f}. "
+                        f"PIN this in TOPVIEW_FOVY_BY_LAYOUT for reproducibility.")
+                else:
+                    _model.cam_fovy[_cid] = _fovy
+                    self.env.sim.forward()
+                    logger.info(
+                        f"topview camera (layout={self._layout_id}): pos=({_cx:.2f},{_cy:.2f},{_cam_z:.2f}) "
+                        f"fovy={_fovy:.1f}° (lookup)")
+                self.update_latest_obs()
+            except Exception as _cam_err:
+                logger.warning(f"topview camera adjust failed: {_cam_err}")
 
     # Default cameras for VLM: top-down, front view, agent center, human 1st-person
     _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_person_main_group_1stview']
@@ -482,12 +651,19 @@ class VoxPoserRobocasa():
                 model = self.env.sim.model
                 data  = self.env.sim.data
 
-                # (a) Body-centroid bbox, excluding outliers
+                # Workspace bounds = floor geom AABB (xy) + body z range.
+                #
+                # Walkable area is exactly the floor. Including body-centroid
+                # bbox (walls, cabinets, outlets, fridges) used to stretch the
+                # workspace past the floor (L1: +0.6m, L9: -0.46m) which wastes
+                # planner grid resolution on non-walkable cells. floor_geom_size
+                # is the exact half-extent (NOT enclosing sphere like geom_rbound),
+                # so this is safe and matches what the robot can actually traverse.
+                #
+                # Z range: keep body bbox z so 3D points (obstacles above floor)
+                # are correctly bounded.
                 xpos = data.xpos
                 keep = np.ones(len(xpos), dtype=bool)
-                # standing_table sits at y=±7m / x=7.5m far outside the kitchen
-                # and consistently stretches the bbox in L1/L3/L6/L7/L8/L9.
-                # Keep world (origin) and eef_target (z=-1 only) — both harmless.
                 exclude_patterns = ('standing_table',)
                 for i in range(model.nbody):
                     n = (model.body_id2name(i) or '').lower()
@@ -497,9 +673,13 @@ class VoxPoserRobocasa():
                 body_min = xpos_clean.min(axis=0)
                 body_max = xpos_clean.max(axis=0)
 
-                # (b) Floor geom AABB — use the actual floor extent (geom_size
-                # is half-extent). Take union across all floor geoms (multi-piece
-                # G_SHAPED / U_SHAPED layouts have several floor pieces).
+                # Floor geom AABB — union across multi-piece G_SHAPED/U_SHAPED.
+                # IMPORTANT: floor geoms in robocasa carry a 90° z-rotation
+                # (geom_xmat = [[0,-1,0],[1,0,0],[0,0,1]]), so geom_size is in
+                # the geom's LOCAL frame, not world. We must apply the
+                # rotation to get the world-axis half-extents — otherwise the
+                # workspace x/y are swapped, which makes corners_uv project
+                # the polygon 90° rotated against the visible floor.
                 floor_xs, floor_ys = [], []
                 for i in range(model.ngeom):
                     name = (model.geom_id2name(i) or '').lower()
@@ -507,14 +687,23 @@ class VoxPoserRobocasa():
                         continue
                     g_pos  = data.geom_xpos[i]
                     g_size = model.geom_size[i]
-                    floor_xs.extend([g_pos[0] - g_size[0], g_pos[0] + g_size[0]])
-                    floor_ys.extend([g_pos[1] - g_size[1], g_pos[1] + g_size[1]])
+                    g_mat  = data.geom_xmat[i].reshape(3, 3)
+                    hx_world = abs(g_mat[0, 0]) * g_size[0] + abs(g_mat[0, 1]) * g_size[1]
+                    hy_world = abs(g_mat[1, 0]) * g_size[0] + abs(g_mat[1, 1]) * g_size[1]
+                    floor_xs.extend([g_pos[0] - hx_world, g_pos[0] + hx_world])
+                    floor_ys.extend([g_pos[1] - hy_world, g_pos[1] + hy_world])
 
+                # Workspace bounds = floor geom AABB (matches YAML
+                # `room.floor` definition exactly after the YAML
+                # (y_half, x_half, z_half) → MuJoCo (x_half, y_half, z_half)
+                # convention swap). The earlier body-bbox expansion attempt
+                # incorrectly added wall/cabinet/ceiling positions, making
+                # the workspace cover non-walkable area.
                 if floor_xs and floor_ys:
-                    fmin = np.array([min(floor_xs), min(floor_ys), body_min[2]])
-                    fmax = np.array([max(floor_xs), max(floor_ys), body_max[2]])
-                    self.workspace_bounds_min = np.minimum(body_min, fmin).copy()
-                    self.workspace_bounds_max = np.maximum(body_max, fmax).copy()
+                    self.workspace_bounds_min = np.array(
+                        [min(floor_xs), min(floor_ys), body_min[2]])
+                    self.workspace_bounds_max = np.array(
+                        [max(floor_xs), max(floor_ys), body_max[2]])
                 else:
                     self.workspace_bounds_min = body_min.copy()
                     self.workspace_bounds_max = body_max.copy()
@@ -527,26 +716,39 @@ class VoxPoserRobocasa():
                     f"y=[{self.workspace_bounds_min[1]:.2f},{self.workspace_bounds_max[1]:.2f}] "
                     f"z=[{self.workspace_bounds_min[2]:.2f},{self.workspace_bounds_max[2]:.2f}] "
                     f"floor_geoms={len(floor_xs)//2 if floor_xs else 0}")
+                # Topview camera was already adjusted in load_task() once
+                # floor_mask_ids was populated, so initial_topview.png and the
+                # corners_uv computed from workspace_bounds (in interfaces.py)
+                # see the same camera state.
                 self._workspace_bounds_locked = True
             return
 
         # get object points
+        # First, normalize the query name: LMP often emits queries with
+        # spaces ('coffee machine', 'mobile base') while name2ids uses
+        # underscores ('coffee_machine'). Without this normalization,
+        # detect() raises KeyError → _safe_parse_query_obj returns a dummy
+        # Observation with position=[0,0,0] → LMP places affordance at the
+        # (0,0) corner cell → A* generates a path to the wrong corner →
+        # robot drives the wrong direction (verified L1 case where
+        # 'coffee machine' query lost ~9m off goal).
+        normalized_name = query_name.replace(' ', '_')
         try:
-            obj_ids = self.name2ids[query_name]
+            obj_ids = self.name2ids[normalized_name]
         except Exception as e:
             # try LLM shorthand aliases first (e.g. 'mobile_base' -> 'mobilebase0')
-            if query_name in LLM_QUERY_ALIASES:
-                mapped_name = LLM_QUERY_ALIASES[query_name]
+            if normalized_name in LLM_QUERY_ALIASES:
+                mapped_name = LLM_QUERY_ALIASES[normalized_name]
                 obj_ids = self.name2ids.get(mapped_name)
                 if obj_ids is None:
                     raise KeyError(f"'{query_name}' -> '{mapped_name}' not found in scene objects")
             else:
                 # use reverse mapped name from MOBILE_ALIAS (display_name -> body_prefix)
                 try:
-                    mapped_name = dict(map(reversed, MOBILE_ALIAS.items()))[query_name]
+                    mapped_name = dict(map(reversed, MOBILE_ALIAS.items()))[normalized_name]
                     obj_ids = self.name2ids[mapped_name]
                 except KeyError:
-                    raise KeyError(f"'{query_name}' not found in scene objects or MOBILE_ALIAS")
+                    raise KeyError(f"'{query_name}' (normalized '{normalized_name}') not found in scene objects or MOBILE_ALIAS")
         try:
             obj_points = points[np.isin(masks, obj_ids)]
             if (len(obj_points) == 0 or len(obj_ids) == 0) and query_name == 'door':
