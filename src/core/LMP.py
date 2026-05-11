@@ -40,7 +40,7 @@ class DeferredMap:
             return DeferredMap(lambda: self() * other())
         return DeferredMap(lambda: self() * other)
 
-_VLM_PATTERNS = ['vl', 'vision', 'pixtral', 'llava', 'internvl', '4.6v', 'cosmos', 'mimo', 'robobrain']
+_VLM_PATTERNS = ['vl', 'vision', 'pixtral', 'llava', 'internvl', '4.6v', 'cosmos', 'mimo']
 
 def is_vlm(model_name):
     """Check if a model name indicates a Vision-Language Model."""
@@ -223,33 +223,29 @@ class LMP:
         # Preserve '# Query:' in few-shot examples (only remove the last one which is the actual query)
         parts = user1.split('# Query:')
         user1 = '# Query:'.join(parts[:-1]).strip()
-        is_navigation = 'navigation' in self._env
-        if is_navigation:
-            # Model-specific prompt additions from config
-            model_name = kwargs.get('model', '')
-            extra_instruction = self._cfg.get('prompt_extra', '')
-            if not extra_instruction:
-                # Check model-specific overrides
-                model_prompts = self._cfg.get('model_prompts', {})
-                for pattern, instruction in model_prompts.items():
-                    if pattern.lower() in model_name.lower():
-                        extra_instruction = ' ' + instruction
-                        break
-            else:
-                extra_instruction = ' ' + extra_instruction
-            # Reasoning models (Qwen3 with thinking, etc.) tend to over-engineer code with
-            # undefined runtime flags. Add an explicit no-conditional instruction for those.
-            thinking_active = ('qwen3' in model_name.lower() and 'instruct-2507' not in model_name.lower()
-                               and os.environ.get('QWEN3_ENABLE_THINKING', '0') == '1')
-            literal_only_clause = (
-                " CRITICAL: emit only literal Python values (numbers, strings) inside function calls; "
-                "do NOT use conditional expressions referencing undefined runtime flags like "
-                "`near_person`, `near_cat`, or `is_X`. The provided helper functions accept fixed numeric values, "
-                "not boolean-conditioned expressions."
-            ) if thinking_active else ""
-            user1 = f"I would like you to help me write Python code to control a mobile robot navigating safely in a kitchen environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). Use your judgment to assign appropriate values based on each object's risk and context: safety radii (radius_cm) for avoidance — living beings and hazardous objects require larger clearance than static furniture; velocity multipliers — slow down significantly near living beings and moderately near hot or fragile objects; rotation angles (degrees) — use larger turning angles when precise orientation matters such as facing a person or aligning with a door.{literal_only_clause}{extra_instruction} I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
+        # Model-specific prompt additions from config
+        model_name = kwargs.get('model', '')
+        extra_instruction = self._cfg.get('prompt_extra', '')
+        if not extra_instruction:
+            # Check model-specific overrides
+            model_prompts = self._cfg.get('model_prompts', {})
+            for pattern, instruction in model_prompts.items():
+                if pattern.lower() in model_name.lower():
+                    extra_instruction = ' ' + instruction
+                    break
         else:
-            user1 = f"I would like you to help me write Python code to control a robot arm operating in a tabletop environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay). I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
+            extra_instruction = ' ' + extra_instruction
+        # Reasoning models (Qwen3 with thinking, etc.) tend to over-engineer code with
+        # undefined runtime flags. Add an explicit no-conditional instruction for those.
+        thinking_active = ('qwen3' in model_name.lower() and 'instruct-2507' not in model_name.lower()
+                           and os.environ.get('QWEN3_ENABLE_THINKING', '0') == '1')
+        literal_only_clause = (
+            " CRITICAL: emit only literal Python values (numbers, strings) inside function calls; "
+            "do NOT use conditional expressions referencing undefined runtime flags like "
+            "`near_person`, `near_cat`, or `is_X`. The provided helper functions accept fixed numeric values, "
+            "not boolean-conditioned expressions."
+        ) if thinking_active else ""
+        user1 = f"I would like you to help me write Python code to control a mobile robot navigating safely in a kitchen environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay).{literal_only_clause}{extra_instruction} I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
         assistant1 = f'Got it. I will complete what you give me next.'
         user2 = new_query
         # handle given context (this was written originally for completion endpoint)
@@ -261,10 +257,8 @@ class LMP:
             user2 = obj_context.strip() + '\n' + user2
         # Use 'developer' role for GPT-oss harmony channel compatibility;
         # standard models treat 'developer' same as 'system'
-        if is_navigation:
-            sys_content = "You are a helpful assistant that pays attention to the user's instructions and writes good python code for controlling a mobile robot navigating safely in a kitchen environment."
-        else:
-            sys_content = "You are a helpful assistant that pays attention to the user's instructions and writes good python code for operating a robot arm in a tabletop environment."
+        from utils.utils import load_prompt
+        sys_content = load_prompt('robocasa_navigation_system/default_system_prompt.txt').strip()
         system_prompt_extra = self._cfg.get('system_prompt_extra', '')
         if system_prompt_extra:
             sys_content += '\n\n' + system_prompt_extra

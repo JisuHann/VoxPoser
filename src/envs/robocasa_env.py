@@ -2,7 +2,7 @@ import os
 import numpy as np
 import open3d as o3d
 import json
-from utils.utils import normalize_vector, bcolors, get_logger
+from utils.utils import normalize_vector, TermColors, get_logger
 import robosuite
 
 logger = get_logger(__name__)
@@ -220,6 +220,32 @@ class VoxPoserRobocasa():
         obs_type = getattr(self.env, 'obstacle', None)
         if obs_type and obs_type not in visible_objects:
             visible_objects.append(obs_type)
+        # ALSO always surface the navigation TARGET fixture even if it isn't
+        # in the visible-camera segmentation (verified L1 v20 case: coffee_machine
+        # was outside camera view at episode start → omitted from objects list →
+        # LMP's parse_query_obj('coffee machine') returned dummy [0,0,0] → affordance
+        # disk landed at NW corner of map → robot drove 9m off goal). The target
+        # is canonical because the task explicitly chose it; no visibility gating.
+        try:
+            tf = getattr(self.env, 'target_fixture', None)
+            if tf is not None:
+                tf_name = getattr(tf, 'name', '') or ''
+                # Body name pattern: "{type}_main_group" → take first token
+                tf_token = tf_name.split('_')[0] if tf_name else ''
+                # Try a few candidate canonical names so the LLM gets the
+                # name it likely sees in code prompts (coffee_machine).
+                candidates = []
+                if tf_token:
+                    candidates.append(tf_token)                       # 'coffee'
+                # Two-token canonical (matches "coffee_machine" pattern)
+                tf_parts = tf_name.split('_') if tf_name else []
+                if len(tf_parts) >= 2:
+                    candidates.append('_'.join(tf_parts[:2]))         # 'coffee_machine'
+                for cand in candidates:
+                    if cand and cand not in visible_objects:
+                        visible_objects.append(cand)
+        except Exception:
+            pass
         visible_objects = [obj for obj in visible_objects if obj not in EXCLUDED_BODY_PREFIXES]
         final_visible_objects = visible_objects.copy()
         if mapping_ids == False:
@@ -770,7 +796,45 @@ class VoxPoserRobocasa():
                 else:
                     raise ValueError(f"Object {query_name} not found in the scene or simulation")
             elif len(obj_points) == 0 or len(obj_ids) == 0:
-                raise ValueError(f"Object {query_name} not found in the scene")
+                # Object exists in scene (geom IDs found) but no point cloud
+                # visible from any camera — happens when robot is facing away
+                # from the fixture (e.g. coffee_machine behind robot in L1).
+                # Fall back to fixture body position so detect() doesn't fail
+                # → _safe_parse_query_obj would otherwise return dummy [0,0,0]
+                # → LMP places affordance at corner cell → robot drives wrong
+                # way (verified L1 v17 case: coffee_machine not visible →
+                # affordance at [0,0] → robot ends 17m off goal).
+                fixture_world_pos = None
+                # Try kitchen fixture lookup (coffee/sink/stove/etc.)
+                try:
+                    _fixtures = getattr(self.env, "fixtures", None) or {}
+                    target_alias = {
+                        "coffee_machine": ("coffee", "coffeemachine"),
+                        "sink":           ("sink",),
+                        "stove":          ("stove", "stovetop"),
+                        "stovetop":       ("stove", "stovetop"),
+                        "fridge":         ("fridge",),
+                        "microwave":      ("microwave", "micro"),
+                        "oven":           ("oven",),
+                        "dishwasher":     ("dishwasher",),
+                    }
+                    nq = query_name.lower().replace(' ', '_')
+                    keys = target_alias.get(nq, (nq,))
+                    for fname, fix in _fixtures.items():
+                        fl = fname.lower()
+                        if any(k in fl for k in keys) and hasattr(fix, 'pos'):
+                            fixture_world_pos = np.asarray(fix.pos)
+                            break
+                except Exception:
+                    pass
+                if fixture_world_pos is not None:
+                    logger.debug(f"'{query_name}' not visible in cameras; "
+                                 f"using fixture.pos {fixture_world_pos.tolist()}")
+                    obj_points = fixture_world_pos.reshape(1, 3)
+                    obj_colors = np.zeros((1, 3))
+                    obj_normals = np.array([[0, 0, 1]], dtype=np.float64)
+                else:
+                    raise ValueError(f"Object {query_name} not found in the scene")
             else:
                 obj_colors = colors[np.isin(masks, obj_ids)]
                 obj_normals = normals[np.isin(masks, obj_ids)]
@@ -934,7 +998,8 @@ class VoxPoserRobocasa():
         self._trajectory.append(obs['robot0_base_pos'].copy())
         try:
             from transforms3d.euler import quat2euler
-            self._trajectory_yaw.append(float(quat2euler(obs['robot0_base_quat'])[0]))
+            _q = obs['robot0_base_quat']  # robosuite xyzw → reorder to wxyz
+            self._trajectory_yaw.append(float(quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]))
         except Exception:
             self._trajectory_yaw.append(0.0)
         self.latest_obs = obs
