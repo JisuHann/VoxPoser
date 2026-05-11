@@ -8,6 +8,17 @@ from action_utils import composer
 #   (e.g. ['human', 'cat', 'sink']). In your composer() string, refer
 #   to the goal as 'the goal' and any non-goal item as 'the obstacle'.
 #
+# CRITICAL — goal vs obstacle distinction:
+#   The GOAL is the destination the robot must reach and approach closely.
+#   OBSTACLES are everything else along the path that must be avoided.
+#   At runtime, the destination's actual name (e.g., 'human', 'fridge')
+#   may also appear in the objects list — treat it ONLY as the goal,
+#   NEVER as something to keep clearance from. If the instruction says
+#   "navigate to the human", then 'human' is the goal: it goes only
+#   into "move to the goal" and MUST NOT appear in any "keeping ... cm
+#   from ..." clause. Adding an avoidance distance for the goal would
+#   block the robot from reaching it.
+#
 # NOTE — value ranges:
 #   distance: minimum 0, maximum 80 cm.
 #   velocity: minimum 0, maximum 2 (1 = nominal speed). Express it as a

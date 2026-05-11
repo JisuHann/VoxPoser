@@ -1,115 +1,71 @@
 import numpy as np
 from perception_utils import parse_query_obj
-from plan_utils import get_empty_affordance_map, set_pixel_by_radius, cm2index
+from plan_utils import get_empty_affordance_map, set_pixel_by_radius, world_offset
 
-# Always set the affordance via set_pixel_by_radius(...) with radius_cm=30 so
-# the planner has a non-degenerate target region (single pixels collapse the
-# A* / greedy goal and produce empty paths). For "near object" queries pass
-# the parsed object directly. For "X cm in front of / next to" queries
-# compute a world position offset and pass [x, y] (in pixel coords) to
-# set_pixel_by_radius — never use `affordance_map[x, y] = 1` directly.
-
-# Query: a point 10cm in front of [10, 15, 60].
-affordance_map = get_empty_affordance_map(task='navigation')
-# 10cm in front of so we add to x-axis
-x = 10 + cm2index(10, 'x')
-y = 15
-set_pixel_by_radius(affordance_map, [x, y], radius_cm=30, value=1)
-ret_val = affordance_map
-
-# Query: a point on the right side of the table.
-affordance_map = get_empty_affordance_map(task='navigation')
-table = parse_query_obj('table')
-(min_x, min_y, min_z), (max_x, max_y, max_z) = table.aabb
-center_x, center_y, center_z = table.position
-# right side so y = max_y
-x = center_x
-y = max_y
-set_pixel_by_radius(affordance_map, [x, y], radius_cm=30, value=1)
-ret_val = affordance_map
-
-# Query: a point 1cm to the left of the brown block.
-affordance_map = get_empty_affordance_map(task='navigation')
-brown_block = parse_query_obj('brown block')
-(min_x, min_y, min_z), (max_x, max_y, max_z) = brown_block.aabb
-center_x, center_y, center_z = brown_block.position
-# 1cm to the left of so we subtract from y-axis
-x = center_x
-y = min_y - cm2index(1, 'y')
-set_pixel_by_radius(affordance_map, [x, y], radius_cm=30, value=1)
-ret_val = affordance_map
-
-# Query: anywhere within 20cm of the right most block.
-affordance_map = get_empty_affordance_map(task='navigation')
-right_most_block = parse_query_obj('the right most block')
-set_pixel_by_radius(affordance_map, right_most_block, radius_cm=30, value=1)
-
-# Query: a point on the back side of the table.
-affordance_map = get_empty_affordance_map(task='navigation')
-table = parse_query_obj('table')
-(min_x, min_y, min_z), (max_x, max_y, max_z) = table.aabb
-center_x, center_y, center_z = table.position
-# back side so x = min_x
-x = min_x
-y = center_y
-set_pixel_by_radius(affordance_map, [x, y], radius_cm=30, value=1)
-ret_val = affordance_map
-
-# Query: a point on the front right corner of the table.
-affordance_map = get_empty_affordance_map(task='navigation')
-table = parse_query_obj('table')
-(min_x, min_y, min_z), (max_x, max_y, max_z) = table.aabb
-center_x, center_y, center_z = table.position
-# front right corner so x = max_x and y = max_y
-x = max_x
-y = max_y
-set_pixel_by_radius(affordance_map, [x, y], radius_cm=30, value=1)
-ret_val = affordance_map
-
-# Query: a point 20cm away from the leftmost block.
-affordance_map = get_empty_affordance_map(task='navigation')
-leftmost_block = parse_query_obj('leftmost block')
-# positive normal because we are moving away from the block.
-moving_dir = leftmost_block.normal
-affordance_xyz = leftmost_block.position + cm2index(20, moving_dir)
-set_pixel_by_radius(affordance_map, [affordance_xyz[0], affordance_xyz[1]], radius_cm=30, value=1)
-ret_val = affordance_map
+# How to set affordance for the navigation goal:
+#  - Default radius: 30 cm  (smaller would create degenerate single-pixel
+#    targets; A* / greedy planner needs a region).
+#  - For "near object X" queries:   pass the parsed object directly.
+#       set_pixel_by_radius(affordance_map, X, radius_cm=30, value=1)
+#  - For "X cm in front of / next to / etc." queries: use world_offset(...)
+#    which returns a point in WORLD-frame metres so the planner grid
+#    conversion is correct on every layout (avoids the per-layout
+#    100³ vs 162×162 mismatch in raw .position arithmetic).
+#       pt = world_offset(X, dx_m=0.15, dy_m=0)   # 15cm in +x world
+#       set_pixel_by_radius(affordance_map, pt, radius_cm=30, value=1)
+#
+# Axis convention (robocasa kitchen, world frame):
+#       +x → counter-front direction
+#       +y → robot-left direction
+#       +z → up
+# "in front of" usually means a small +x offset in the fixture's neighbourhood.
+# DO NOT use raw `.position` indices in `set_pixel_by_radius([row, col], ...)`
+# — those are in a 100³ legacy grid that does not match the planner's grid
+# on rectangular layouts.
 
 # Query: a point 15cm from the coffee machine.
 affordance_map = get_empty_affordance_map(task='navigation')
-coffee_machine = parse_query_obj('coffee machine')
-# Prefer passing the object directly — it uses the real point cloud and
-# avoids voxel-coord arithmetic on .position which can land at (0, 0).
+coffee_machine = parse_query_obj('coffee_machine')
+# Object mode — radius_cm dilates the real fixture mesh, no offset arithmetic.
 set_pixel_by_radius(affordance_map, coffee_machine, radius_cm=30, value=1)
 ret_val = affordance_map
 
-# Query: a point 10cm to the right of [45 49 66].
+# Query: a point 15cm in front of the coffee machine.
 affordance_map = get_empty_affordance_map(task='navigation')
-# 10cm to the right of so we add to y-axis
-x = 45
-y = 49 + cm2index(10, 'y')
-set_pixel_by_radius(affordance_map, [x, y], radius_cm=30, value=1)
+coffee_machine = parse_query_obj('coffee_machine')
+pt = world_offset(coffee_machine, dx_m=0.15, dy_m=0)
+set_pixel_by_radius(affordance_map, pt, radius_cm=30, value=1)
 ret_val = affordance_map
 
-# Query: the blue circle.
+# Query: a point 10cm to the left of the yellow bowl.
 affordance_map = get_empty_affordance_map(task='navigation')
-blue_circle = parse_query_obj('blue circle')
-set_pixel_by_radius(affordance_map, blue_circle, radius_cm=30, value=1)
+yellow_bowl = parse_query_obj('yellow_bowl')
+pt = world_offset(yellow_bowl, dx_m=0, dy_m=0.10)
+set_pixel_by_radius(affordance_map, pt, radius_cm=30, value=1)
 ret_val = affordance_map
 
-# Query: a point at the center of the blue circle.
+# Query: a point 20cm behind the table.
 affordance_map = get_empty_affordance_map(task='navigation')
-blue_circle = parse_query_obj('blue circle')
-set_pixel_by_radius(affordance_map, blue_circle, radius_cm=30, value=1)
+table = parse_query_obj('table')
+pt = world_offset(table, dx_m=-0.20, dy_m=0)
+set_pixel_by_radius(affordance_map, pt, radius_cm=30, value=1)
 ret_val = affordance_map
 
-# Query: a point 5cm to the left of the yellow bowl.
+# Query: anywhere within 30cm of the right-most block.
 affordance_map = get_empty_affordance_map(task='navigation')
-yellow_bowl = parse_query_obj('yellow bowl')
-(min_x, min_y, min_z), (max_x, max_y, max_z) = yellow_bowl.aabb
-center_x, center_y, center_z = yellow_bowl.position
-# 5cm to the left of so we subtract from y-axis
-x = center_x
-y = min_y - cm2index(5, 'y')
-set_pixel_by_radius(affordance_map, [x, y], radius_cm=30, value=1)
+right_most_block = parse_query_obj('right_most_block')
+set_pixel_by_radius(affordance_map, right_most_block, radius_cm=30, value=1)
+ret_val = affordance_map
+
+# Query: in front of the sink.
+affordance_map = get_empty_affordance_map(task='navigation')
+sink = parse_query_obj('sink')
+pt = world_offset(sink, dx_m=0.30, dy_m=0)   # ~30cm in front of sink
+set_pixel_by_radius(affordance_map, pt, radius_cm=30, value=1)
+ret_val = affordance_map
+
+# Query: at the door.
+affordance_map = get_empty_affordance_map(task='navigation')
+door = parse_query_obj('door')
+set_pixel_by_radius(affordance_map, door, radius_cm=30, value=1)
 ret_val = affordance_map
