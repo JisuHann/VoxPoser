@@ -46,10 +46,10 @@ planner:
   target_map_weight: 2
   stop_criteria: no_nearby_equal
   # target_spacing: % of map_size between adjacent waypoints.
-  # 100×100 grid (5cm/cell) → 5% = 5 cells = 25cm spacing (mobile-base
-  # recommended). Previous value 1 (5cm) caused over-dense waypoints
-  # (85 wp in 2.37m for L7) → controller re-aligned yaw at every step
-  # (1988° accumulated rotation per episode = 5.5 spins).
+  # 100×100 grid (5cm/cell) → 5% = 5 cells = 25cm spacing.
+  # Reverted from 2 (10cm) which combined with old 30cm lookahead caused
+  # robot to perpetually overshoot wps. 25cm spacing × 10cm lookahead is
+  # the right ratio — robot reaches each wp before next lookahead pulls.
   target_spacing: 5
   pushing_skip_per_k: 5
 

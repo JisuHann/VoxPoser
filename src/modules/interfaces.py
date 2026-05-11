@@ -1,14 +1,14 @@
 import os
 
 from core.LMP import LMP
-from utils.utils import get_clock_time, normalize_vector, pointat2quat, bcolors, Observation, VoxelIndexingWrapper, get_logger, DynamicObservation
+from utils.utils import get_clock_time, normalize_vector, pointat2quat, TermColors, Observation, VoxelIndexingWrapper, get_logger, DynamicObservation
 from utils.visualization import save_image, save_array, visualize_voxel, save_map_to_image, save_video_images
 import numpy as np
 from modules.planners import PathPlanner
 import time
 from scipy.ndimage import distance_transform_edt
 import transforms3d
-from modules.controllers import NavigationController, ManipulationController
+from modules.controllers import NavigationController
 from envs.robocasa_env import VoxPoserRobocasa, KITCHEN_GROUP_SUBNAMES
 from tqdm import tqdm
 from transforms3d.euler import quat2euler
@@ -29,7 +29,7 @@ DIST_THRESHOLD_DEFAULT = 0.05
 EE_ALIAS = ['ee', 'endeffector', 'end_effector', 'end effector', 'gripper', 'hand']
 TABLE_ALIAS = ['table', 'desk', 'workstation', 'work_station', 'work station', 'workspace', 'work_space', 'work space']
 
-class LMP_interface():
+class NavigationLMPInterface():
 
   def __init__(self, env, lmp_config, controller_config, planner_config, env_name='rlbench', nav_controller_config=None, output_dir=None):
     self._env = env
@@ -50,7 +50,6 @@ class LMP_interface():
     _nav_w = int(getattr(self._env, 'map_w', self._map_size))
     self._planner = PathPlanner(planner_config, map_size=max(_nav_h, _nav_w, self._map_size))
     self._nav_controller = NavigationController(self._env, controller_config)
-    self._manip_controller = ManipulationController(self._env, controller_config)
     if nav_controller_config is None:
         nav_controller_config = {}
     self._yaw_threshold = nav_controller_config.get('yaw_threshold', YAW_THRESHOLD_DEFAULT)
@@ -212,6 +211,49 @@ class LMP_interface():
       if _fpos is not None:
         obs_dict['_position_world'] = np.asarray(_fpos)
         obs_dict['position'] = self._world_to_pos_coords(np.asarray(_fpos))
+    # #78: expose fixture orientation for LMP face-toward intent.
+    # `.normal` is camera-derived per-point average → biased to -z, useless
+    # for "face the fixture" rotation. fixture.rot is the sim-side mounted
+    # yaw (z-axis, radians). fixture_front = rot + π/2 matches env's
+    # `compute_robot_base_placement_pose` convention (kitchen.py:692) so
+    # robot facing fixture_front is properly aligned to use the fixture.
+    _frot = self._lookup_fixture_rot(obj_name)
+    if _frot is not None:
+      obs_dict['fixture_yaw']   = float(_frot)
+      obs_dict['fixture_front'] = float(_frot) + float(np.pi / 2)
+    # A3: override with env.target_pos when this object IS the navigation
+    # target fixture. fixture.pos = mesh centroid (e.g. sink_island_group at
+    # counter middle), but env.target_pos = "robot's required approach pose"
+    # (computed by compute_robot_base_placement_pose — counter edge minus
+    # robot offset). For sink-like fixtures these differ by ~0.5m. Without
+    # this override, LMP affordance lands at fixture.pos and robot stops far
+    # from the actual goal_pos used for success eval. Verified L1 v32 RouteB:
+    # sink at (3.75, -2.30) vs goal at (3.75, -1.80) → 0.50m semantic gap.
+    try:
+      _kitchen = getattr(self._env, "env", None)
+      if _kitchen is not None:
+        _tf = getattr(_kitchen, "target_fixture", None)
+        _tp = getattr(_kitchen, "target_pos", None)
+        if _tf is not None and _tp is not None:
+          _tf_name = (getattr(_tf, "name", "") or "").lower()
+          _q = obj_name.lower().replace(" ", "_")
+          # Same alias logic as _lookup_fixture_pos to match canonical names.
+          _alias = {
+              "coffee_machine": ("coffee", "coffeemachine"),
+              "sink":           ("sink",),
+              "stove":          ("stove", "stovetop"),
+              "stovetop":       ("stove", "stovetop"),
+              "fridge":         ("fridge",),
+              "microwave":      ("microwave", "micro"),
+              "oven":           ("oven",),
+              "dishwasher":     ("dishwasher",),
+          }.get(_q, (_q,))
+          if any(k in _tf_name for k in _alias):
+            obs_dict['_position_world'] = np.asarray(_tp)
+            obs_dict['position'] = self._world_to_pos_coords(np.asarray(_tp))
+            logger.debug(f"detect('{obj_name}'): override _position_world to env.target_pos {np.asarray(_tp).tolist()} (was fixture.pos)")
+    except Exception as _e:
+      logger.debug(f"target_pos override failed for '{obj_name}': {_e}")
     object_obs = Observation(obs_dict)
     return object_obs
 
@@ -240,6 +282,34 @@ class LMP_interface():
           return np.asarray(fix.pos)
     except Exception as e:
       logger.debug(f"_lookup_fixture_pos({obj_name}) failed: {e}")
+    return None
+
+  def _lookup_fixture_rot(self, obj_name):
+    """Return fixture.rot (z-axis yaw, radians) for matched kitchen fixture.
+    Returns None if no fixture matches. Used by detect() to expose
+    fixture_yaw / fixture_front so LMP can encode "face the fixture" intent
+    without relying on the noisy camera-derived `.normal`."""
+    try:
+      kitchen = getattr(self._env, "env", None)
+      if kitchen is None: return None
+      fixtures = getattr(kitchen, "fixtures", None) or {}
+      target_alias = {
+          "coffee_machine": ("coffee", "coffeemachine"),
+          "sink":           ("sink",),
+          "stove":          ("stove", "stovetop"),
+          "stovetop":       ("stove", "stovetop"),
+          "fridge":         ("fridge",),
+          "microwave":      ("microwave", "micro"),
+          "oven":           ("oven",),
+          "dishwasher":     ("dishwasher",),
+      }
+      keys = target_alias.get(obj_name.lower(), (obj_name.lower(),))
+      for fname, fix in fixtures.items():
+        fl = fname.lower()
+        if any(k in fl for k in keys) and hasattr(fix, "rot"):
+          return float(fix.rot)
+    except Exception as e:
+      logger.debug(f"_lookup_fixture_rot({obj_name}) failed: {e}")
     return None
 
   def save_image(self, array, save_path="tmp.png"):
@@ -290,6 +360,17 @@ class LMP_interface():
         _avoidance_map = avoidance_map()
         _rotation_map = rotation_map()
         _velocity_map = velocity_map()
+        # Defensive fallback: LMP-generated get_*_map sometimes omits `ret_val =`
+        # at the end → returns None → downstream crashes ('NoneType' subscriptable).
+        # Replace any None with the corresponding default voxel map.
+        if _rotation_map is None:
+            _rotation_map = self._get_default_voxel_map('rotation', task='navigation')()
+        if _velocity_map is None:
+            _velocity_map = self._get_default_voxel_map('velocity', task='navigation')()
+        if _affordance_map is None:
+            _affordance_map = self._get_default_voxel_map('target', task='navigation')()
+        if _avoidance_map is None:
+            _avoidance_map = self._get_default_voxel_map('obstacle', task='navigation')()
         _avoidance_map = self._preprocess_avoidance_pixel_map(_avoidance_map, _affordance_map, movable_obs)
         start_pos = movable_obs['position'][:2]
         start_time = time.time()
@@ -353,6 +434,46 @@ class LMP_interface():
         controller_infos = dict()
         step_idx = 0
 
+        # v30: rotate-first phase before main waypoint loop.
+        # If the path direction at the start is far from where the robot is
+        # currently facing, rotating while translating (v26 default) makes the
+        # body-frame action curve in world frame and the robot drifts away
+        # from the path. So we rotate in place first — translation is
+        # suppressed until cur_yaw aligns with the first segment's tangent
+        # (within ROTATE_FIRST_TOL_RAD), or we hit ROTATE_FIRST_MAX_STEPS.
+        # Opt-in via env var ROTATE_FIRST_ENABLED=1 (default off — initial
+        # test on Cat Route A L2 produced 12.4 m goal divergence; still gated
+        # while a safer trigger threshold is verified).
+        _rotate_first_enabled = os.environ.get('ROTATE_FIRST_ENABLED', '0') == '1'
+        if _rotate_first_enabled and len(traj_world) >= 2:
+          first_dxy = np.asarray(traj_world[1][0]) - np.asarray(traj_world[0][0])
+          if np.linalg.norm(first_dxy) > 0.05:
+            first_tangent_yaw = float(np.arctan2(first_dxy[1], first_dxy[0]))
+            _q = self._env.env._get_observations()['robot0_base_quat']
+            cur_yaw0 = quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]
+            init_delta = (first_tangent_yaw - cur_yaw0 + np.pi) % (2 * np.pi) - np.pi
+            ROTATE_FIRST_TRIGGER_RAD = np.deg2rad(60)
+            ROTATE_FIRST_TOL_RAD = np.deg2rad(15)
+            ROTATE_FIRST_MAX_STEPS = 30
+            if abs(init_delta) > ROTATE_FIRST_TRIGGER_RAD:
+              logger.info(f'[{get_clock_time()}] rotate-first phase: '
+                          f'init delta_yaw={np.degrees(init_delta):+.1f}deg '
+                          f'(> {np.degrees(ROTATE_FIRST_TRIGGER_RAD):.0f}deg trigger)')
+              for _rf_step in range(ROTATE_FIRST_MAX_STEPS):
+                _q = self._env.env._get_observations()['robot0_base_quat']
+                _cy = quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]
+                _d = (first_tangent_yaw - _cy + np.pi) % (2 * np.pi) - np.pi
+                if abs(_d) <= ROTATE_FIRST_TOL_RAD:
+                  logger.info(f'[{get_clock_time()}] rotate-first done in '
+                              f'{_rf_step + 1} steps (remaining delta='
+                              f'{np.degrees(_d):+.1f}deg)')
+                  break
+                rotate_action = np.array([0.0, 0.0, np.clip(_d * 10.0, -1.0, 1.0)])
+                self._env.apply_navigation_action(rotate_action)
+              else:
+                logger.warning(f'[{get_clock_time()}] rotate-first hit step '
+                               f'limit ({ROTATE_FIRST_MAX_STEPS}); proceeding')
+
         for i, waypoint in tqdm(enumerate(traj_world), total=len(traj_world), desc='REACHED waypoint'):
           waypoint_reach = False
           is_last = (i == len(traj_world) - 1)
@@ -365,7 +486,8 @@ class LMP_interface():
               traj_action, dist_to_yaw = self._navigate_to_trajectory(traj_world[i], traj_world[i+1])
             controller_info = self._nav_controller.execute(traj_action)
             cur_pos = self._env.env._get_observations()['robot0_base_pos']
-            cur_yaw = quat2euler(self._env.env._get_observations()['robot0_base_quat'])[0]
+            _q = self._env.env._get_observations()['robot0_base_quat']  # robosuite xyzw
+            cur_yaw = quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]       # → wxyz, [2]=yaw_Z
             dxy = cur_pos[:2] - waypoint[0]
 
             controller_info['controller_step'] = step_idx
@@ -378,21 +500,43 @@ class LMP_interface():
             controller_infos[step_idx] = controller_info
             step_idx += 1
 
-            if np.linalg.norm(dxy) <= dist_threshold:
-              last_yaw = np.asarray(waypoint[1]).item() if np.asarray(waypoint[1]).size == 1 else 0.0
-              if is_last and last_yaw != 0.0:
-                # Last waypoint with target yaw: also check orientation.
-                # Use config yaw_threshold (default 0.35 rad ≈ 20°) — must be
-                # tighter than success threshold (0.8 cos ≈ 36.9°) so the robot
-                # doesn't exit the waypoint loop just outside the success cone.
-                yaw_error = abs((last_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi)
-                if yaw_error < self._yaw_threshold:
-                  waypoint_reach = True
-                  break
-                # Position OK but yaw not aligned yet — keep rotating
+            # ---- Y1 debug log: per-step state on LAST wp only (single L6 sweep) ----
+            if is_last:
+              try:
+                _last_yaw_log = np.asarray(waypoint[1]).item() if np.asarray(waypoint[1]).size == 1 else float('nan')
+                _delta = (_last_yaw_log - cur_yaw + np.pi) % (2 * np.pi) - np.pi if not np.isnan(_last_yaw_log) else 0.0
+                with open('/tmp/yaw_debug_last_wp.log', 'a') as _lf:
+                  _lf.write(f"step={step_idx} dist={float(np.linalg.norm(dxy)):.4f} cur_yaw={cur_yaw:.4f} goal_yaw={_last_yaw_log:.4f} delta={_delta:.4f} act={traj_action.tolist()}\n")
+              except Exception:
+                pass
+            # -----------------------------------------------------------------------
+
+            # ---- Y4 fix: last waypoint exit also accepts position-only success ----
+            # Last wp is intentionally placed inside the affordance disk which
+            # may overlap a counter/fixture (planner picks the cell closest to
+            # goal). Robot may never reach within dist_threshold=5cm because the
+            # mesh blocks it ~30cm out, so it pushes into the wall for 300 steps
+            # → physics torque rotates the base randomly. Allow early exit when
+            # (a) dist <= success threshold (0.5m) AND yaw error within tolerance,
+            # or (b) tight dist (5cm) like before for non-last waypoints.
+            _dist_now = float(np.linalg.norm(dxy))
+            if is_last:
+              # Use config yaw_threshold (0.35 rad ≈ 20°)
+              _last_yaw_chk = np.asarray(waypoint[1]).item() if np.asarray(waypoint[1]).size == 1 else float('nan')
+              if np.isnan(_last_yaw_chk):
+                _yaw_ok = True   # no rotation requirement
               else:
+                _yaw_err = abs((_last_yaw_chk - cur_yaw + np.pi) % (2 * np.pi) - np.pi)
+                _yaw_ok = _yaw_err < self._yaw_threshold
+              if _dist_now <= 0.5 and _yaw_ok:
+                logger.debug(f"last waypoint reached (dist={_dist_now:.3f}m, yaw_ok={_yaw_ok})")
                 waypoint_reach = True
                 break
+            else:
+              if _dist_now <= dist_threshold:
+                waypoint_reach = True
+                break
+            # ---------------------------------------------------------------------
 
             wp_step += 1
             # Give the LAST waypoint extra time so yaw can fully align
@@ -418,12 +562,35 @@ class LMP_interface():
       for _si in execute_info:
         _wps = _si.get("traj_world") or []
         _wp_xy = np.asarray([np.asarray(w[0])[:3] for w in _wps]) if _wps else np.empty((0, 3))
-        # Try to recover key-waypoint yaw from the quaternion entry. Quaternion
-        # convention is wxyz here (interfaces._process_obs converts xyzw→wxyz).
+        # Recover key-waypoint yaw from the rotation entry _w[1].
+        # Navigation: scalar yaw (radians). NaN means "no explicit rotation
+        #   requirement"; matching controller policy, we substitute the
+        #   direction toward the NEXT waypoint (seg_dir) so viz arrows show
+        #   the robot facing where it's about to travel. Last wp inherits
+        #   prior wp's heading (no next wp to face).
+        # Manipulation: wxyz quaternion (4-element).
         _wp_yaw = []
-        for _w in _wps:
+        n_wps = len(_wps)
+        for i, _w in enumerate(_wps):
           try:
-            _wp_yaw.append(float(_q2e(np.asarray(_w[1]))[0]))
+            _r = np.asarray(_w[1])
+            if _r.ndim == 0 or _r.size == 1:
+              v = float(_r)
+              if np.isnan(v):
+                # NaN sentinel → seg_dir to next wp (or prior heading if last)
+                if i < n_wps - 1:
+                  _w_now = np.asarray(_wp_xy[i])[:2]
+                  _w_next = np.asarray(_wp_xy[i + 1])[:2]
+                  _d = _w_next - _w_now
+                  if np.linalg.norm(_d) > 1e-6:
+                    v = float(np.arctan2(_d[1], _d[0]))
+                  else:
+                    v = _wp_yaw[-1] if _wp_yaw else 0.0
+                else:
+                  v = _wp_yaw[-1] if _wp_yaw else 0.0
+            else:
+              v = float(_q2e(_r)[2])  # [2] = yaw_Z; not [0]=roll (legacy bug)
+            _wp_yaw.append(v)
           except Exception:
             _wp_yaw.append(0.0)
         _dump_iters.append({
@@ -612,137 +779,6 @@ class LMP_interface():
                     save_path=os.path.join(self._output_dir, f"{_kw}.mp4"),
                 )
     logger.info(f'[{get_clock_time()}] finished executing navigation')
-    return execute_info
-  
-  def execute(self, movable_obs_func, affordance_map=None, avoidance_map=None, rotation_map=None,
-              velocity_map=None, gripper_map=None):
-    """
-    First use planner to generate waypoint path, then use controller to follow the waypoints.
-
-    Args:
-      movable_obs_func: callable function to get observation of the body to be moved
-      affordance_map: callable function that generates a 3D numpy array, the target voxel map
-      avoidance_map: callable function that generates a 3D numpy array, the obstacle voxel map
-      rotation_map: callable function that generates a 4D numpy array, the rotation voxel map (rotation is represented by a quaternion *in world frame*)
-      velocity_map: callable function that generates a 3D numpy array, the velocity voxel map
-      gripper_map: callable function that generates a 3D numpy array, the gripper voxel map
-    """
-    # initialize default voxel maps if not specified
-    if rotation_map is None:
-      rotation_map = self._get_default_voxel_map('rotation')
-    if velocity_map is None:
-      velocity_map = self._get_default_voxel_map('velocity')
-    if gripper_map is None:
-      gripper_map = self._get_default_voxel_map('gripper')
-    if avoidance_map is None:
-      avoidance_map = self._get_default_voxel_map('obstacle')
-    object_centric = (not movable_obs_func()['name'] in EE_ALIAS)
-    execute_info = []
-    if affordance_map is not None:
-      # execute path in closed-loop
-      for plan_iter in range(self._cfg['max_plan_iter']):
-        step_info = dict()
-        # evaluate voxel maps such that we use latest information
-        movable_obs = movable_obs_func()
-        _affordance_map = affordance_map()
-        _avoidance_map = avoidance_map()
-        _rotation_map = rotation_map()
-        _velocity_map = velocity_map()
-        _gripper_map = gripper_map()
-        # preprocess avoidance map
-        _avoidance_map = self._preprocess_avoidance_voxel_map(_avoidance_map, _affordance_map, movable_obs)
-        # start planning
-        start_pos = movable_obs['position']
-        start_time = time.time()
-        # optimize path and log
-        path_voxel, planner_info = self._planner.optimize(start_pos, _affordance_map, _avoidance_map,
-                                                        object_centric=object_centric)
-        logger.debug(f'[{get_clock_time()}] planner time: {time.time() - start_time:.3f}s')
-        assert len(path_voxel) > 0, 'path_voxel is empty'
-        step_info['path_voxel'] = path_voxel
-        step_info['planner_info'] = planner_info
-        # convert voxel path to world trajectory, and include rotation, velocity, and gripper information
-        traj_world = self._path2traj(path_voxel, _rotation_map, _velocity_map, _gripper_map)
-        traj_world = traj_world[:self._cfg['num_waypoints_per_plan']]
-        step_info['start_pos'] = start_pos
-        step_info['plan_iter'] = plan_iter
-        step_info['movable_obs'] = movable_obs
-        step_info['traj_world'] = traj_world
-        step_info['affordance_map'] = _affordance_map
-        step_info['rotation_map'] = _rotation_map
-        step_info['velocity_map'] = _velocity_map
-        step_info['gripper_map'] = _gripper_map
-        step_info['avoidance_map'] = _avoidance_map
-
-        logger.debug(f'[{get_clock_time()}] executing path ({len(traj_world)} waypoints)')
-        controller_infos = dict()
-        for i, waypoint in tqdm(enumerate(traj_world), total=len(traj_world), desc='waypoint'):
-          # check if the movement is finished
-          if np.linalg.norm(movable_obs['_position_world'] - traj_world[-1][0]) <= 0.01:
-            logger.info(f"[{get_clock_time()}] reached last waypoint; distance: {np.linalg.norm(movable_obs['_position_world'] - traj_world[-1][0]):.3f}")
-            break
-          # skip waypoint if moving to this point is going in opposite direction of the final target point
-          # (for example, if you have over-pushed an object, no need to move back)
-          if i != 0 and i != len(traj_world) - 1:
-            movable2target = traj_world[-1][0] - movable_obs['_position_world']
-            movable2waypoint = waypoint[0] - movable_obs['_position_world']
-            if np.dot(movable2target, movable2waypoint).round(3) <= 0:
-              logger.debug(f'[{get_clock_time()}] skip waypoint {i+1} (opposite direction)')
-              continue
-          controller_info = self._manip_controller.execute(movable_obs, waypoint)
-          # logging
-          movable_obs = movable_obs_func()
-          dist2target = np.linalg.norm(movable_obs['_position_world'] - traj_world[-1][0])
-          if not object_centric and controller_info['mp_info'] == -1:
-            logger.info(f'[{get_clock_time()}] failed waypoint {i+1} dist2target: {dist2target.round(3)}')
-          else:
-            logger.info(f'[{get_clock_time()}] completed waypoint {i+1} dist2target: {dist2target.round(3)}')
-          controller_info['controller_step'] = i
-          controller_info['target_waypoint'] = waypoint
-          controller_info['robot0_agentview_left_image'] = controller_info['mp_info'][0]['robot0_agentview_left_image'][::-1]
-          controller_infos[i] = controller_info
-        step_info['controller_infos'] = controller_infos
-        execute_info.append(step_info)
-        if controller_infos:
-          _kw = 'robot0_agentview_left_image'
-          if any(_kw in v for v in controller_infos.values()):
-            save_video_images(
-                controller_infos,
-                keyword=_kw,
-                save_path=os.path.join(self._output_dir, f"{_kw}.mp4"),
-            )
-        # check whether we need to replan
-        curr_pos = movable_obs['position']
-        if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
-          logger.info(f'[{get_clock_time()}] reached target; terminating')
-          break
-    logger.info(f'[{get_clock_time()}] finished executing path')
-
-    # make sure we are at the final target position and satisfy any additional parametrization
-    # (skip if we are specifying object-centric motion)
-    if not object_centric:
-      try:
-        # traj_world: world_xyz, rotation, velocity, gripper
-        ee_pos_world = traj_world[-1][0]
-        ee_rot_world = traj_world[-1][1]
-        ee_pose_world = np.concatenate([ee_pos_world, ee_rot_world])
-        ee_speed = traj_world[-1][2]
-        gripper_state = traj_world[-1][3]
-      except:
-        # evaluate latest voxel map
-        _rotation_map = rotation_map()
-        _velocity_map = velocity_map()
-        _gripper_map = gripper_map()
-        # get last ee pose
-        ee_pos_world = self._env.get_ee_pos()
-        ee_pos_voxel = self.get_ee_pos()
-        ee_rot_world = _rotation_map[ee_pos_voxel[0], ee_pos_voxel[1], ee_pos_voxel[2]]
-        ee_pose_world = np.concatenate([ee_pos_world, ee_rot_world])
-        ee_speed = _velocity_map[ee_pos_voxel[0], ee_pos_voxel[1], ee_pos_voxel[2]]
-        gripper_state = _gripper_map[ee_pos_voxel[0], ee_pos_voxel[1], ee_pos_voxel[2]]
-      # move to the final target
-      self._env.apply_action(np.concatenate([ee_pose_world, [gripper_state]]))
-
     return execute_info
   
   def yaw_toward(self, from_pos, to_pos):
@@ -983,20 +1019,49 @@ class LMP_interface():
       pixel_map[min_x:max_x, min_y:max_y] = value
     return pixel_map
 
-  def get_empty_affordance_map(self, task='manipulation'):
+  def world_offset(self, obj, dx_m=0.0, dy_m=0.0, dz_m=0.0):
+    """Return a 3-tuple `_position_world`-style coord offset from `obj` by
+    (dx_m, dy_m, dz_m) in WORLD frame metres. Result can be passed to
+    `set_pixel_by_radius` as the second arg — it goes through POINT-WORLD
+    mode (correct map_h × map_w grid conversion via workspace bounds).
+
+    Use this instead of pixel-frame arithmetic on `obj.position`:
+        # OLD (broken on non-100×100 grids; silent corner cell on dummy obj):
+        x = obj.position[0] + cm2index(15, 'x')
+        y = obj.position[1]
+        set_pixel_by_radius(map, [x, y], radius_cm=30)   # POINT-RAW mode
+        # NEW (frame-correct; falls back gracefully on missing/dummy obj):
+        pt = world_offset(obj, dx_m=0.15, dy_m=0)
+        set_pixel_by_radius(map, pt, radius_cm=30)       # POINT-WORLD mode
+
+    Convention (world frame, robocasa kitchen):
+        +dx_m → +x world (configurable per layout)
+        +dy_m → +y world
+    Returns a wrapper dict with `_position_world` so set_pixel_by_radius
+    detects POINT-WORLD mode automatically.
+    """
+    try:
+      base = np.asarray(obj._position_world if hasattr(obj, '_position_world')
+                        else obj.get('_position_world', [0., 0., 0.]))[:3].astype(float)
+    except Exception:
+      base = np.zeros(3, dtype=float)
+    out = base + np.array([float(dx_m), float(dy_m), float(dz_m)], dtype=float)
+    return Observation({
+      '_position_world': out,
+      'name': f"world_offset({getattr(obj, 'name', '?')})",
+    })
+
+  def get_empty_affordance_map(self, task='navigation'):
     return self._get_default_voxel_map('target', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
 
-  def get_empty_avoidance_map(self, task='manipulation'):
+  def get_empty_avoidance_map(self, task='navigation'):
     return self._get_default_voxel_map('obstacle', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
   
-  def get_empty_rotation_map(self, task='manipulation'):
+  def get_empty_rotation_map(self, task='navigation'):
     return self._get_default_voxel_map('rotation', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
   
-  def get_empty_velocity_map(self, task='manipulation'):
+  def get_empty_velocity_map(self, task='navigation'):
     return self._get_default_voxel_map('velocity', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
-  
-  def get_empty_gripper_map(self, task='manipulation'):
-    return self._get_default_voxel_map('gripper', task=task)()  # return evaluated voxel map instead of functions (such that LLM can manipulate it)
   
   def reset_to_default_pose(self):
      self._env.reset_to_default_pose()
@@ -1102,76 +1167,28 @@ class LMP_interface():
                         self._map_h, self._map_w)
 
 
-  def _get_default_voxel_map(self, type='target', task='manipulation'):
+  def _get_default_voxel_map(self, type='target', task='navigation'):
     """returns default voxel map (defaults to current state)"""
     def fn_wrapper():
-      if task == 'manipulation':
-        if type == 'target':
-          voxel_map = np.zeros((self._map_size, self._map_size, self._map_size))
-        elif type == 'obstacle':  # for LLM to do customization
-          voxel_map = np.zeros((self._map_size, self._map_size, self._map_size))
-        elif type == 'velocity':
-          voxel_map = np.ones((self._map_size, self._map_size, self._map_size))
-        elif type == 'gripper':
-          voxel_map = np.ones((self._map_size, self._map_size, self._map_size)) * self._env.get_last_gripper_action()
-        elif type == 'rotation':
-          voxel_map = np.zeros((self._map_size, self._map_size, self._map_size, 4))
-          voxel_map[:, :, :] = self._env.get_ee_quat()
-      elif task == 'navigation':
-        # Rectangular grid: (map_h, map_w) for isotropic 5cm cells per layout.
-        if type == 'target':
-          voxel_map = np.zeros((self._map_h, self._map_w))
-        elif type == 'obstacle':
-          voxel_map = np.zeros((self._map_h, self._map_w))
-        elif type == 'velocity':
-          voxel_map = np.ones((self._map_h, self._map_w))
-        elif type == 'rotation':
-          voxel_map = np.zeros((self._map_h, self._map_w))
-        else:
-          raise ValueError('Unknown voxel map type: {}'.format(type))
+      # Rectangular grid: (map_h, map_w) for isotropic 5cm cells per layout.
+      if type == 'target':
+        voxel_map = np.zeros((self._map_h, self._map_w))
+      elif type == 'obstacle':
+        voxel_map = np.zeros((self._map_h, self._map_w))
+      elif type == 'velocity':
+        voxel_map = np.ones((self._map_h, self._map_w))
+      elif type == 'rotation':
+        # NaN sentinel = "no rotation requirement at this cell".
+        # Controller treats NaN waypoints as "keep current yaw" so the
+        # holonomic base sidesteps freely without forced rotation. LMP
+        # only writes scalar yaw to cells that need explicit alignment
+        # (e.g. set_pixel_by_radius around a face-toward target).
+        voxel_map = np.full((self._map_h, self._map_w), np.nan)
       else:
-        raise ValueError('Unknown task type: {}'.format(type))
+        raise ValueError('Unknown voxel map type: {}'.format(type))
       voxel_map = VoxelIndexingWrapper(voxel_map)
       return voxel_map
     return fn_wrapper
-  
-  def _path2traj(self, path, rotation_map, velocity_map, gripper_map):
-    """
-    convert path (generated by planner) to trajectory (used by controller)
-    path only contains a sequence of voxel coordinates, while trajectory parametrize the motion of the end-effector with rotation, velocity, and gripper on/off command
-    """
-    # convert path to trajectory
-    traj = []
-    for i in range(len(path)):
-      # get the current voxel position
-      voxel_xyz = path[i]
-      # get the current world position
-      world_xyz = self._voxel_to_world(voxel_xyz)
-      voxel_xyz = np.round(voxel_xyz).astype(int)
-      # get the current rotation (in world frame)
-      rotation = rotation_map[voxel_xyz[0], voxel_xyz[1], voxel_xyz[2]]
-      # get the current velocity
-      velocity = velocity_map[voxel_xyz[0], voxel_xyz[1], voxel_xyz[2]]
-      # get the current on/off
-      gripper = gripper_map[voxel_xyz[0], voxel_xyz[1], voxel_xyz[2]]
-      # LLM might specify a gripper value change, but sometimes EE may not be able to reach the exact voxel, so we overwrite the gripper value if it's close enough (TODO: better way to do this?)
-      if (i == len(path) - 1) and not (np.all(gripper_map == 1) or np.all(gripper_map == 0)):
-        # get indices of the less common values
-        less_common_value = 1 if np.sum(gripper_map == 1) < np.sum(gripper_map == 0) else 0
-        less_common_indices = np.where(gripper_map == less_common_value)
-        less_common_indices = np.array(less_common_indices).T
-        # get closest distance from voxel_xyz to any of the indices that have less common value
-        closest_distance = np.min(np.linalg.norm(less_common_indices - voxel_xyz[None, :], axis=0))
-        # if the closest distance is less than threshold, then set gripper to less common value
-        if closest_distance <= 3:
-          gripper = less_common_value
-          logger.debug(f'[{get_clock_time()}] overwriting gripper to less common value')
-      # add to trajectory
-      traj.append((world_xyz, rotation, velocity, gripper))
-    # append the last waypoint a few more times for the robot to stabilize
-    for _ in range(2):
-      traj.append((world_xyz, rotation, velocity, gripper))
-    return traj
   
   def _path2traj_navigation(self, path, avoidance_map, rotation_map, velocity_map):
     """Convert pixel path to navigation trajectory with rotation and velocity."""
@@ -1204,12 +1221,13 @@ class LMP_interface():
       rotation = rotation_map[voxel_xy[0], voxel_xy[1]]
       velocity = velocity_map[voxel_xy[0], voxel_xy[1]]
       traj.append((world_xy, rotation, velocity))
-    # Inject target orientation into last waypoint
+    # v26: revert to last 1 wp injection (v20 baseline). Last 3 wps caused
+    # premature target_ori commands at intermediate wps, distorting path.
+    LAST_N_WITH_TARGET_YAW = 1
     if len(traj) > 0:
       dst_is_human = getattr(self._env.env, 'dst_is_human', False)
+      target_yaw = None
       if dst_is_human:
-        # For human targets: compute yaw dynamically from last waypoint to person position.
-        # Using static sink→person angle fails when robot approaches from off-axis.
         person_pos = getattr(self._env.env, 'target_pos', None)
         if person_pos is not None:
           last_wp = traj[-1]
@@ -1218,22 +1236,19 @@ class LMP_interface():
           if dist > 0.1:
             target_yaw = float(np.arctan2(dir_to_person[1], dir_to_person[0]))
           elif len(traj) >= 2:
-            # Path ends at person — use final approach direction
             prev_wp = traj[-2][0]
             dir_approach = np.array(last_wp[0]) - np.array(prev_wp)
             target_yaw = float(np.arctan2(dir_approach[1], dir_approach[0]))
-          else:
-            target_yaw = None
-          if target_yaw is not None:
-            traj[-1] = (last_wp[0], target_yaw, last_wp[2])
-            logger.debug(f'[{get_clock_time()}] injected human target_yaw={np.degrees(target_yaw):.1f}deg (dist_to_person={dist:.2f}m)')
       else:
         target_ori = getattr(self._env.env, 'target_ori', None)
         if target_ori is not None:
-          last_wp = traj[-1]
           target_yaw = float(target_ori[2])
-          traj[-1] = (last_wp[0], target_yaw, last_wp[2])
-          logger.debug(f'[{get_clock_time()}] injected target_yaw={np.degrees(target_yaw):.1f}deg into last waypoint')
+      if target_yaw is not None:
+        n_inject = min(LAST_N_WITH_TARGET_YAW, len(traj))
+        for offset in range(1, n_inject + 1):
+          wp = traj[-offset]
+          traj[-offset] = (wp[0], target_yaw, wp[2])
+        logger.debug(f'[{get_clock_time()}] injected target_yaw={np.degrees(target_yaw):.1f}deg into last {n_inject} waypoints')
     return traj
   
   def _navigate_to_trajectory(self, waypoint, to_waypoint, kp=10):
@@ -1241,25 +1256,26 @@ class LMP_interface():
     to_goal_xy = to_waypoint[0]
     direction_vector = to_goal_xy - goal_xy
     cur_xy = self._env.env._get_observations()['robot0_base_pos']
-    cur_yaw = quat2euler(self._env.env._get_observations()['robot0_base_quat'])[0]
+    _q = self._env.env._get_observations()['robot0_base_quat']  # robosuite xyzw
+    cur_yaw = quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]       # → wxyz, [2]=yaw_Z
 
-    # lookahead smoothing — drive toward a point 0.3m ahead of goal_xy
-    # along the segment direction so motion is smoother through corners.
+    # Lookahead smoothing — drive toward a point L metres ahead of goal_xy.
+    # v26: revert to 0.3 (v20 baseline). v25 L=0.1 caused undershoot.
     seg_len = np.linalg.norm(direction_vector) + 1e-8
     seg_dir = direction_vector / seg_len
     L = 0.3
     target_xy = goal_xy + seg_dir * min(L, seg_len)
     is_last = np.array_equal(goal_xy, target_xy)
-    goal_yaw_scalar = np.asarray(goal_yaw).item() if np.asarray(goal_yaw).size == 1 else 0.0
-    # Intermediate wp: face along the path segment.
-    # Last wp: use the explicitly-injected target_yaw from _path2traj_navigation
-    #   (which always sets it from env.target_ori for navigation tasks). The
-    #   previous `goal_yaw_scalar == 0` sentinel was buggy — 0 is a valid
-    #   target yaw (e.g. coffee_machine with rot=0), and treating it as
-    #   "no target" caused the robot to align with seg_dir instead, failing
-    #   the success criterion's ori_cos check at the goal fixture.
-    if not is_last:
-      goal_yaw = float(np.arctan2(seg_dir[1], seg_dir[0]))
+    goal_yaw_scalar = np.asarray(goal_yaw).item() if np.asarray(goal_yaw).size == 1 else float('nan')
+    # v26: revert NaN→cur_yaw (v20 baseline that succeeded for L0/L6).
+    # NaN→seg_dir caused intermediate-wp drift across v21-v25.
+    #   1. Last wp + explicit yaw  → align to that target_ori (success criterion)
+    #   2. LMP-set scalar yaw      → use it (face-toward intent at this cell)
+    #   3. NaN sentinel (default)  → keep current yaw (no rotation forced)
+    if is_last:
+      goal_yaw = goal_yaw_scalar if not np.isnan(goal_yaw_scalar) else cur_yaw
+    elif np.isnan(goal_yaw_scalar):
+      goal_yaw = cur_yaw
     else:
       goal_yaw = goal_yaw_scalar
 
@@ -1285,7 +1301,30 @@ class LMP_interface():
     action = np.zeros(3)
     action[0] = v_x * goal_vel * kp
     action[1] = v_y * goal_vel * kp
+    # action[2] sign: clean omega test confirmed action[2]=+1 → CCW (yaw
+    # increases via shortest signed angle). Earlier "−delta" flip was a
+    # misread caused by yaw wrapping at ±π. The original convention is
+    # correct: positive delta (need CCW) → positive action[2].
     action[2] = delta_yaw * goal_vel * kp
+    # v26: rotate-first removed (v20 baseline). With NaN→cur_yaw default,
+    # intermediate wps have delta_yaw=0 so rotate-first wouldn't trigger
+    # anyway. Only the last wp uses target_ori (where delta_yaw can be big),
+    # but Y4 early-exit handles that with dist+yaw_threshold check.
+    #
+    # Y6 (v28→v29): at LAST waypoint, suppress translation when robot is
+    # CLOSE to wp AND yaw not aligned, so it rotates in place without
+    # drifting. Without this, action[1] (body-frame translation toward wp)
+    # keeps firing while yaw rotates → body-y direction shifts in world
+    # frame → robot spirals away from goal area.
+    # v29: threshold raised 0.5→1.0 — L8 v28 case showed robot at dist=0.53m
+    # (just outside 0.5m) still triggered drift over 300 steps. 1.0m gives
+    # the rotation enough headroom before robot enters jam-prone region.
+    Y6_TRANSLATION_SUPPRESS_DIST_M = 1.0
+    if is_last:
+      _dxy_now = np.hypot(target_xy[0] - cur_xy[0], target_xy[1] - cur_xy[1])
+      if _dxy_now <= Y6_TRANSLATION_SUPPRESS_DIST_M and abs(delta_yaw) > self._yaw_threshold:
+        action[0] = 0.0
+        action[1] = 0.0
     action = np.clip(action, -1.0, 1.0)
     return action, delta_yaw
 
@@ -1534,7 +1573,7 @@ def setup_LMP(env, general_config, debug=False, output_dir=None):
   llm_api_config = general_config.get('llm_api', {})
   nav_controller_config = general_config.get('navigation_controller', {})
   # LMP env wrapper
-  lmp_env = LMP_interface(env, lmp_env_config, controller_config, planner_config, env_name=env_name, nav_controller_config=nav_controller_config, output_dir=output_dir)
+  lmp_env = NavigationLMPInterface(env, lmp_env_config, controller_config, planner_config, env_name=env_name, nav_controller_config=nav_controller_config, output_dir=output_dir)
   # creating APIs that the LMPs can interact with
   import time as _time
   fixed_vars = {
