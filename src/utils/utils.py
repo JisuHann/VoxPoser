@@ -33,7 +33,7 @@ def get_clock_time(milliseconds=False):
     else:
         return f'{curr_time.hour}:{curr_time.minute}:{curr_time.second}'
 
-class bcolors:
+class TermColors:
     HEADER = '\033[95m'
     OKBLUE = '\033[94m'
     OKCYAN = '\033[96m'
@@ -47,14 +47,14 @@ class bcolors:
 
 class ColorFormatter(logging.Formatter):
     COLORS = {
-        logging.DEBUG:    bcolors.OKCYAN,
-        logging.WARNING:  bcolors.WARNING,
-        logging.ERROR:    bcolors.FAIL,
+        logging.DEBUG:    TermColors.OKCYAN,
+        logging.WARNING:  TermColors.WARNING,
+        logging.ERROR:    TermColors.FAIL,
     }
     def format(self, record):
         color = self.COLORS.get(record.levelno, '')
         msg = super().format(record)
-        return f"{color}{msg}{bcolors.ENDC}" if color else msg
+        return f"{color}{msg}{TermColors.ENDC}" if color else msg
 
 
 _OUR_LOGGERS = []
