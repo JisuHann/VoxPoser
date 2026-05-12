@@ -155,7 +155,10 @@ class PathPlanner:
         # the "stops far from goal → force-append teleport" failure mode.
         use_astar = bool(self.config.get('use_astar', False)) if hasattr(self.config, 'get') else getattr(self.config, 'use_astar', False)
         if use_astar:
-            target_mask = raw_target_map > 0
+            # Threshold 0.5: filters out outer-halo cells (gradient affordance has
+            # value < 0.5 there). A* terminates only in inner half-radius zone,
+            # pulling the robot deeper than the standard "any halo cell" termination.
+            target_mask = raw_target_map > 0.5
             obs_binary = (raw_obstacle_map > 0.5)
             # Scale cost map up so the obstacle gradient is not drowned by
             # the Euclidean heuristic in the fallback (no-inflation) case.
@@ -204,6 +207,32 @@ class PathPlanner:
                 raw_path = astar_path
                 _last = astar_path[-1].astype(int)
                 reached = bool(target_mask[_last[0], _last[1]])
+                # Snap last cell to centroid of target_mask so path ends as
+                # close to true goal as possible (instead of disk edge). Only
+                # when reached=True; pick the disk cell closest to centroid
+                # that is also reachable (not blocked at chosen inflation).
+                if reached:
+                    ys, xs = np.where(target_mask)
+                    if ys.size > 0:
+                        cy, cx = float(ys.mean()), float(xs.mean())
+                        if chosen_r and chosen_r > 0:
+                            from scipy.ndimage import binary_dilation as _bd
+                            _blocked = _bd(obs_binary, iterations=int(chosen_r))
+                        else:
+                            _blocked = None
+                        best_d = float('inf'); best_cell = None
+                        for y, x in zip(ys, xs):
+                            if _blocked is not None and _blocked[y, x]:
+                                continue
+                            d = (y - cy) ** 2 + (x - cx) ** 2
+                            if d < best_d:
+                                best_d, best_cell = d, (int(y), int(x))
+                        if best_cell is not None and tuple(_last) != best_cell:
+                            raw_path = np.vstack([raw_path, np.array(best_cell)])
+                            _last = np.array(best_cell)
+                            logger.info(f'[{get_clock_time(milliseconds=True)}] '
+                                        f'snapped last cell to centroid {best_cell} '
+                                        f'(was {astar_path[-1].astype(int).tolist()})')
                 logger.info(f'[{get_clock_time(milliseconds=True)}] A* path: {len(raw_path)} pts '
                             f'(target reachable={reached}, inflation_used={chosen_r} cells)')
             else:

@@ -11,7 +11,7 @@ task:
 navigation:
   env_name: robocasa_navigation
   task:
-    camera_names: ['robot0_robotview', 'robot0_agentview_center', 'robot0_agentview_left', 'robot0_agentview_right', 'robot0_frontview', 'robot0_eye_in_hand', 'topview', 'sideview', 'posed_person_main_group_1stview']
+    camera_names: ['robot0_robotview', 'robot0_agentview_center', 'robot0_agentview_left', 'robot0_agentview_right', 'robot0_frontview', 'robot0_eye_in_hand', 'topview', 'sideview', 'posed_human_main_group_1stview']
   planner:
     use_astar: true                    # W1: replace greedy descent with global A*
     stop_threshold: 0.01
@@ -22,6 +22,7 @@ navigation:
     yaw_threshold: 0.35                # v6 winner config (0.45 reverted, no significant gain)
     dist_threshold: 0.05
     max_steps_per_waypoint: 100
+    mode: holonomic                    # holonomic | translate_only (env NAV_MODE overrides)
   lmp_config:
     env:
       visualize: False
@@ -47,9 +48,8 @@ planner:
   stop_criteria: no_nearby_equal
   # target_spacing: % of map_size between adjacent waypoints.
   # 100×100 grid (5cm/cell) → 5% = 5 cells = 25cm spacing.
-  # Reverted from 2 (10cm) which combined with old 30cm lookahead caused
-  # robot to perpetually overshoot wps. 25cm spacing × 10cm lookahead is
-  # the right ratio — robot reaches each wp before next lookahead pulls.
+  # Combined with L=0.15 lookahead and asymmetric controller gains
+  # (kp_trans=10, kp_rot=3, omega_max=0.3) for stable convergence.
   target_spacing: 5
   pushing_skip_per_k: 5
 
@@ -68,6 +68,14 @@ llm_api:
   base_url: "http://172.17.0.1:8000/v1"
   api_key: "api-key-not-required"
 
+# LLM cache: persists chat-completion results to disk so identical
+# (model + messages + sampling params) calls reuse stored output.
+# Skipped automatically for VLM models (image bytes vary per call).
+# Override via env vars: LMP_DISABLE_CACHE=1, LMP_CACHE_DIR=path
+lmp_cache:
+  enabled: true
+  cache_dir: cache
+
 lmp_config:
   env:
     map_size: 100
@@ -79,7 +87,7 @@ lmp_config:
     # to their fixture.pos reference frame instead of the visible
     # point-cloud centroid. Centroid can be 30cm–1m off the goal-success
     # anchor; the fix closes that gap for affordance / avoidance maps.
-    # Movable obstacles (cat, dog, person, ...) are not in the fixtures
+    # Movable obstacles (cat, dog, human, ...) are not in the fixtures
     # registry so they always use centroid (correct for avoidance halo).
     use_fixture_pos: True
   lmps:

@@ -215,7 +215,7 @@ class IterableDynamicObservation:
 
     def __getattr__(self, key):
         # Delegate single-attribute access to first element so LLM code like
-        # `obs = parse_query_obj('person'); obs.position` works without indexing.
+        # `obs = parse_query_obj('human'); obs.position` works without indexing.
         if key == 'func':
             raise AttributeError(key)
         return getattr(self[0], key)

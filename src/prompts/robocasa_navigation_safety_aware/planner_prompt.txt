@@ -4,9 +4,20 @@ from action_utils import composer
 # NOTE — runtime substitution:
 #   The 'objects' lists below use placeholder names: 'goal' for the
 #   destination and 'object_1', 'object_2', ... for non-goal items.
-#   At runtime the harness replaces these with the actual scene names
-#   (e.g. ['human', 'cat', 'sink']). In your composer() string, refer
-#   to the goal as 'the goal' and any non-goal item as 'the obstacle'.
+#   At runtime the harness replaces these placeholders with the actual
+#   scene names. In your composer() string, refer to the goal as
+#   'the goal' and to each non-goal item by its placeholder name
+#   (object_1, object_2, ...) — do not substitute a concrete name
+#   yourself.
+#
+# NOTE — adapt constraints to the resolved object identity:
+#   When the placeholder has been resolved to a concrete object at
+#   inference time, briefly reason about what kind of object it is in
+#   a `# Reasoning:` comment, then pick distance / velocity values that
+#   match that kind — more caution for things that are alive, exposed,
+#   or easily damaged; less caution for sturdy, inert items. Use the
+#   example values below only as anchors for the value range and adjust
+#   based on the reasoning rather than copying blindly.
 #
 # NOTE — value ranges:
 #   distance: minimum 0, maximum 80 cm.
@@ -14,11 +25,10 @@ from action_utils import composer
 #   percent in the get_velocity_map query, where 100% = nominal.
 #
 # NOTE — what to emit:
-#   You may write the constraint either with abstract verbs (e.g. "stay
-#   clear of the obstacle", "slow down when near it") or with specific
-#   cm distances (e.g. "keep at least 50cm from the obstacle"). Mixing is
-#   fine. The composer downstream translates both styles into concrete
-#   map calls.
+#   Reference each object by its placeholder name and assign a specific
+#   constraint per object (e.g. "keep at least 50cm from object_1, and
+#   slow down to 40% velocity when within 30cm of object_2").
+#   Name each one individually so the composer can ground it to a real scene object.
 #
 # NOTE — choose constraints freely but keep them feasible:
 #   The composer can pick any value in its allowed range. Use the full
@@ -33,31 +43,33 @@ from action_utils import composer
 #   only for multi-stage tasks.
 
 objects = ['goal']
-# Query: navigate to the goal.
-# Reasoning: no obstacle is mentioned.
+# Query: navigate safely to the goal while avoiding obstacles.
+# Reasoning: no obstacle in the scene.
 composer("move to the goal")
 # done
 
 objects = ['goal', 'object_1']
-# Query: navigate to the goal while keeping a safe distance from the obstacle.
-# Reasoning: the obstacle is solid.
-composer("move to the goal while keeping at least 20cm from the obstacle")
+# Query: navigate safely to the goal while avoiding obstacles.
+# Reasoning: object_1 is a sturdy fixture.
+composer("move to the goal while keeping at least 20cm from object_1")
 # done
 
 objects = ['goal', 'object_1', 'object_2']
-# Query: navigate to the goal while being careful around the two obstacles.
-# Reasoning: the first obstacle is a moving presence. The second is delicate.
-composer("move to the goal while keeping at least 70cm from the first obstacle and at least 30cm from the second obstacle, slowing down when near either of them")
+# Query: navigate safely to the goal while avoiding obstacles.
+# Reasoning: object_1 is a moving presence. object_2 is delicate.
+composer("move to the goal while keeping at least 70cm from object_1 and at least 30cm from object_2, slowing down to 50% velocity when within 30cm of object_1 or object_2")
 # done
 
 objects = ['goal', 'object_1', 'object_2', 'object_3']
-# Query: navigate to the goal — there are three obstacles in the room and the path is tight.
-# Reasoning: three obstacles, no room to spare.
-composer("move to the goal while staying clear of every obstacle and slowing down significantly throughout the path")
+# Query: navigate safely to the goal while avoiding obstacles.
+# Reasoning: three obstacles, path is tight — assign per-object clearance
+# and a shared slowdown near any of them.
+composer("move to the goal while keeping at least 40cm from object_1, at least 30cm from object_2, and at least 25cm from object_3, slowing down to 30% velocity when within 30cm of any of them")
 # done
 
 objects = ['goal', 'object_1', 'object_2']
-# Query: navigate to the goal carefully — there are two obstacles.
-# Reasoning: the first is delicate. The second occupies its space dynamically.
-composer("move to the goal while keeping at least 35cm from the first obstacle and slowing down to 30% velocity when near it, and keeping at least 10cm from the second obstacle")
+# Query: navigate safely to the goal while avoiding obstacles.
+# Reasoning: object_1 is delicate (slow down when near). object_2
+# occupies its space dynamically (wider clearance, no slowdown).
+composer("move to the goal while keeping at least 35cm from object_1 and slowing down to 30% velocity when within 30cm of object_1, and keeping at least 60cm from object_2")
 # done

@@ -113,6 +113,13 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
         "lmp_only": lmp_only,
     }
     config = get_config(config_path='src/configs/robocasa_config.yaml', task_type=TASK_TYPE)
+    # LLM cache: configure module-level singleton from config (env vars override)
+    _cache_cfg = config.get('lmp_cache', {}) or {}
+    from core.LMP import configure_cache
+    configure_cache(
+        enabled=bool(_cache_cfg.get('enabled', True)),
+        cache_dir=str(_cache_cfg.get('cache_dir', 'cache')),
+    )
     if obstacle_map_weight is not None:
         config['planner']['obstacle_map_weight'] = obstacle_map_weight
         logger.info(f"Override planner.obstacle_map_weight = {obstacle_map_weight}")
@@ -482,7 +489,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         rd = ROUTE_DEFINITIONS.get(route_def, {})
                         dst_is_human = rd.get("dst", "") == "Human"
                     if dst_is_human:
-                        # For Human destination: cos between robot forward and dir_to_person
+                        # For Human destination: cos between robot forward and dir_to_human
                         robot_fwd = np.array([np.cos(robot_yaw), np.sin(robot_yaw)])
                         dir_to_goal = goal_pos[:2] - robot_pos[:2]
                         d = np.linalg.norm(dir_to_goal)
@@ -880,7 +887,7 @@ def main():
     parser.add_argument("--vlm-cameras", default=None,
         help="Comma-separated list of camera names for VLM input. Overrides default 4-camera set. "
              "Example: --vlm-cameras topview,robot0_frontview,robot0_agentview_center "
-             "(omits posed_person_main_group_1stview)")
+             "(omits posed_human_main_group_1stview)")
     parser.add_argument("--obstacle-map-gaussian-sigma", type=float, default=None,
                         help="Override planner.obstacle_map_gaussian_sigma (ablation)")
     parser.add_argument("--layout-ids", default=None,
@@ -898,9 +905,9 @@ def main():
     vlm_cameras = None
     if args.vlm_cameras:
         vlm_cameras = [c.strip() for c in args.vlm_cameras.split(',') if c.strip()]
-    # DEFAULT_LAYOUTS omits 4 (GALLEY) and 9 (WRAPAROUND) — posed_person
+    # DEFAULT_LAYOUTS omits 4 (GALLEY) and 9 (WRAPAROUND) — posed_human
     # placement is broken there. Layout 10 is out-of-range (LayoutType max=9).
-    print("[run_LMP] note: layouts 4, 9 are not considered (broken posed_person placement)")
+    print("[run_LMP] note: layouts 4, 9 are not considered (broken posed_human placement)")
     DEFAULT_LAYOUTS = [0, 1, 2, 3, 5, 6, 7, 8]
     def _parse_id_list(s, default):
         """Parse '0,1,2' or 'all' into a list of ints. None falls back to `default`."""

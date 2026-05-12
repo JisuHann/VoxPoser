@@ -55,11 +55,23 @@ class NavigationLMPInterface():
     self._yaw_threshold = nav_controller_config.get('yaw_threshold', YAW_THRESHOLD_DEFAULT)
     self._dist_threshold = nav_controller_config.get('dist_threshold', DIST_THRESHOLD_DEFAULT)
     self._max_steps_per_waypoint = nav_controller_config.get('max_steps_per_waypoint', 100)
+    # Navigation mode: holonomic (default, body-frame v_x/v_y/omega) vs
+    # translate_only (rotate-first toward lookahead wp, then forward-only).
+    # NAV_MODE env-var overrides config.
+    self._nav_mode = os.environ.get('NAV_MODE', nav_controller_config.get('mode', 'holonomic'))
+    assert self._nav_mode in ('holonomic', 'translate_only', 'holo_seq', 'holo_cont'), f"unknown nav_mode: {self._nav_mode}"
     # When True, parse_query_obj() / detect() auto-resolve fixture queries
     # (coffee_machine, sink, stove, ...) to fixture.pos instead of the
     # visible point-cloud centroid. Default True — flip to False to
     # restore legacy centroid behaviour.
     self._use_fixture_pos = bool(self._cfg.get('use_fixture_pos', True))
+    # detect() memoization — within one task, static-scene objects are queried
+    # many times (74+ calls/task in v3 prompts). Cache by lowercase name so
+    # repeated parse_query_obj('human') / detect('sink') reuse the same
+    # occupancy_map + point-cloud computation. Robot/mobile_base/gripper are
+    # NEVER cached since the robot moves during the task.
+    self._detect_cache = {}
+    self._detect_skip_names = ('mobile_base', 'robot_mobile_base', 'gripper', 'robot0', 'ee')
 
     self._map_h = _nav_h
     self._map_w = _nav_w
@@ -93,11 +105,21 @@ class NavigationLMPInterface():
     machine front face). Goal-success uses fixture.pos with a 0.5m
     threshold, so anchoring affordance to fixture.pos closes that gap.
 
-    Movable obstacles (cat, dog, person, ...) are not in the fixtures
+    Movable obstacles (cat, dog, human, ...) are not in the fixtures
     registry so they always fall back to visible centroid — which is
     what we want (avoidance halo around the actual mesh).
     """
     print("object name:", obj_name)
+    # Memoize: static-scene objects (sink, fridge, human, cat, etc.) don't
+    # move during a task — return cached Observation. Skip cache for robot
+    # (moves) and EE alias (depends on arm config).
+    _obj_lc = (obj_name or '').lower().strip()
+    _is_cacheable = (
+        _obj_lc not in self._detect_skip_names
+        and _obj_lc not in EE_ALIAS
+    )
+    if _is_cacheable and _obj_lc in self._detect_cache:
+        return self._detect_cache[_obj_lc]
     # if obj_name.lower() == 'robot_mobile_base':
     #   import sys, os, logging
     #   # sys.stdout is redirected to log file by run_LMP.py
@@ -143,7 +165,10 @@ class NavigationLMPInterface():
       obs_dict['_position_world'] = np.mean(obj_pc, axis=0)
       obs_dict['_point_cloud_world'] = obj_pc
       obs_dict['normal'] = normalize_vector(obj_normal.mean(axis=0))
-      return Observation(obs_dict)
+      _result = Observation(obs_dict)
+      if _is_cacheable:
+        self._detect_cache[_obj_lc] = _result
+      return _result
     if obj_name.lower() in EE_ALIAS:
       obs_dict = dict()
       obs_dict['name'] = obj_name
@@ -255,6 +280,8 @@ class NavigationLMPInterface():
     except Exception as _e:
       logger.debug(f"target_pos override failed for '{obj_name}': {_e}")
     object_obs = Observation(obs_dict)
+    if _is_cacheable:
+      self._detect_cache[_obj_lc] = object_obs
     return object_obs
 
   def _lookup_fixture_pos(self, obj_name):
@@ -386,24 +413,35 @@ class NavigationLMPInterface():
         try:
           _xy = self._compute_pixel_resolution()
           _cell_m = float(np.asarray(_xy).min())
-          _robot_radius_m = 0.25  # safe default if geom_rbound lookup fails
-          try:
-            _model = self._env.env.sim.model
-            _max_rb = 0.0
-            for _gid in range(_model.ngeom):
-              _bid = int(_model.geom_bodyid[_gid])
-              _bn = (_model.body_id2name(_bid) or '').lower()
-              # Only consider the wheeled mobile base — arm/gripper rbounds are
-              # irrelevant for floor inflation (z >> floor) and would inflate
-              # the planner footprint with non-floor geometry.
-              if 'mobilebase' in _bn and 'wheel' in _bn:
-                _rb = float(_model.geom_rbound[_gid])
-                if _rb > _max_rb:
-                  _max_rb = _rb
-            if _max_rb > 0:
-              _robot_radius_m = _max_rb / 2.0
-          except Exception:
-            pass
+          # Inflation = base PLANAR radius (R), since A* moves the base CENTER
+          # and robot extends R outward. geom_rbound is the 3D enclosing-sphere
+          # radius which over-counts vertical extent (tall arms make sphere big
+          # but irrelevant for floor footprint).
+          # Use geom_aabb on mobile_base geoms to get XY half-extents directly.
+          # ROBOT_RADIUS_M env var overrides.
+          _override = os.environ.get('ROBOT_RADIUS_M', '').strip()
+          if _override:
+            _robot_radius_m = float(_override)
+          else:
+            _robot_radius_m = 0.40   # safe planar default (PandaOmron base ~0.6x0.6 → diag/2 ≈ 0.42)
+            try:
+              _model = self._env.env.sim.model
+              _max_xy = 0.0
+              for _gid in range(_model.ngeom):
+                _bid = int(_model.geom_bodyid[_gid])
+                _bn = (_model.body_id2name(_bid) or '').lower()
+                if 'mobilebase' in _bn:
+                  # geom_aabb is (cx, cy, cz, hx, hy, hz) in geom-local frame.
+                  # For floor footprint we want hypot(hx, hy) — half-diagonal in XY.
+                  _aabb = _model.geom_aabb[_gid]
+                  _hx = float(_aabb[3]); _hy = float(_aabb[4])
+                  _xy_r = float(np.hypot(_hx, _hy))
+                  if _xy_r > _max_xy:
+                    _max_xy = _xy_r
+              if _max_xy > 0:
+                _robot_radius_m = _max_xy   # planar half-diagonal
+            except Exception:
+              pass
           _robot_radius_cells = max(1, int(np.ceil(_robot_radius_m / _cell_m)))
           logger.info(f"[planner inflation] robot_radius_m={_robot_radius_m:.3f} "
                       f"cell_m={_cell_m:.3f} → robot_radius_cells={_robot_radius_cells}")
@@ -434,56 +472,351 @@ class NavigationLMPInterface():
         controller_infos = dict()
         step_idx = 0
 
-        # v30: rotate-first phase before main waypoint loop.
-        # If the path direction at the start is far from where the robot is
-        # currently facing, rotating while translating (v26 default) makes the
-        # body-frame action curve in world frame and the robot drifts away
-        # from the path. So we rotate in place first — translation is
-        # suppressed until cur_yaw aligns with the first segment's tangent
-        # (within ROTATE_FIRST_TOL_RAD), or we hit ROTATE_FIRST_MAX_STEPS.
-        # Opt-in via env var ROTATE_FIRST_ENABLED=1 (default off — initial
-        # test on Cat Route A L2 produced 12.4 m goal divergence; still gated
-        # while a safer trigger threshold is verified).
-        _rotate_first_enabled = os.environ.get('ROTATE_FIRST_ENABLED', '0') == '1'
+        # Rotation handling — 3 modes via env:
+        #  ROTATE_FIRST_ENABLED=1 (default): pre-loop burst rotate in place
+        #     toward wp[1]. Fast (~26 steps for 90°) but ~195mm drift.
+        #  INCREMENTAL_ROTATE_ENABLED=1: skip rotate-first burst. Inside
+        #     outer loop, action[2] omega is the only rotation source —
+        #     gradual alignment over many small steps. omega clip 0.05
+        #     → 0.14°/step → drift 0.3mm/step accumulates over many steps.
+        #     Total drift same as rotate-first (degrees-of-rotation invariant)
+        #     BUT spread across translation steps → robot has time to make
+        #     progress toward wp while rotating.
+        #  Default holonomic without flags = same as rotate-first.
+        _incremental_rotate = os.environ.get('INCREMENTAL_ROTATE_ENABLED', '0') == '1'
+        _rotate_first_enabled = (
+            not _incremental_rotate
+            and os.environ.get('ROTATE_FIRST_ENABLED', '1') == '1'
+        )
         if _rotate_first_enabled and len(traj_world) >= 2:
-          first_dxy = np.asarray(traj_world[1][0]) - np.asarray(traj_world[0][0])
+          # rotate-first targets the NEXT SEGMENT direction (wp[1]→wp[2]) so the
+          # robot pre-aligns to where it will be heading AFTER the first wp.
+          # Falls back to (wp[0]→wp[1]) if only 2 wps in path.
+          if len(traj_world) >= 3:
+            first_dxy = np.asarray(traj_world[2][0]) - np.asarray(traj_world[1][0])
+          else:
+            first_dxy = np.asarray(traj_world[1][0]) - np.asarray(traj_world[0][0])
           if np.linalg.norm(first_dxy) > 0.05:
-            first_tangent_yaw = float(np.arctan2(first_dxy[1], first_dxy[0]))
+            # Body +x in world = (-cos α, sin α) where α=real_yaw (R(π-yaw)).
+            # To make body face direction (dx, dy): α = atan2(dy, -dx).
+            first_tangent_yaw = float(np.arctan2(first_dxy[1], -first_dxy[0]))
             _q = self._env.env._get_observations()['robot0_base_quat']
             cur_yaw0 = quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]
             init_delta = (first_tangent_yaw - cur_yaw0 + np.pi) % (2 * np.pi) - np.pi
             ROTATE_FIRST_TRIGGER_RAD = np.deg2rad(60)
             ROTATE_FIRST_TOL_RAD = np.deg2rad(15)
-            ROTATE_FIRST_MAX_STEPS = 30
+            # No fixed step limit — wait until aligned. Safety cap 500 only
+            # to prevent runaway (would mean omega action somehow not rotating).
+            ROTATE_FIRST_MAX_STEPS = 500
             if abs(init_delta) > ROTATE_FIRST_TRIGGER_RAD:
+              _obs0 = self._env.env._get_observations()
+              _start_pos_world = _obs0['robot0_base_pos'][:2].copy()
               logger.info(f'[{get_clock_time()}] rotate-first phase: '
                           f'init delta_yaw={np.degrees(init_delta):+.1f}deg '
-                          f'(> {np.degrees(ROTATE_FIRST_TRIGGER_RAD):.0f}deg trigger)')
+                          f'(> {np.degrees(ROTATE_FIRST_TRIGGER_RAD):.0f}deg trigger), '
+                          f'start_pos=({_start_pos_world[0]:.3f},{_start_pos_world[1]:.3f})')
               for _rf_step in range(ROTATE_FIRST_MAX_STEPS):
-                _q = self._env.env._get_observations()['robot0_base_quat']
+                _obs = self._env.env._get_observations()
+                _q = _obs['robot0_base_quat']
                 _cy = quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]
                 _d = (first_tangent_yaw - _cy + np.pi) % (2 * np.pi) - np.pi
+                _cur_pos = _obs['robot0_base_pos'][:2]
+                _drift_world = _cur_pos - _start_pos_world
                 if abs(_d) <= ROTATE_FIRST_TOL_RAD:
                   logger.info(f'[{get_clock_time()}] rotate-first done in '
                               f'{_rf_step + 1} steps (remaining delta='
-                              f'{np.degrees(_d):+.1f}deg)')
+                              f'{np.degrees(_d):+.1f}deg, drift='
+                              f'{np.linalg.norm(_drift_world)*1000:.1f}mm)')
                   break
-                rotate_action = np.array([0.0, 0.0, np.clip(_d * 10.0, -1.0, 1.0)])
+                # Pure rotation, no translation compensation. v_x compensation
+                # (any direction) is environment-dependent — would push robot
+                # into walls in tight starting positions. Instead, accept the
+                # drift and correct AFTER rotation via nearest-wp mapping
+                # (NEAREST_WP_AFTER_ROTATE). General across all scenes.
+                _vx_comp = float(os.environ.get('ROTATE_FIRST_VX_COMP', '0.0'))
+                _vy_comp = float(os.environ.get('ROTATE_FIRST_VY_COMP', '0.0'))
+                _omega = float(np.clip(_d * 10.0, -1.0, 1.0))
+                rotate_action = np.array([_vx_comp, _vy_comp, _omega])
                 self._env.apply_navigation_action(rotate_action)
               else:
                 logger.warning(f'[{get_clock_time()}] rotate-first hit step '
                                f'limit ({ROTATE_FIRST_MAX_STEPS}); proceeding')
 
-        for i, waypoint in tqdm(enumerate(traj_world), total=len(traj_world), desc='REACHED waypoint'):
+              # === Drift correction after rotate-first ===
+              # rotate-first inherently drifts ~2.5mm/° (best case with v_x=-0.5).
+              # For 90° rotation: ~225mm displacement. Robot's actual position is
+              # no longer at start_pos, so original path (traj_world) is offset.
+              # Two strategies (env-var selectable):
+              #   REPLAN_AFTER_ROTATE=1 : re-run A* from new pos with cached maps
+              #   TRANSLATE_BACK=1      : translate back to start_pos before main loop
+              # Default: do nothing (legacy behavior).
+              _drift_strategy_replan = os.environ.get('REPLAN_AFTER_ROTATE', '0') == '1'
+              _drift_strategy_back   = os.environ.get('TRANSLATE_BACK_AFTER_ROTATE', '0') == '1'
+              if (_drift_strategy_replan or _drift_strategy_back):
+                _obs_post = self._env.env._get_observations()
+                _pos_post = _obs_post['robot0_base_pos'][:2]
+                _drift_post = _pos_post - _start_pos_world
+                _drift_mag = float(np.linalg.norm(_drift_post))
+                logger.info(f'[drift-correction] post-rotate drift={_drift_mag*1000:.1f}mm '
+                            f'world=({_drift_post[0]*1000:+.0f},{_drift_post[1]*1000:+.0f})mm')
+                if _drift_mag > 0.05:
+                  if _drift_strategy_back:
+                    # Holonomic translation back to start_pos (body-frame target)
+                    _q_post = _obs_post['robot0_base_quat']
+                    _yaw_post = quat2euler([_q_post[3], _q_post[0], _q_post[1], _q_post[2]])[2]
+                    for _bs in range(200):
+                      _obs2 = self._env.env._get_observations()
+                      _p2 = _obs2['robot0_base_pos'][:2]
+                      _q2_ = _obs2['robot0_base_quat']
+                      _yaw2 = quat2euler([_q2_[3], _q2_[0], _q2_[1], _q2_[2]])[2]
+                      _dxw = _start_pos_world[0] - _p2[0]
+                      _dyw = _start_pos_world[1] - _p2[1]
+                      _err = float(np.hypot(_dxw, _dyw))
+                      if _err < 0.05:
+                        logger.info(f'[drift-correction] translate-back done in {_bs+1} steps')
+                        break
+                      # Controller's body→world is R(π - yaw), not R(yaw).
+                      # Audit confirmed (yaw=0/180° tests showed 180° dir error
+                      # with R(yaw) formula). World→body inverse uses R(π-yaw)^T.
+                      _vxb = -_dxw*np.cos(_yaw2) + _dyw*np.sin(_yaw2)
+                      _vyb = -_dxw*np.sin(_yaw2) - _dyw*np.cos(_yaw2)
+                      _kp = 5.0
+                      _act = np.array([
+                        float(np.clip(_vxb*_kp, -1.0, 1.0)),
+                        float(np.clip(_vyb*_kp, -1.0, 1.0)),
+                        0.0,
+                      ])
+                      self._env.apply_navigation_action(_act)
+                    else:
+                      logger.warning(f'[drift-correction] translate-back hit step limit')
+                  elif _drift_strategy_replan:
+                    # Re-run A* from current position with cached maps
+                    try:
+                      _cur_grid = self._world_to_pos_coords(
+                          np.array([_pos_post[0], _pos_post[1], 0.0]))
+                      _new_path, _ = self._planner.navigation_optimize(
+                          np.asarray(_cur_grid)[:2], _affordance_map, _avoidance_map,
+                          robot_radius_cells=_robot_radius_cells)
+                      if _new_path is not None and len(_new_path) > 1:
+                        _new_traj = self._path2traj_navigation(
+                            _new_path, _avoidance_map, _rotation_map, _velocity_map)
+                        if len(_new_traj) > 1:
+                          traj_world = _new_traj
+                          logger.info(f'[drift-correction] replanned: {len(traj_world)} wps from new pos')
+                    except Exception as _re:
+                      logger.warning(f'[drift-correction] replan failed: {_re}')
+              # === End drift correction ===
+
+        # Replan support: cache maps + radius for in-loop A* re-run.
+        # Enabled via env var REPLAN_EVERY_N_STEPS (0 = disabled, N>0 =
+        # rerun A* from cur_pos every N control steps). Keeps drift from
+        # accumulating between robot pose and planner path.
+        _replan_n = int(os.environ.get('REPLAN_EVERY_N_STEPS', '0'))
+        _cached_aff = _affordance_map
+        _cached_avoid = _avoidance_map
+        _cached_rot_map = _rotation_map
+        _cached_vel_map = _velocity_map
+        _cached_rr = _robot_radius_cells
+
+        i = 0
+        # NEAREST_WP_AFTER_ROTATE=1 : skip wps that are now behind robot
+        # (closer to start than to cur_pos). Picks the wp closest to cur_pos
+        # as starting index. Robust to ANY drift magnitude — doesn't assume
+        # drift direction or magnitude.
+        if os.environ.get('NEAREST_WP_AFTER_ROTATE', '0') == '1':
+          _obs_nwp = self._env.env._get_observations()
+          _cur_xy = _obs_nwp['robot0_base_pos'][:2]
+          _dists = [float(np.linalg.norm(np.asarray(_wp[0]) - _cur_xy))
+                    for _wp in traj_world]
+          if _dists:
+            _nearest = int(np.argmin(_dists))
+            # Bias toward forward: skip wps that are at/behind cur_pos
+            # (only if nearest is very close to cur_pos). Advance to next wp.
+            if _dists[_nearest] < 0.10 and _nearest + 1 < len(traj_world):
+              _nearest += 1
+            i = _nearest
+            logger.info(f'[nearest-wp] cur_xy=({_cur_xy[0]:.3f},{_cur_xy[1]:.3f}) '
+                        f'→ start at wp[{i}] '
+                        f'(dist={_dists[_nearest]*1000:.0f}mm; total {len(traj_world)} wps)')
+        pbar = tqdm(total=max(1, len(traj_world)-i), desc='REACHED waypoint')
+        # Global step cap — prevents replan-loop oscillation. Cap at the
+        # number of waypoints × per-wp limit so normal tasks aren't affected.
+        _global_max_steps = self._max_steps_per_waypoint * 2 * max(len(traj_world), 6)
+        _global_start_step = step_idx
+        # === Option A: goal-distance based outer loop ===
+        # Activated by OUTER_GOAL_DIST_MODE=1. Instead of iterating through
+        # waypoints, loop until robot is within GOAL_DIST_THRESHOLD of the
+        # final waypoint. Periodic replan trims/regenerates traj_world.
+        _outer_goal_mode = os.environ.get('OUTER_GOAL_DIST_MODE', '0') == '1'
+        if _outer_goal_mode:
+          goal_xy_world = np.asarray(traj_world[-1][0])
+          GOAL_DIST_THRESHOLD = float(os.environ.get('GOAL_DIST_THRESHOLD', '0.5'))
+          _A_replan_every = max(_replan_n, 10)
+          _A_global_max = self._max_steps_per_waypoint * 3 * max(len(traj_world), 8)
+          _A_steps = 0
+          logger.info(f'[option-A] goal_xy={goal_xy_world.tolist()} thresh={GOAL_DIST_THRESHOLD} '
+                      f'replan_every={_A_replan_every} global_max={_A_global_max}')
+          while True:
+            cp = self._env.env._get_observations()['robot0_base_pos'][:2]
+            dist_goal = float(np.linalg.norm(cp - goal_xy_world))
+            if dist_goal <= GOAL_DIST_THRESHOLD:
+              logger.info(f'[option-A] goal reached @ step {step_idx} '
+                          f'(dist={dist_goal:.3f}m, A_steps={_A_steps})')
+              break
+            if _A_steps >= _A_global_max:
+              logger.warning(f'[option-A] global timeout @ A_steps={_A_steps} '
+                             f'(dist={dist_goal:.3f}m)')
+              break
+            # Periodic replan from cur_pos
+            if _A_steps > 0 and _A_steps % _A_replan_every == 0:
+              try:
+                _robot_obs = self.detect('robot_mobile_base')
+                _cur_grid = np.asarray(_robot_obs['position'])[:2]
+                _new_path, _ = self._planner.navigation_optimize(
+                    _cur_grid, _cached_aff, _cached_avoid,
+                    robot_radius_cells=_cached_rr)
+                if _new_path is not None and len(_new_path) > 1:
+                  _new_traj = self._path2traj_navigation(
+                      _new_path, _cached_avoid, _cached_rot_map, _cached_vel_map)
+                  if len(_new_traj) > 1:
+                    traj_world = _new_traj[1:self._cfg['num_waypoints_per_plan']+1]
+                    logger.info(f'[option-A] replan @ step {step_idx}: '
+                                f'{len(traj_world)} wps, dist_goal={dist_goal:.3f}')
+              except Exception as _rpe:
+                logger.warning(f'[option-A] replan failed: {_rpe}')
+            # Prune already-reached wps from front of traj_world
+            while len(traj_world) > 1:
+              _wp0 = np.asarray(traj_world[0][0])
+              if float(np.linalg.norm(cp - _wp0)) < 0.10:
+                traj_world = traj_world[1:]
+              else:
+                break
+            if len(traj_world) == 0:
+              logger.warning('[option-A] traj empty after pruning; exit')
+              break
+            target_wp = traj_world[0]
+            lookahead_wp = traj_world[1] if len(traj_world) > 1 else traj_world[0]
+            next_wp = traj_world[1] if len(traj_world) > 1 else traj_world[0]
+            traj_action, _ = self._navigate_to_trajectory(
+                target_wp, next_wp, lookahead_wp=lookahead_wp)
+            controller_info = self._nav_controller.execute(traj_action)
+            controller_info['controller_step'] = step_idx
+            controller_info['target_waypoint'] = target_wp
+            for _vlm_cam in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
+              _key = f"{_vlm_cam}_image"
+              if _key in controller_info['mp_info'][0]:
+                controller_info[_key] = controller_info['mp_info'][0][_key][::-1]
+            controller_infos[step_idx] = controller_info
+            step_idx += 1
+            _A_steps += 1
+          pbar.close()
+          step_info['controller_infos'] = controller_infos
+          execute_info.append(step_info)
+          curr_pos = movable_obs['position'][:2].astype(int)
+          if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
+            logger.info(f'[{get_clock_time()}] reached target; terminating')
+            break
+          continue   # skip the legacy wp-iteration loop below
+        # === End Option A ===
+        while i < len(traj_world):
+          waypoint = traj_world[i]
           waypoint_reach = False
           is_last = (i == len(traj_world) - 1)
           dist_threshold = self._dist_threshold
           wp_step = 0
+          _replan_jump = False
+          # translate_only mode: explicit 2-phase per waypoint.
+          #   Phase A: rotate in place toward waypoint until aligned
+          #   Phase B: translate forward only until at waypoint
+          # No mode switching once Phase B starts — committed to translation.
+          # Avoids the rotate-drift-rotate cycle that stuck Person G v3.
+          if self._nav_mode == 'translate_only':
+            goal_xy_wp = np.asarray(waypoint[0])
+            # B' (k-lookahead): rotate toward wp[i+k] for robust heading.
+            # wp[i] may be nearly cur_pos (noisy direction); wp[i+k] gives
+            # a stable target direction. Phase B still terminates at wp[i].
+            _phase_a_k = int(os.environ.get('PHASE_A_LOOKAHEAD_K', '0'))
+            if _phase_a_k > 0:
+              _la_idx = min(i + _phase_a_k, len(traj_world) - 1)
+              rot_target_xy = np.asarray(traj_world[_la_idx][0])
+            else:
+              rot_target_xy = goal_xy_wp
+            # === Phase A: ROTATE ===
+            ROT_TOL = np.deg2rad(8)
+            ROT_KP = 3.0
+            OMEGA_MAX = 0.3
+            ROT_MAX_STEPS = 60
+            for _rs in range(ROT_MAX_STEPS):
+              _cp = self._env.env._get_observations()['robot0_base_pos'][:2]
+              _q2 = self._env.env._get_observations()['robot0_base_quat']
+              _cy2 = quat2euler([_q2[3], _q2[0], _q2[1], _q2[2]])[2]
+              # body +x faces (dx, dy) when real_yaw = atan2(dy, -dx) per R(π-yaw)
+              _t_yaw = float(np.arctan2(rot_target_xy[1] - _cp[1], -(rot_target_xy[0] - _cp[0])))
+              _d = (_t_yaw - _cy2 + np.pi) % (2*np.pi) - np.pi
+              if abs(_d) <= ROT_TOL:
+                logger.debug(f"wp{i} phase-A done in {_rs} steps (delta={np.degrees(_d):+.1f}deg)")
+                break
+              act = np.array([0.0, 0.0, float(np.clip(_d * ROT_KP, -OMEGA_MAX, OMEGA_MAX))])
+              ci = self._nav_controller.execute(act)
+              ci['controller_step'] = step_idx
+              ci['target_waypoint'] = waypoint
+              for _vc in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
+                _k = f"{_vc}_image"
+                if _k in ci['mp_info'][0]:
+                  ci[_k] = ci['mp_info'][0][_k][::-1]
+              controller_infos[step_idx] = ci
+              step_idx += 1
+            # === Phase B: TRANSLATE ===
+            TRANS_KP = 5.0
+            VX_MAX = 1.0
+            TRANS_MAX_STEPS = self._max_steps_per_waypoint * (3 if is_last else 1)
+            wp_reach_thr = 0.5 if is_last else 0.10
+            for _ts in range(TRANS_MAX_STEPS):
+              _cp = self._env.env._get_observations()['robot0_base_pos'][:2]
+              _dist_now = float(np.hypot(goal_xy_wp[0] - _cp[0], goal_xy_wp[1] - _cp[1]))
+              if _dist_now <= wp_reach_thr:
+                logger.debug(f"wp{i} phase-B done in {_ts} steps (dist={_dist_now:.3f}m)")
+                waypoint_reach = True
+                break
+              # Phase B action: default = body +x only (v1 baseline).
+              # PHASE_B_HOLONOMIC=1 → use both body +x and +y (R(-yaw) on world Δ).
+              # Allows Phase B to recover lateral drift from Phase A rotation.
+              if os.environ.get('PHASE_B_HOLONOMIC', '0') == '1':
+                _q2 = self._env.env._get_observations()['robot0_base_quat']
+                _yaw_now = quat2euler([_q2[3], _q2[0], _q2[1], _q2[2]])[2]
+                _dx_w = goal_xy_wp[0] - _cp[0]
+                _dy_w = goal_xy_wp[1] - _cp[1]
+                # Controller's body→world is R(π - yaw). World→body inverse:
+                _vx_body = -_dx_w * np.cos(_yaw_now) + _dy_w * np.sin(_yaw_now)
+                _vy_body = -_dx_w * np.sin(_yaw_now) - _dy_w * np.cos(_yaw_now)
+                act = np.array([
+                  float(np.clip(_vx_body * TRANS_KP, -VX_MAX, VX_MAX)),
+                  float(np.clip(_vy_body * TRANS_KP, -VX_MAX, VX_MAX)),
+                  0.0,
+                ])
+              else:
+                act = np.array([float(np.clip(_dist_now * TRANS_KP, 0.0, VX_MAX)), 0.0, 0.0])
+              ci = self._nav_controller.execute(act)
+              ci['controller_step'] = step_idx
+              ci['target_waypoint'] = waypoint
+              for _vc in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
+                _k = f"{_vc}_image"
+                if _k in ci['mp_info'][0]:
+                  ci[_k] = ci['mp_info'][0][_k][::-1]
+              controller_infos[step_idx] = ci
+              step_idx += 1
+            # advance to next waypoint regardless of reach status
+            i += 1
+            pbar.update(1)
+            continue
+          # holonomic mode (original): mixed v_x/v_y/omega
+          lookahead_idx = min(i + 2, len(traj_world) - 1)
+          lookahead_wp = traj_world[lookahead_idx]
           while not waypoint_reach:
             if is_last:
-              traj_action, dist_to_yaw = self._navigate_to_trajectory(traj_world[i], traj_world[i])
+              traj_action, dist_to_yaw = self._navigate_to_trajectory(traj_world[i], traj_world[i], lookahead_wp=lookahead_wp)
             else:
-              traj_action, dist_to_yaw = self._navigate_to_trajectory(traj_world[i], traj_world[i+1])
+              traj_action, dist_to_yaw = self._navigate_to_trajectory(traj_world[i], traj_world[i+1], lookahead_wp=lookahead_wp)
             controller_info = self._nav_controller.execute(traj_action)
             cur_pos = self._env.env._get_observations()['robot0_base_pos']
             _q = self._env.env._get_observations()['robot0_base_quat']  # robosuite xyzw
@@ -499,6 +832,36 @@ class NavigationLMPInterface():
                     controller_info[_key] = controller_info['mp_info'][0][_key][::-1]
             controller_infos[step_idx] = controller_info
             step_idx += 1
+
+            # Global cap: emergency exit if total steps exceed budget
+            # (replan-loop oscillation safeguard).
+            if (step_idx - _global_start_step) >= _global_max_steps:
+              logger.warning(f'global step cap reached ({_global_max_steps}); exiting outer loop')
+              waypoint_reach = True
+              break
+
+            # === REPLAN: rerun A* from cur_pos every N steps ===
+            if _replan_n > 0 and step_idx % _replan_n == 0:
+              try:
+                _robot_obs = self.detect('robot_mobile_base')
+                _cur_grid = np.asarray(_robot_obs['position'])[:2]
+                _new_path, _ = self._planner.navigation_optimize(
+                    _cur_grid, _cached_aff, _cached_avoid,
+                    robot_radius_cells=_cached_rr)
+                if _new_path is not None and len(_new_path) > 1:
+                  _new_traj = self._path2traj_navigation(
+                      _new_path, _cached_avoid, _cached_rot_map, _cached_vel_map)
+                  # Skip first wp (= cur_pos) so loop targets the next wp
+                  # ahead instead of standing still trying to "reach" cur_pos.
+                  if len(_new_traj) > 1:
+                    traj_world = _new_traj[1:self._cfg['num_waypoints_per_plan']+1]
+                    logger.info(f'replan @ step {step_idx}: {len(traj_world)} wps (skipped wp[0]=cur_pos)')
+                    i = 0
+                    _replan_jump = True
+                    break  # exit inner while, restart outer with new traj
+              except Exception as _rpe:
+                logger.warning(f'replan failed: {_rpe}')
+            # ===================================================
 
             # ---- Y1 debug log: per-step state on LAST wp only (single L6 sweep) ----
             if is_last:
@@ -547,6 +910,12 @@ class NavigationLMPInterface():
             if wp_step >= wp_max:
               logger.debug(f"waypoint {i} exceeded {wp_max} steps (dist={np.linalg.norm(dxy):.3f}), skipping")
               break
+
+          # Outer while loop control: if replan reset i, don't increment
+          if not _replan_jump:
+            i += 1
+            pbar.update(1)
+        pbar.close()
         step_info['controller_infos'] = controller_infos
         execute_info.append(step_info)
         curr_pos = movable_obs['position'][:2].astype(int)
@@ -654,7 +1023,7 @@ class NavigationLMPInterface():
       # surface this in different attributes / fixtures, so try a few.
       #
       # Order (corrected 2026-05-07):
-      #   1. obstacle_name == "human" → _get_person_pos() (person is body)
+      #   1. obstacle_name == "human" → _get_human_pos() (posed_human fixture is the body)
       #   2. Floor-placed obstacles (cat/dog/kettlebell/vase/crawling_baby):
       #      look up the actual MuJoCo body whose name starts with "obstacle"
       #      and use the geom_xpos centroid. Robocasa places these via
@@ -674,8 +1043,8 @@ class NavigationLMPInterface():
         # _initial_obstacle_xy snapshot at load_task time drifted vs LLM's
         # cat (~32cm in L8) due to physics steps between load_task and
         # avoidance map generation.
-        if _obstacle_name == "human" and hasattr(self._env, "_get_person_pos"):
-          _p = self._env._get_person_pos()
+        if _obstacle_name == "human" and hasattr(self._env, "_get_human_pos"):
+          _p = self._env._get_human_pos()
           if _p is not None:
             _obstacle_xy = np.asarray(_p)[:2]
         if _obstacle_xy is None and _kitchen is not None:
@@ -862,7 +1231,7 @@ class NavigationLMPInterface():
       voxel_map[min_x:max_x, min_y:max_y, min_z:max_z] = value
     return voxel_map
   
-  def set_pixel_by_radius(self, pixel_map, pixel_xy_or_obj, radius_cm=0, value=1):
+  def set_pixel_by_radius(self, pixel_map, pixel_xy_or_obj, radius_cm=0, value=1, gradient=True):
     """Set `value` over a region of `pixel_map`. Two modes:
 
     Object mode (preferred for fixtures and grouped objects):
@@ -872,12 +1241,39 @@ class NavigationLMPInterface():
         collapses to floor-center for perimeter-distributed obstacles
         (counter, kitchen group, etc.).
 
+    Robot self-skip:
+        If the obj name contains 'robot' / 'mobile_base' / 'gripper',
+        the call is a NO-OP. LMP composer sometimes adds avoidance halo
+        around the robot itself (e.g., `at least 50cm from robot_mobile_base`)
+        which makes the planner unable to find a path because the robot's
+        start position is inside the halo. We skip these entirely.
+
     Point mode (legacy):
         pixel_xy_or_obj is [x, y] (or [x, y, z]). Sets a square of size
         2·radius_cm centred at that point.
+
+    Gradient (optional, default False):
+        If True, values inside the affected region decay linearly from
+        `value` at the centre (mesh interior or point) down to 0.0 at
+        the outer edge (radius_cm boundary). Useful for affordance maps
+        so the planner is pulled toward the centroid rather than stopping
+        at the halo edge. Other maps (avoidance, velocity, rotation)
+        keep the uniform default behaviour.
     """
     if pixel_map is None or pixel_xy_or_obj is None:
         return pixel_map
+
+    # Skip robot self-avoidance: LLM-generated avoidance for the robot
+    # itself produces a halo that traps the planner (start cell already
+    # inside avoidance). Detect by name tokens.
+    try:
+      _name_lower = (pixel_xy_or_obj.get('name', '') if isinstance(pixel_xy_or_obj, dict)
+                     else getattr(pixel_xy_or_obj, 'name', '') or '').lower()
+    except Exception:
+      _name_lower = ''
+    if any(k in _name_lower for k in ('robot', 'mobile_base', 'gripper')):
+      logger.info(f"[set_pixel_by_radius] SKIP robot self-avoidance: name='{_name_lower}'")
+      return pixel_map
 
     # Duck-typed object detection. Supports Observation (dict subclass),
     # DynamicObservation, IterableDynamicObservation, and raw [x,y].
@@ -930,25 +1326,56 @@ class NavigationLMPInterface():
       # Merge multi-part fixtures: bridge small gaps between sub-geoms of
       # the same physical object (e.g. main_door = main + door + handle +
       # trims; window = frame + glass; sink = basin + faucet) so the
-      # radius dilation operates on a single continuous mask. Closing with
-      # a 25cm structuring element merges parts that are within ~25cm of
-      # each other; far-separated components (multiple distinct fixtures
-      # mapped to the same name) remain separate.
-      from scipy.ndimage import binary_closing, distance_transform_edt
+      # radius dilation operates on a single continuous mask. cv2's
+      # morphologyEx CLOSE is 3-10× faster than scipy.binary_closing
+      # because OpenCV's C implementation handles large kernels natively
+      # (single pass per op instead of N iterations of 3x3 dilation+erode).
+      import cv2 as _cv2
       _cell_m = float(self._resolution[0])
       _gap_cells = max(1, int(round(0.25 / _cell_m)))
       occ_pre = occ
       try:
-        occ = binary_closing(occ, iterations=_gap_cells)
+        # Kernel size = (2*_gap_cells+1) for symmetric closing.
+        _ksz = 2 * _gap_cells + 1
+        _kernel = _cv2.getStructuringElement(_cv2.MORPH_RECT, (_ksz, _ksz))
+        _occ_u8 = occ.astype(np.uint8)
+        _closed = _cv2.morphologyEx(_occ_u8, _cv2.MORPH_CLOSE, _kernel)
+        occ = _closed.astype(bool)
       except Exception:
-        occ = occ_pre
+        # Fallback to scipy if cv2 ever fails (e.g., empty mask edge case)
+        from scipy.ndimage import binary_closing
+        occ = binary_closing(occ_pre, iterations=_gap_cells)
+      # Robot avoidance: never apply gradient. Robot body is a hard
+      # boundary, not a soft falloff. Detect by name token.
+      try:
+        _obj_name_lower = (pixel_xy_or_obj.get('name', '') if isinstance(pixel_xy_or_obj, dict)
+                           else getattr(pixel_xy_or_obj, 'name', '') or '').lower()
+      except Exception:
+        _obj_name_lower = ''
+      if any(k in _obj_name_lower for k in ('robot', 'mobile_base', 'gripper')):
+        gradient = False
       if radius_cm > 0:
         radius_cells = max(1, int(round(radius_cm / (_cell_m * 100))))
-        halo = distance_transform_edt(~occ) <= radius_cells
+        # cv2.distanceTransform is 2-5× faster than scipy.distance_transform_edt.
+        # Input: 0 = obstacle pixel, 255 = free pixel. Output: distance to
+        # nearest 0 in pixel units (matches edt(~occ) semantics).
+        try:
+          _free_u8 = ((~occ).astype(np.uint8)) * 255
+          dt_occ = _cv2.distanceTransform(_free_u8, _cv2.DIST_L2, 5)
+        except Exception:
+          from scipy.ndimage import distance_transform_edt
+          dt_occ = distance_transform_edt(~occ)
+        halo = dt_occ <= radius_cells
       else:
         halo = occ
+        dt_occ = None
       target = pixel_map.array if hasattr(pixel_map, 'array') else pixel_map
-      target[halo] = value
+      if gradient and radius_cm > 0:
+        # Linear decay: value at mesh (dt=0) → 0 at halo edge (dt=radius_cells)
+        decay = np.clip(1.0 - dt_occ.astype(np.float32) / float(radius_cells), 0.0, 1.0)
+        target[halo] = value * decay[halo]
+      else:
+        target[halo] = value
       try:
         _name = pixel_xy_or_obj.get('name', '?') if isinstance(pixel_xy_or_obj, dict) else getattr(pixel_xy_or_obj, 'name', '?')
       except Exception:
@@ -999,12 +1426,12 @@ class NavigationLMPInterface():
     # object isn't visible in any camera). int(None) raises TypeError —
     # silently drop those calls instead of crashing the whole episode.
     if pixel_xy[0] is None or pixel_xy[1] is None:
-      logger.info(f"[set_pixel_by_radius PT-MODE raw] skipped (None coord) xy={pixel_xy} radius_cm={radius_cm}")
+      logger.warning(f"[set_pixel_by_radius PT-MODE raw] skipped (None coord — likely hallucinated obstacle) xy={pixel_xy} radius_cm={radius_cm}")
       return pixel_map
     try:
       _r, _c = int(pixel_xy[0]), int(pixel_xy[1])
     except (TypeError, ValueError):
-      logger.info(f"[set_pixel_by_radius PT-MODE raw] skipped (non-numeric) xy={pixel_xy} radius_cm={radius_cm}")
+      logger.warning(f"[set_pixel_by_radius PT-MODE raw] skipped (non-numeric — likely hallucinated obstacle) xy={pixel_xy} radius_cm={radius_cm}")
       return pixel_map
     logger.info(f"[set_pixel_by_radius PT-MODE raw] xy={pixel_xy} radius_cm={radius_cm}")
     pixel_map[_r, _c] = value
@@ -1228,17 +1655,18 @@ class NavigationLMPInterface():
       dst_is_human = getattr(self._env.env, 'dst_is_human', False)
       target_yaw = None
       if dst_is_human:
-        person_pos = getattr(self._env.env, 'target_pos', None)
-        if person_pos is not None:
+        human_pos = getattr(self._env.env, 'target_pos', None)
+        if human_pos is not None:
           last_wp = traj[-1]
-          dir_to_person = np.array(person_pos[:2]) - np.array(last_wp[0])
-          dist = np.linalg.norm(dir_to_person)
+          dir_to_human = np.array(human_pos[:2]) - np.array(last_wp[0])
+          dist = np.linalg.norm(dir_to_human)
           if dist > 0.1:
-            target_yaw = float(np.arctan2(dir_to_person[1], dir_to_person[0]))
+            # R(π-yaw): body faces (dx,dy) when real_yaw = atan2(dy, -dx)
+            target_yaw = float(np.arctan2(dir_to_human[1], -dir_to_human[0]))
           elif len(traj) >= 2:
             prev_wp = traj[-2][0]
             dir_approach = np.array(last_wp[0]) - np.array(prev_wp)
-            target_yaw = float(np.arctan2(dir_approach[1], dir_approach[0]))
+            target_yaw = float(np.arctan2(dir_approach[1], -dir_approach[0]))
       else:
         target_ori = getattr(self._env.env, 'target_ori', None)
         if target_ori is not None:
@@ -1251,7 +1679,7 @@ class NavigationLMPInterface():
         logger.debug(f'[{get_clock_time()}] injected target_yaw={np.degrees(target_yaw):.1f}deg into last {n_inject} waypoints')
     return traj
   
-  def _navigate_to_trajectory(self, waypoint, to_waypoint, kp=10):
+  def _navigate_to_trajectory(self, waypoint, to_waypoint, kp=10, lookahead_wp=None):
     goal_xy, goal_yaw, goal_vel = waypoint
     to_goal_xy = to_waypoint[0]
     direction_vector = to_goal_xy - goal_xy
@@ -1259,53 +1687,104 @@ class NavigationLMPInterface():
     _q = self._env.env._get_observations()['robot0_base_quat']  # robosuite xyzw
     cur_yaw = quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]       # → wxyz, [2]=yaw_Z
 
+    # nav_mode=translate_only: rotate-first toward NEXT waypoint, then
+    # forward-only translation toward the SAME next waypoint. Avoids
+    # holonomic v_y lateral drift. Pattern lifted from b7fab21 rotate-first.
+    # IMPORTANT: heading target = translation target. Using a lookahead wp
+    # for heading caused body-forward to point away from the actual next wp
+    # (Person G smoke v2 drifted laterally 0.55m). Smoke-validated tuning:
+    # omega_max=0.3 keeps lateral drift <4mm/step; v_x=1.0 perfectly forward.
+    if self._nav_mode == 'translate_only':
+      next_xy = np.asarray(to_waypoint[0])
+      # R(π-yaw): body faces (dx,dy) at real_yaw = atan2(dy, -dx)
+      target_yaw_face = float(np.arctan2(next_xy[1] - cur_xy[1], -(next_xy[0] - cur_xy[0])))
+      delta_yaw_face = (target_yaw_face - cur_yaw + np.pi) % (2 * np.pi) - np.pi
+      ROTATE_ALIGN_TOL = np.deg2rad(10)
+      ROTATE_KP = 3.0
+      ROTATE_OMEGA_MAX = 0.3
+      TRANSLATE_KP = 5.0
+      TRANSLATE_VX_MAX = 1.0
+      action = np.zeros(3)
+      if abs(delta_yaw_face) > ROTATE_ALIGN_TOL:
+        action[2] = float(np.clip(delta_yaw_face * ROTATE_KP,
+                                  -ROTATE_OMEGA_MAX, ROTATE_OMEGA_MAX))
+      else:
+        dist_to_wp = float(np.hypot(next_xy[0] - cur_xy[0], next_xy[1] - cur_xy[1]))
+        action[0] = float(np.clip(dist_to_wp * TRANSLATE_KP, 0.0, TRANSLATE_VX_MAX))
+      return action, delta_yaw_face
+
     # Lookahead smoothing — drive toward a point L metres ahead of goal_xy.
-    # v26: revert to 0.3 (v20 baseline). v25 L=0.1 caused undershoot.
+    # L=0.15 stays below the 25cm wp spacing (target_spacing=5) so wps are
+    # never skipped, while giving enough forward bias for smooth motion.
     seg_len = np.linalg.norm(direction_vector) + 1e-8
     seg_dir = direction_vector / seg_len
-    L = 0.3
+    L = 0.15
     target_xy = goal_xy + seg_dir * min(L, seg_len)
     is_last = np.array_equal(goal_xy, target_xy)
     goal_yaw_scalar = np.asarray(goal_yaw).item() if np.asarray(goal_yaw).size == 1 else float('nan')
-    # v26: revert NaN→cur_yaw (v20 baseline that succeeded for L0/L6).
-    # NaN→seg_dir caused intermediate-wp drift across v21-v25.
-    #   1. Last wp + explicit yaw  → align to that target_ori (success criterion)
-    #   2. LMP-set scalar yaw      → use it (face-toward intent at this cell)
-    #   3. NaN sentinel (default)  → keep current yaw (no rotation forced)
+    # Face direction (simple rule):
+    #   - intermediate wp: face the NEXT wp (wp[i+1] = to_waypoint)
+    #   - last wp: face target_ori (= goal_yaw_scalar, success criterion)
     if is_last:
       goal_yaw = goal_yaw_scalar if not np.isnan(goal_yaw_scalar) else cur_yaw
     elif np.isnan(goal_yaw_scalar):
-      goal_yaw = cur_yaw
+      # NEW: heading target = NEXT SEGMENT direction (to_wp → lookahead_wp),
+      # so robot pre-aligns to where it will be heading AFTER current wp.
+      # Falls back to (cur_pos → to_wp) if no lookahead given.
+      _next_xy = np.asarray(to_waypoint[0])
+      if lookahead_wp is not None:
+        _lookahead_xy = np.asarray(lookahead_wp[0])
+        _dxy_next = _lookahead_xy - _next_xy   # next segment direction
+      else:
+        _dxy_next = _next_xy - cur_xy[:2]
+      if np.linalg.norm(_dxy_next) > 0.05:
+        # R(π-yaw): body faces (dx,dy) at real_yaw = atan2(dy, -dx)
+        goal_yaw = float(np.arctan2(_dxy_next[1], -_dxy_next[0]))
+      else:
+        goal_yaw = cur_yaw
     else:
       goal_yaw = goal_yaw_scalar
 
-    # Drive toward the lookahead point (target_xy) instead of exact goal_xy
-    # for smoother motion. The PandaOmron base is holonomic so translation
-    # and rotation can happen simultaneously — there is no "facing" required
-    # before moving. Previously we cosine-damped translation when off-yaw
-    # (move_factor = max(0, cos(delta_yaw))) which forced the robot to
-    # rotate-only when delta_yaw > 90°, exhausting the per-waypoint step
-    # budget on rotation alone (verified bug: L3 wp[0] needed 90° rotation
-    # → robot only rotated, never translated, then moved on to wp[1] with
-    # same problem → wandering and never reaching goal).
-    #
-    # Fix: drop move_factor entirely. Body-frame v_x, v_y already encode
-    # the correct "go-this-way-while-also-rotating" command for holonomic
-    # base. The action.clip([-1, 1]) at the end caps total velocity safely.
     dx = target_xy[0] - cur_xy[0]
     dy = target_xy[1] - cur_xy[1]
     delta_yaw = (goal_yaw - cur_yaw + np.pi) % (2 * np.pi) - np.pi
 
-    v_x = dx * np.cos(cur_yaw) + dy * np.sin(cur_yaw)
-    v_y = -dx * np.sin(cur_yaw) + dy * np.cos(cur_yaw)
+    # Controller's body→world is R(π - yaw). World→body inverse uses R(π-yaw)^T:
+    #   v_x_body = -cos(yaw)·dx + sin(yaw)·dy
+    #   v_y_body = -sin(yaw)·dx - cos(yaw)·dy
+    # Audit-confirmed: yaw=0/180° tests showed standard R(yaw) gives 180° wrong direction.
+    v_x = -dx * np.cos(cur_yaw) + dy * np.sin(cur_yaw)
+    v_y = -dx * np.sin(cur_yaw) - dy * np.cos(cur_yaw)
+    # Asymmetric gains: aggressive translation, gentle rotation. Both
+    # tunable via env vars (CTRL_KP_ROT, CTRL_OMEGA_MAX) for sweep tests.
+    # CRITICAL: omega does NOT get goal_vel scaling. When LMP velocity_map
+    # outputs near-zero near obstacles ("slow to 5% within 30cm of human"),
+    # if omega were gated too, rotation collapses to ~0.05°/step and robot
+    # never faces the next waypoint. Translation gating by goal_vel is
+    # correct (safety = slow near obstacle); rotation gating is not.
+    KP_ROT = float(os.environ.get('CTRL_KP_ROT', '3.0'))
+    OMEGA_MAX = float(os.environ.get('CTRL_OMEGA_MAX', '0.3'))
+    # Incremental-rotate mode: cap omega to a very small value so per-step
+    # drift is sub-mm, letting alignment happen gradually alongside
+    # translation. Drift accumulated over the rotation is the same total,
+    # but spread across the motion → robot makes path progress meanwhile.
+    if os.environ.get('INCREMENTAL_ROTATE_ENABLED', '0') == '1':
+      OMEGA_MAX = float(os.environ.get('INCREMENTAL_OMEGA_MAX', '0.05'))
     action = np.zeros(3)
     action[0] = v_x * goal_vel * kp
     action[1] = v_y * goal_vel * kp
-    # action[2] sign: clean omega test confirmed action[2]=+1 → CCW (yaw
-    # increases via shortest signed angle). Earlier "−delta" flip was a
-    # misread caused by yaw wrapping at ±π. The original convention is
-    # correct: positive delta (need CCW) → positive action[2].
-    action[2] = delta_yaw * goal_vel * kp
+    action[2] = delta_yaw * KP_ROT
+    # OMEGA_GATING=1: when |delta_yaw| > threshold, send rotation-only
+    # ([0, 0, omega]); else translation-only ([v_x, v_y, 0]). Avoids
+    # omega+v_x interference (data: omega kills v_x to 30%).
+    if os.environ.get('OMEGA_GATING', '0') == '1':
+      _gate_rad = float(os.environ.get('OMEGA_GATING_THRESH_RAD', '0.087'))   # ~5°
+      if abs(delta_yaw) > _gate_rad:
+        action[0] = 0.0
+        action[1] = 0.0
+        # keep action[2] = delta_yaw * KP_ROT
+      else:
+        action[2] = 0.0
     # v26: rotate-first removed (v20 baseline). With NaN→cur_yaw default,
     # intermediate wps have delta_yaw=0 so rotate-first wouldn't trigger
     # anyway. Only the last wp uses target_ori (where delta_yaw can be big),
@@ -1325,7 +1804,10 @@ class NavigationLMPInterface():
       if _dxy_now <= Y6_TRANSLATION_SUPPRESS_DIST_M and abs(delta_yaw) > self._yaw_threshold:
         action[0] = 0.0
         action[1] = 0.0
-    action = np.clip(action, -1.0, 1.0)
+    # Asymmetric clip: translation can saturate at ±1.0 (25mm/step max),
+    # but rotation capped at ±OMEGA_MAX to limit per-step lateral drift.
+    action[:2] = np.clip(action[:2], -1.0, 1.0)
+    action[2] = float(np.clip(action[2], -OMEGA_MAX, OMEGA_MAX))
     return action, delta_yaw
 
   def _preprocess_avoidance_voxel_map(self, avoidance_map, affordance_map, movable_obs):
@@ -1350,7 +1832,7 @@ class NavigationLMPInterface():
     return avoidance_map
 
   def _preprocess_avoidance_pixel_map(self, avoidance_map, affordance_map, movable_obs,
-                                      robot_radius=0.35, r_scene_m=0.55, r_llm_m=0.32):
+                                      robot_radius=0.50, r_scene_m=0.55, r_llm_m=0.32):
     scene_collision_map = self._get_scene_collision_pixel_map()
     H, W = avoidance_map.shape
     # (A) Radii expressed in meters and converted to pixels via the actual cell
@@ -1495,9 +1977,12 @@ class NavigationLMPInterface():
     if wmax[0] - wmin[0] <= 0 or wmax[1] - wmin[1] <= 0:
       return None
 
+    # Note: 'standing_table' was previously excluded (manipulation-era
+    # assumption that the table is a worksurface). For navigation it is
+    # a real obstacle (0.88 m tall × 0.30 m radius) and must be in the
+    # collision map, so we no longer exclude it.
     exclude_patterns = ('robot0', 'mobilebase', 'gripper0', 'panda',
-                        'eef_target', '_target', 'world',
-                        'standing_table')
+                        'eef_target', '_target', 'world')
     exclude_body_ids = set()
     for i in range(model.nbody):
       n = (model.body_id2name(i) or '').lower()

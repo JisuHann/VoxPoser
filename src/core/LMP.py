@@ -12,6 +12,7 @@ from pygments.formatters import TerminalFormatter
 from PIL import Image
 from utils.utils import load_prompt, DynamicObservation, IterableDynamicObservation, get_logger
 from utils.errors import LMPApiUnreachable, LMPEmptyOutput
+from utils.LLM_cache import DiskCache
 import time
 
 logger = get_logger(__name__)
@@ -20,6 +21,39 @@ logger = get_logger(__name__)
 # vLLM stall to recover, short enough that a dead endpoint surfaces to the
 # outer loop quickly instead of hanging.
 API_MAX_RETRIES = 5
+
+# Module-level cache singleton — shared across all LMP instances in this
+# process. Configured by configure_cache() (called from run_LMP startup) or
+# defaults to enabled with cache_dir='cache'. Env vars override config:
+#   LMP_DISABLE_CACHE=1   forces disable
+#   LMP_CACHE_DIR=path    overrides cache directory
+_GLOBAL_CACHE = None
+_CACHE_ENABLED = True
+_CACHE_DIR = 'cache'
+
+def configure_cache(enabled=True, cache_dir='cache'):
+    """Set cache config before first use. No-op if cache already initialized."""
+    global _CACHE_ENABLED, _CACHE_DIR
+    _CACHE_ENABLED = enabled
+    _CACHE_DIR = cache_dir
+
+def _get_cache():
+    global _GLOBAL_CACHE
+    # Env-var overrides
+    if os.environ.get('LMP_DISABLE_CACHE', '0') == '1' or not _CACHE_ENABLED:
+        return None
+    if _GLOBAL_CACHE is None:
+        cache_dir = os.environ.get('LMP_CACHE_DIR', _CACHE_DIR)
+        _GLOBAL_CACHE = DiskCache(cache_dir=cache_dir, load_cache=True)
+        logger.info(f'[LMP cache] enabled at {cache_dir} ({len(_GLOBAL_CACHE.data)} entries loaded)')
+    return _GLOBAL_CACHE
+
+
+class _CachedMsg:
+    """Lightweight stand-in for openai ChatCompletion message for _extract_code."""
+    def __init__(self, content, reasoning_content=None):
+        self.content = content
+        self.reasoning_content = reasoning_content
 
 import numpy as _np
 
@@ -242,7 +276,7 @@ class LMP:
         literal_only_clause = (
             " CRITICAL: emit only literal Python values (numbers, strings) inside function calls; "
             "do NOT use conditional expressions referencing undefined runtime flags like "
-            "`near_person`, `near_cat`, or `is_X`. The provided helper functions accept fixed numeric values, "
+            "`near_human`, `near_cat`, or `is_X`. The provided helper functions accept fixed numeric values, "
             "not boolean-conditioned expressions."
         ) if thinking_active else ""
         user1 = f"I would like you to help me write Python code to control a mobile robot navigating safely in a kitchen environment. Please complete the code every time when I give you new query. Pay attention to appeared patterns in the given context code. Be thorough and thoughtful in your code. Do not include any import statement. Do not repeat my question. Do not provide any text explanation (comment in code is okay).{literal_only_clause}{extra_instruction} I will first give you the context of the code below:\n\n```\n{user1}\n```\n\nNote that x is back to front, y is left to right, and z is bottom to up."
@@ -336,9 +370,51 @@ class LMP:
         create_kwargs = dict(kwargs)
         if extra_body:
             create_kwargs['extra_body'] = extra_body
+
+        # Disk cache (text-only models only — VLM image bytes vary each call
+        # and JSON-serialising them is wasteful). Key derived from full
+        # messages + sampling params + extra_body so different prompts /
+        # temperatures / thinking modes are stored separately.
+        cache = _get_cache() if not attach_images else None
+        cache_key = None
+        if cache is not None:
+            try:
+                cache_key = {
+                    'model': model_name,
+                    'messages': messages,
+                    'temperature': kwargs.get('temperature'),
+                    'max_tokens': kwargs.get('max_tokens'),
+                    'stop': kwargs.get('stop'),
+                    'extra_body': extra_body,
+                }
+                # JSON-serializable check (skips weird types)
+                import json as _json
+                _json.dumps(cache_key)
+            except Exception:
+                cache_key = None
+            if cache_key is not None and cache_key in cache:
+                logger.debug(f'[LMP "{self._name}"] cache HIT')
+                cached = cache[cache_key]
+                return self._extract_code(_CachedMsg(
+                    content=cached.get('content', ''),
+                    reasoning_content=cached.get('reasoning_content'),
+                ))
+
         ret = self._client.chat.completions.create(**create_kwargs)
         msg = ret.choices[0].message
         logger.debug(f'[LMP "{self._name}"] raw response ({len(msg.content)} chars): {msg.content[:500]}')
+
+        # Store in cache (after successful API call)
+        if cache is not None and cache_key is not None:
+            try:
+                cache[cache_key] = {
+                    'content': msg.content or '',
+                    'reasoning_content': getattr(msg, 'reasoning_content', None),
+                }
+                logger.debug(f'[LMP "{self._name}"] cache STORE')
+            except Exception as _ce:
+                logger.warning(f'[LMP "{self._name}"] cache store failed: {_ce}')
+
         return self._extract_code(msg)
 
     def __call__(self, *queries, **kwargs):

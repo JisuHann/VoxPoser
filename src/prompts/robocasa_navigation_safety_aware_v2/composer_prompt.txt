@@ -5,6 +5,13 @@ from plan_utils import get_affordance_map, get_avoidance_map, get_velocity_map, 
 # NOTE — your role:
 #   Translate the natural-language query into concrete arguments for the maps.
 #
+# NOTE — object grounding:
+#   The query may reference objects by placeholder names (object_1,
+#   object_2, ...) or by their actual scene names. Pass each name through
+#   verbatim into the map queries — e.g. get_avoidance_map('30cm from
+#   object_1') — so the downstream map LMP can call parse_query_obj on
+#   the real scene object.
+#
 # NOTE — value ranges:
 #   distance: minimum 0, maximum 80 cm.
 #   velocity: minimum 0, maximum 2 (1 = nominal speed). Express it as a
@@ -30,48 +37,43 @@ from plan_utils import get_affordance_map, get_avoidance_map, get_velocity_map, 
 #   emitting an empty or unnecessary one.
 
 # Query: move to the goal.
-# Reasoning: no obstacle, slowdown, or rotation in the query. Only the
-# affordance map is emitted.
+# Reasoning: no obstacle or constraint mentioned — only affordance map needed.
 movable = parse_query_obj('mobile_base')
-affordance_map = get_affordance_map('a point 25cm in front of the goal')
+affordance_map = get_affordance_map('the goal')
 execute_navigation(movable, affordance_map=affordance_map)
 
-# Query: move to the goal while passing right next to the obstacle and slowing down significantly when near it.
-# Reasoning: the obstacle is a moving presence. Distance: wide.
-# Velocity: strongly reduced when near it.
+# Query: move to the goal while passing right next to object_1 and slowing down significantly when near it.
+# Reasoning: query requests wide clearance of object_1 and strong slowdown near the object_1.
 movable = parse_query_obj('mobile_base')
-affordance_map = get_affordance_map('a point 20cm in front of the goal')
-avoidance_map = get_avoidance_map('70cm from the obstacle')
-velocity_map = get_velocity_map('slow down to 30% velocity within 60cm of the obstacle')
+affordance_map = get_affordance_map('the goal')
+avoidance_map = get_avoidance_map('70cm from object_1')
+velocity_map = get_velocity_map('slow down to 30% velocity within 60cm of object_1')
 execute_navigation(movable, affordance_map=affordance_map,
                    avoidance_map=avoidance_map, velocity_map=velocity_map)
 
-# Query: move to the goal while keeping at least 40cm from the obstacle and slowing down when near it.
-# Reasoning: the obstacle is delicate. Distance: moderate.
-# Velocity: eased when near it.
+# Query: move to the goal while keeping at least 40cm from object_1 and slowing down when near it.
+# Reasoning: query specifies moderate clearance of object_1 and reduced speed nearby object_1.
 movable = parse_query_obj('mobile_base')
-affordance_map = get_affordance_map('a point 25cm in front of the goal')
-avoidance_map = get_avoidance_map('40cm from the obstacle')
-velocity_map = get_velocity_map('slow down to 60% velocity within 40cm of the obstacle')
+affordance_map = get_affordance_map('the goal')
+avoidance_map = get_avoidance_map('40cm from object_1')
+velocity_map = get_velocity_map('slow down to 60% velocity within 40cm of object_1')
 execute_navigation(movable, affordance_map=affordance_map,
                    avoidance_map=avoidance_map, velocity_map=velocity_map)
 
-# Query: move to the goal while staying clear of the obstacle.
-# Reasoning: the obstacle occupies its space dynamically. Distance: wide.
-# Velocity: reduced when near it.
+# Query: move to the goal while staying clear of object_1.
+# Reasoning: query requests wide clearance of object_1 and small speed reduce nearby object_1.
 movable = parse_query_obj('mobile_base')
-affordance_map = get_affordance_map('a point 30cm in front of the goal')
-avoidance_map = get_avoidance_map('60cm from the obstacle')
-velocity_map = get_velocity_map('slow down to 30% velocity within 60cm of the obstacle')
+affordance_map = get_affordance_map('the goal')
+avoidance_map = get_avoidance_map('60cm from object_1')
+velocity_map = get_velocity_map('slow down to 30% velocity within 60cm of object_1')
 execute_navigation(movable, affordance_map=affordance_map,
                    avoidance_map=avoidance_map, velocity_map=velocity_map)
 
-# Query: move to the goal while avoiding the obstacle as much as possible and speeding up where the path is open.
-# Reasoning: the obstacle is solid. Distance: small.
-# Velocity: nominal nearby, faster in the open stretch.
+# Query: move to the goal while avoiding object_1 as much as possible and speeding up where the path is open.
+# Reasoning: query requests minimal avoidance of object_1 and faster speed in open space from object_1.
 movable = parse_query_obj('mobile_base')
-affordance_map = get_affordance_map('a point 25cm in front of the goal')
-avoidance_map = get_avoidance_map('10cm from the obstacle')
-velocity_map = get_velocity_map('150% velocity in the open area away from the obstacle')
+affordance_map = get_affordance_map('the goal')
+avoidance_map = get_avoidance_map('10cm from object_1')
+velocity_map = get_velocity_map('150% velocity in the open area away from object_1')
 execute_navigation(movable, affordance_map=affordance_map,
                    avoidance_map=avoidance_map, velocity_map=velocity_map)

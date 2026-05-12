@@ -21,7 +21,7 @@ EXCLUDED_BODY_PREFIXES = [
 ]
 TABLE_ALIAS =["table", "cutting", "window",'stack', 'wall', 'utensil']
 MOBILE_ALIAS = {
-    "posed": "person",
+    "posed": "human",                 # unified naming: posed_human fixture → 'human' for LLM
     "mobilebase0": "robot_mobile_base",
     "coffee": "coffee_machine",
     # 'door' intentionally not mapped — LLM sees 'door', name2ids['door'] has geom IDs directly
@@ -33,13 +33,13 @@ LLM_QUERY_ALIASES = {
 
 # Semantic grouping: collapse fine-grained kitchen furniture into a single
 # 'kitchen' label so the LLM sees a shorter, semantically meaningful object
-# list. Safety obstacles (cat/dog/person/wine/...) and navigation targets
+# list. Safety obstacles (cat/dog/human/wine/...) and navigation targets
 # (sink/fridge/oven/...) stay individual because they matter for avoidance
 # and goal selection. detect('kitchen') falls back to a UNION point cloud
 # of every furniture sub-name (handled in modules/interfaces.py).
 SEMANTIC_GROUP = {
     # safety obstacles — keep individual
-    'cat': 'cat', 'dog': 'dog', 'person': 'person',
+    'cat': 'cat', 'dog': 'dog', 'person': 'human',
     'crawling_baby': 'crawling_baby',
     'wine': 'wine', 'glass_of_water': 'glass_of_water',
     'hot_chocolate': 'hot_chocolate', 'vase': 'vase',
@@ -321,9 +321,9 @@ class VoxPoserRobocasa():
         obs_type = getattr(self.env, 'obstacle', None)
         if obs_type:
             if obs_type == 'human':
-                # 'human' obstacle reuses the posed_person fixture (no separate
+                # 'human' obstacle reuses the posed_human fixture (no separate
                 # obstacle_* body is spawned in kitchen_navigate_safe.py:580).
-                # Alias 'human' to the posed_person geoms so parse_query_obj('human')
+                # Alias 'human' to the posed_human geoms so parse_query_obj('human')
                 # resolves correctly.
                 posed_ids = self.name2ids.get('posed') or []
                 if posed_ids:
@@ -475,7 +475,7 @@ class VoxPoserRobocasa():
                 logger.warning(f"topview camera adjust failed: {_cam_err}")
 
     # Default cameras for VLM: top-down, front view, agent center, human 1st-person
-    _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_person_main_group_1stview']
+    _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_human_main_group_1stview']
     # Cameras whose per-step frames we record into mp4 for downstream review.
     # Includes the legacy `robot0_agentview_left` so older runs remain reproducible.
     VIDEO_RECORD_CAMERAS = tuple(_DEFAULT_VLM_CAMERAS) + ('robot0_agentview_left',)
@@ -647,13 +647,13 @@ class VoxPoserRobocasa():
             flip_indices = np.dot(cam_normals, self.lookat_vectors[cam]) > 0
             cam_normals[flip_indices] *= -1
             normals.append(cam_normals)
-            logger.info(f"[DEBUG] cam={cam}: pc={points[-1].shape}, img={colors[-1].shape}, mask={masks[-1].shape}, normals={cam_normals.shape}")
+            logger.debug(f"cam={cam}: pc={points[-1].shape}, img={colors[-1].shape}, mask={masks[-1].shape}, normals={cam_normals.shape}")
 
         points = np.concatenate(points, axis=0)
         colors = np.concatenate(colors, axis=0)
         masks = np.concatenate(masks, axis=0)
         normals = np.concatenate(normals, axis=0)
-        logger.info(f"[DEBUG] points={points.shape}, colors={colors.shape}, masks={masks.shape}, normals={normals.shape}")
+        logger.debug(f"points={points.shape}, colors={colors.shape}, masks={masks.shape}, normals={normals.shape}")
     
         # Set workspace bound min/max at initial stage
         if query_name is None:
@@ -1108,7 +1108,7 @@ class VoxPoserRobocasa():
         gripper_open = gripper_qpos[0]>0.04
         return 1 if gripper_open else -1
 
-    def _get_person_pos(self):
+    def _get_human_pos(self):
         """Get the person's torso position if a PosedPerson fixture exists."""
         from robocasa.models.fixtures.human import PosedPerson
         for fxtr in self.env.fixtures.values():
