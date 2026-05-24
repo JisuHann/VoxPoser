@@ -129,21 +129,121 @@ prompt can be the plain `default_system_prompt.txt` or the
 `safety_aware_system_prompt.txt` which instructs the model to scale
 clearance and speed by inferred obstacle character.
 
+## Pure-pursuit navigator (current default)
+
+Since 2026-05-24 the default `NAV_MODE` is **`pure_pursuit`** with
+**replan + 4-direction escape**. A lookahead target slides
+continuously along the path, the projection cursor only moves forward
+(no U-shape teleports), and a workspace-bounds guard aborts the
+episode if the controller diverges. When stuck, a donut wedge marker
+(core 0.15 m free, outer 0.5 m blocked) triggers a replan; if that
+also stalls, the robot tries 4 escape directions and picks the
+first-improvement one. All knobs default to the best-config values
+from the 2026-05-24 sweep — `env` overrides exist but you don't have
+to set anything to get the recommended setup.
+
+| env var | default | meaning |
+|---|---|---|
+| `NAV_MODE` | `pure_pursuit` | navigator (legacy: `holonomic`, `translate_only`, `holo_seq`, `holo_cont`) |
+| `PP_LOOKAHEAD_M` | `0.5` | lookahead distance (m) along the projected path |
+| `PP_REPLAN_MAX` | `4` | max replan attempts before aborting |
+| `PP_GOAL_TOL` | `0.25` | goal-reached threshold (m), controller-side |
+| `PP_STUCK_GOAL_R` | `0.6` | "stuck near goal" radius (m) — treat as arrived |
+| `PP_DECEL_R` | `0.4` | start decelerating within this radius of the goal (m) |
+| `PP_TURN_SLOW` | `100` | turn-priority slowdown gain (high = strong slowdown when yawing) |
+| `PP_ESCAPE_ENABLED` | `1` | toggle 4-direction first-improvement escape |
+| `PP_OMEGA_MAX` | `0.1` | max angular velocity (rad/step) |
+| `START_CLEAR_CELLS` | `2` | start-clear disk radius (cells) — keeps real counters in the map |
+| `ROBOT_FOOTPRINT_Z_MAX` | `0.6` | robot footprint height cap (m) |
+
+LMP cache and Voxposer outputs:
+
+```
+src/cache/                                    # disk LMP result cache (delete to invalidate)
+outputs/<run_name>/                           # one dir per evaluation run
+├── layout{0..9}/
+│   └── NavigateKitchen<obstacle><mode>Route<X>/
+│       ├── run.log                           # full per-task log (SUCCESS/FAILURE line at end)
+│       ├── task_info.json                    # per-task summary (success, viol, lmp_output)
+│       ├── trajectory_log.json               # robot trajectory, obstacle distance history
+│       ├── voxposer_overview.png             # final map composition + path
+│       ├── initial_topview.png               # scene snapshot
+│       ├── voxposer_dump.npz                 # raw maps + planner output
+│       └── *_image.mp4                       # per-camera videos
+├── results.json                              # aggregated summary (last worker to exit writes)
+└── setup_w*.log                              # per-worker setup log
+```
+
 ## Quick start
 
 ```shell
-# 1. start a vLLM server on the host
-vllm serve Qwen/Qwen3-4B-Instruct-2507 --port 8003 --max-model-len 16384
+# 1. start a vLLM server on the host (Qwen3-14B example, port 8000, TP=2)
+CUDA_VISIBLE_DEVICES=0,1 python3 -m vllm.entrypoints.openai.api_server \
+  --model Qwen/Qwen3-14B \
+  --served-model-name Qwen/Qwen3-14B \
+  --port 8000 \
+  --tensor-parallel-size 2 \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --trust-remote-code
 
-# 2. inside the robocasa docker container, run an eval
-python3 src/run_LMP.py \
-    -m Qwen/Qwen3-4B-Instruct-2507 -p 8003 \
+# 2. inside the robocasa docker container, run an eval — no PPENV needed,
+#    defaults are already the best config (LH=0.5, replan=4, escape on, …)
+docker exec -it robocasa-eval-0 bash
+cd /workspace/policy/Voxposer
+MUJOCO_GL=egl python3 src/run_LMP.py \
+    -m Qwen/Qwen3-14B -p 8000 -w 0 \
+    -o outputs/smoke \
+    --system-prompt default --few-shot default \
+    --layout-ids 0 --style-ids 3 \
+    NavigateKitchenCatBlockingRouteA
+```
+
+A small 4-B Qwen3 also works (TP=1 is enough):
+
+```shell
+vllm serve Qwen/Qwen3-4B-Instruct-2507 --port 8003 --max-model-len 16384
+docker exec robocasa-eval-0 bash -c "
+  cd /workspace/policy/Voxposer && MUJOCO_GL=egl \
+  python3 src/run_LMP.py -m Qwen/Qwen3-4B-Instruct-2507 -p 8003 -w 0 \
     --system-prompt default --few-shot default \
     --layout-ids 0 --style-ids 3
+"
 ```
 
 LMP-only mode (no physics rollout — useful for prompt ablation) is
 enabled with `--lmp-only`.
+
+## Multi-container parallel evaluation (6 docker workers)
+
+Each container has a dedicated MuJoCo framebuffer, so one task at a
+time per container. With six `robocasa-eval-0..5` containers, you can
+run 6 workers in parallel against a single host vLLM:
+
+```shell
+# tasks for a single layout (write 1 task per line, 150 lines for a full sweep)
+cat > /tmp/task_list.txt <<'EOF'
+NavigateKitchenCatBlockingRouteA
+NavigateKitchenCatBlockingRouteB
+# ... 150 tasks total
+EOF
+TASKS=$(cat /tmp/task_list.txt | tr '\n' ' ')
+
+for idx in 0 1 2 3 4 5; do
+  docker exec -d robocasa-eval-$idx bash -c "
+    cd /workspace/policy/Voxposer && OMP_NUM_THREADS=8 MUJOCO_GL=egl \
+    python3 src/run_LMP.py -m Qwen/Qwen3-14B -p 8000 -w $idx \
+      -o outputs/sweep --system-prompt default --few-shot default \
+      --layout-ids $idx --style-ids 3 $TASKS \
+      > /tmp/sweep_d${idx}.log 2>&1
+  "
+done
+```
+
+A 5-layout × 6-shard wave script (used for the 690-task prompt
+ablation in `robotics-safety/scripts/_pp_bench_690.sh`) is the
+recommended template if you want a sequential layout-by-layout sweep
+that fully utilises all six workers.
 
 ## CLI knobs that change behaviour
 
