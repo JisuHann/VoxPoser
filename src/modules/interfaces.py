@@ -59,7 +59,7 @@ class NavigationLMPInterface():
     # translate_only (rotate-first toward lookahead wp, then forward-only).
     # NAV_MODE env-var overrides config.
     self._nav_mode = os.environ.get('NAV_MODE', nav_controller_config.get('mode', 'holonomic'))
-    assert self._nav_mode in ('holonomic', 'translate_only', 'holo_seq', 'holo_cont'), f"unknown nav_mode: {self._nav_mode}"
+    assert self._nav_mode in ('holonomic', 'translate_only', 'holo_seq', 'holo_cont', 'pure_pursuit'), f"unknown nav_mode: {self._nav_mode}"
     # When True, parse_query_obj() / detect() auto-resolve fixture queries
     # (coffee_machine, sink, stove, ...) to fixture.pos instead of the
     # visible point-cloud centroid. Default True — flip to False to
@@ -484,9 +484,15 @@ class NavigationLMPInterface():
         #     progress toward wp while rotating.
         #  Default holonomic without flags = same as rotate-first.
         _incremental_rotate = os.environ.get('INCREMENTAL_ROTATE_ENABLED', '0') == '1'
+        # pure_pursuit rotates incrementally inside its own pursuit loop (small
+        # per-step omega → sub-mm coupling drift). The legacy rotate-first
+        # BURST below spins in place with no translation compensation → drifts
+        # ~2.5mm/° (148° turn → ~0.37m), shoving the robot into a wall before
+        # the pursuit loop even starts. Never run the burst in pure_pursuit.
         _rotate_first_enabled = (
             not _incremental_rotate
             and os.environ.get('ROTATE_FIRST_ENABLED', '1') == '1'
+            and self._nav_mode != 'pure_pursuit'
         )
         if _rotate_first_enabled and len(traj_world) >= 2:
           # rotate-first targets the NEXT SEGMENT direction (wp[1]→wp[2]) so the
@@ -718,6 +724,324 @@ class NavigationLMPInterface():
             break
           continue   # skip the legacy wp-iteration loop below
         # === End Option A ===
+
+        # === PURE-PURSUIT mode (NAV_MODE=pure_pursuit) ===
+        # Replaces the discrete waypoint-by-waypoint follower. A lookahead
+        # target slides CONTINUOUSLY along the path: each step the robot is
+        # projected onto the path polyline, and the target is a point
+        # PP_LOOKAHEAD_M of arc length ahead. There is no "reach waypoint i"
+        # state → no waypoint-stuck, no overshoot reversal (the projection
+        # always finds where the robot actually is), and smooth tracking on
+        # curved / U-shaped detour paths. A workspace-bounds guard aborts the
+        # episode if the controller diverges off the map (the F0 blowup).
+        if self._nav_mode == 'pure_pursuit':
+          _path_xy = np.array([np.asarray(w[0])[:2] for w in traj_world], dtype=float)
+          _final_xy = _path_xy[-1]
+          _fy = np.asarray(traj_world[-1][1])
+          _final_yaw = float(_fy.item()) if _fy.size == 1 and np.isfinite(_fy.item()) else None
+          _Ld      = float(os.environ.get('PP_LOOKAHEAD_M', '0.6'))
+          _pp_kp   = float(os.environ.get('PP_KP', '6.0'))
+          # #29 REPLAN: when stuck FAR from goal, try replanning from current
+          # position before aborting. Max replans capped to avoid infinite loop.
+          _pp_replan_count = 0
+          _pp_replan_max   = int(os.environ.get('PP_REPLAN_MAX', '3'))
+          # incremental rotation: small omega cap → per-step rotation tiny →
+          # rotation-translation coupling drift is sub-mm AND continuously
+          # corrected by the pursuit loop (no uncorrected rotate-first burst).
+          _omega_max = float(os.environ.get('PP_OMEGA_MAX', '0.1'))
+          _kp_rot  = float(os.environ.get('CTRL_KP_ROT', '3.0'))
+          _succ_thr = float(os.environ.get('PP_GOAL_TOL', '0.45'))
+          _ws_min = np.asarray(self._env.workspace_bounds_min[:2], dtype=float)
+          _ws_max = np.asarray(self._env.workspace_bounds_max[:2], dtype=float)
+          # PP_STEP_CAP_MULT (default 0.5) halves the cap to bound wedge-case
+          # runtime. Successful tasks median ~150 step, max ~500 step → 0.5×
+          # (cap ~300-700) leaves margin while cutting wedge cap from 1400→700.
+          _pp_max_steps = int(self._max_steps_per_waypoint *
+                              max(len(traj_world), 6) *
+                              float(os.environ.get('PP_STEP_CAP_MULT', '0.5')))
+          _pp_start = step_idx
+          # Monotonic projection cursor: the closest-segment search is
+          # restricted to [_last_k, _last_k + PP_PROJ_WINDOW] and _last_k
+          # only increases. A global closest-segment search teleports
+          # across U-shaped detour paths (the far side of the U is
+          # Euclidean-close to the near side) → the lookahead jumps the
+          # robot straight across the obstacle. Forward-windowed search
+          # keeps the projection advancing along the path.
+          _last_k = 0
+          _proj_win = int(os.environ.get('PP_PROJ_WINDOW', '12'))
+          # stuck detection: robot blocked by wall/counter (NOT in the
+          # obstacle-avoid list, so min_obstacle_distance stays large) →
+          # pure-pursuit commands full-forward forever. Detect no-progress
+          # and either treat as arrived (near goal) or abort (far).
+          _stuck_win = int(os.environ.get('PP_STUCK_WIN', '40'))
+          _stuck_eps = float(os.environ.get('PP_STUCK_EPS', '0.04'))
+          _stuck_goal_r = float(os.environ.get('PP_STUCK_GOAL_R', '0.7'))
+          _pos_hist = []
+          # rotate-first: align to the goal heading IN PLACE before travel.
+          # During travel omega then stays ~0 → no rotation-translation
+          # coupling drift (the big initial turn otherwise smears the
+          # body-frame translation, accumulating ~0.5m cross-track error).
+          if os.environ.get('PP_ROTATE_FIRST', '0') == '1' and _final_yaw is not None:
+            for _rf in range(int(os.environ.get('PP_ROTATE_FIRST_MAX', '500'))):
+              _rfo = self._env.env._get_observations()
+              _rfq = _rfo['robot0_base_quat']
+              _rfy = quat2euler([_rfq[3], _rfq[0], _rfq[1], _rfq[2]])[2]
+              _rfd = (_final_yaw - _rfy + np.pi) % (2 * np.pi) - np.pi
+              if abs(_rfd) <= self._yaw_threshold:
+                logger.info(f'[pure-pursuit] rotate-first done @ step {step_idx} '
+                            f'({_rf} steps, rem={np.degrees(_rfd):+.1f}deg)')
+                break
+              _rfa = np.array([0.0, 0.0,
+                               float(np.clip(_rfd * _kp_rot, -_omega_max, _omega_max))])
+              _rfci = self._nav_controller.execute(_rfa)
+              _rfci['controller_step'] = step_idx
+              for _vc in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
+                _k = f"{_vc}_image"
+                if _k in _rfci['mp_info'][0]:
+                  _rfci[_k] = _rfci['mp_info'][0][_k][::-1]
+              controller_infos[step_idx] = _rfci
+              step_idx += 1
+          pbar = tqdm(total=_pp_max_steps, desc='pure-pursuit')
+          while True:
+            _obs = self._env.env._get_observations()
+            _cur = np.asarray(_obs['robot0_base_pos'][:2], dtype=float)
+            _q = _obs['robot0_base_quat']
+            _cyaw = quat2euler([_q[3], _q[0], _q[1], _q[2]])[2]
+            # workspace-bounds abort guard (F0 blowup containment)
+            if (_cur[0] < _ws_min[0] - 1.0 or _cur[0] > _ws_max[0] + 1.0 or
+                _cur[1] < _ws_min[1] - 1.0 or _cur[1] > _ws_max[1] + 1.0):
+              logger.warning(f'[pure-pursuit] robot left workspace ({_cur[0]:.2f},'
+                             f'{_cur[1]:.2f}) — abort episode')
+              break
+            if (step_idx - _pp_start) >= _pp_max_steps:
+              logger.info('[pure-pursuit] step cap reached')
+              break
+            # arrived = within _succ_thr of path end, OR stuck near goal
+            # (blocked by wall/counter — robot cannot get physically closer).
+            _pos_hist.append(_cur.copy())
+            if len(_pos_hist) > _stuck_win:
+              _pos_hist.pop(0)
+            _d_final = float(np.linalg.norm(_cur - _final_xy))
+            _arrived = _d_final <= _succ_thr
+            if (not _arrived) and len(_pos_hist) >= _stuck_win:
+              _moved = max(float(np.linalg.norm(_cur - _p)) for _p in _pos_hist)
+              if _moved < _stuck_eps:
+                if _d_final <= _stuck_goal_r:
+                  logger.info(f'[pure-pursuit] stuck near goal @ step {step_idx} '
+                              f'(moved {_moved:.3f}m/{_stuck_win}st, d_final={_d_final:.2f}) '
+                              f'— treat as arrived')
+                  _arrived = True
+                else:
+                  # #29 REPLAN v2: stuck FAR → mark current robot position as
+                  # obstacle in avoidance map (so A* won't route through this
+                  # wedge spot again), then replan. Without wedge-marker, naive
+                  # replan generates the same path → robot stucks again.
+                  if _pp_replan_count < _pp_replan_max:
+                    # ESCAPE (#34 v3 first-improvement): try each direction in
+                    # turn (back, forward, left, right). Break on FIRST direction
+                    # that improves d_final by >= PP_ESCAPE_IMPROVE_M (default
+                    # 0.1m). If none improve, fall through with robot at final
+                    # tried position. Avoids cycling-mode regression where each
+                    # replan picks single (sometimes wrong) direction.
+                    if os.environ.get('PP_ESCAPE_ENABLED', '0') == '1':
+                      _esc_dirs = [
+                          ('back',    -1.0,  0.0),
+                          ('forward',  1.0,  0.0),
+                          ('left',     0.0,  1.0),
+                          ('right',    0.0, -1.0),
+                      ]
+                      _esc_speed = float(os.environ.get('PP_ESCAPE_SPEED', '0.5'))
+                      _esc_steps_per_dir = int(os.environ.get('PP_ESCAPE_STEPS', '20'))
+                      _esc_improve_thresh = float(os.environ.get('PP_ESCAPE_IMPROVE_M', '0.1'))
+                      _d_orig = float(np.linalg.norm(_cur - _final_xy))
+                      _d_baseline = _d_orig
+                      _esc_chosen = None
+                      for _dir_name, _esc_dx, _esc_dy in _esc_dirs:
+                        _esc_vx = _esc_dx * _esc_speed
+                        _esc_vy = _esc_dy * _esc_speed
+                        for _es in range(_esc_steps_per_dir):
+                          _esc_act = np.array([_esc_vx, _esc_vy, 0.0])
+                          _ci = self._nav_controller.execute(_esc_act)
+                          _ci['controller_step'] = step_idx
+                          for _vc in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
+                            _k = f"{_vc}_image"
+                            if _k in _ci['mp_info'][0]:
+                              _ci[_k] = _ci['mp_info'][0][_k][::-1]
+                          controller_infos[step_idx] = _ci
+                          step_idx += 1
+                        _obs = self._env.env._get_observations()
+                        _cur = np.asarray(_obs['robot0_base_pos'][:2], dtype=float)
+                        _d_after = float(np.linalg.norm(_cur - _final_xy))
+                        _improv = _d_baseline - _d_after
+                        logger.info(f'[pure-pursuit] ESCAPE dir={_dir_name}: d_final '
+                                    f'{_d_baseline:.2f} → {_d_after:.2f} ({_improv:+.2f}m)')
+                        if _improv >= _esc_improve_thresh:
+                          _esc_chosen = _dir_name
+                          logger.info(f'[pure-pursuit] ESCAPE chose {_esc_chosen} '
+                                      f'(orig d={_d_orig:.2f} → {_d_after:.2f}, replan next)')
+                          break
+                        _d_baseline = _d_after
+                      if _esc_chosen is None:
+                        logger.warning(f'[pure-pursuit] ESCAPE all 4 dirs failed to improve '
+                                       f'(orig {_d_orig:.2f} → {_d_baseline:.2f}); replan anyway')
+                    try:
+                      _robot_obs = self.detect('robot_mobile_base')
+                      _cur_grid = np.asarray(_robot_obs['position'])[:2]
+                      # Build augmented avoid map: copy + disk obstacle at robot pos
+                      _avoid_aug = np.asarray(_cached_avoid).copy()
+                      _Ha, _Wa = _avoid_aug.shape
+                      _wmin = np.asarray(self._env.workspace_bounds_min[:2], float)
+                      _wmax = np.asarray(self._env.workspace_bounds_max[:2], float)
+                      _sx_m = (_wmax[0]-_wmin[0])/_Wa; _sy_m = (_wmax[1]-_wmin[1])/_Ha
+                      _cr = int((_cur[1]-_wmin[1])/_sy_m)
+                      _cc = int((_cur[0]-_wmin[0])/_sx_m)
+                      _wedge_r_m = float(os.environ.get('PP_REPLAN_WEDGE_R', '0.5'))
+                      _wedge_core_m = float(os.environ.get('PP_REPLAN_WEDGE_CORE', '0.15'))
+                      _wedge_cells = max(1, int(_wedge_r_m / ((_sx_m+_sy_m)/2)))
+                      _core_cells = max(1, int(_wedge_core_m / ((_sx_m+_sy_m)/2)))
+                      _yy, _xx = np.ogrid[:_Ha, :_Wa]
+                      _dist_sq = (_yy-_cr)**2 + (_xx-_cc)**2
+                      # DONUT: inner core stays free (A* start unblocked),
+                      # outer ring blocked (force replan to avoid wedge area).
+                      _wm = (_dist_sq <= _wedge_cells**2) & (_dist_sq > _core_cells**2)
+                      _avoid_aug[_wm] = 1.0
+                      logger.info(f'[pure-pursuit] REPLAN v3: donut wedge marker '
+                                  f'(core={_wedge_core_m}m, outer={_wedge_r_m}m, '
+                                  f'cells {_core_cells}-{_wedge_cells}) at robot pos px({_cr},{_cc})')
+                      _new_path, _ = self._planner.navigation_optimize(
+                          _cur_grid, _cached_aff, _avoid_aug,
+                          robot_radius_cells=_cached_rr)
+                      if _new_path is not None and len(_new_path) > 1:
+                        _new_traj = self._path2traj_navigation(
+                            _new_path, _cached_avoid, _cached_rot_map, _cached_vel_map)
+                        if len(_new_traj) > 1:
+                          traj_world = _new_traj
+                          _path_xy = np.array([np.asarray(w[0])[:2] for w in traj_world], dtype=float)
+                          _final_xy = _path_xy[-1]
+                          _fy = np.asarray(traj_world[-1][1])
+                          _final_yaw = float(_fy.item()) if _fy.size == 1 and np.isfinite(_fy.item()) else None
+                          _last_k = 0
+                          _pos_hist = []
+                          _pp_replan_count += 1
+                          logger.info(f'[pure-pursuit] REPLAN #{_pp_replan_count} @ step '
+                                      f'{step_idx} (d_final was {_d_final:.2f}m, '
+                                      f'new path {len(_path_xy)} wps, '
+                                      f'new end ({_final_xy[0]:.2f},{_final_xy[1]:.2f}))')
+                          continue
+                    except Exception as _re:
+                      logger.warning(f'[pure-pursuit] replan exception: {_re}')
+                  logger.warning(f'[pure-pursuit] stuck FAR from goal @ step '
+                                 f'{step_idx} (d_final={_d_final:.2f}m) — abort '
+                                 f'(replan {_pp_replan_count}/{_pp_replan_max} exhausted)')
+                  break
+            # arrived → align final yaw, then stop
+            if _arrived:
+              if _final_yaw is not None:
+                _dy = (_final_yaw - _cyaw + np.pi) % (2 * np.pi) - np.pi
+                if abs(_dy) > self._yaw_threshold:
+                  _act = np.array([0.0, 0.0,
+                                   float(np.clip(_dy * _kp_rot, -_omega_max, _omega_max))])
+                  _ci = self._nav_controller.execute(_act)
+                  _ci['controller_step'] = step_idx
+                  for _vc in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
+                    _k = f"{_vc}_image"
+                    if _k in _ci['mp_info'][0]:
+                      _ci[_k] = _ci['mp_info'][0][_k][::-1]
+                  controller_infos[step_idx] = _ci
+                  step_idx += 1
+                  pbar.update(1)
+                  continue
+              logger.info(f'[pure-pursuit] goal reached @ step {step_idx}')
+              break
+            # 1) project robot onto path polyline → closest segment (k, t),
+            #    searched forward-only within [_last_k, _last_k+PP_PROJ_WINDOW]
+            _bk, _bt, _bd = _last_k, 0.0, 1e9
+            _k_hi = min(len(_path_xy) - 1, _last_k + _proj_win)
+            for _k in range(_last_k, _k_hi):
+              _a, _b = _path_xy[_k], _path_xy[_k + 1]
+              _ab = _b - _a
+              _L2 = float(_ab.dot(_ab))
+              _t = 0.0 if _L2 < 1e-9 else float(np.clip((_cur - _a).dot(_ab) / _L2, 0.0, 1.0))
+              _d = float(np.linalg.norm(_cur - (_a + _t * _ab)))
+              if _d < _bd:
+                _bk, _bt, _bd = _k, _t, _d
+            _last_k = _bk   # monotonic — projection only advances
+            # 2) lookahead point: walk PP_LOOKAHEAD_M of arc length forward
+            _remain = _Ld
+            _li, _lt = _bk, _bt
+            _look = _final_xy.copy()
+            while _li < len(_path_xy) - 1:
+              _a, _b = _path_xy[_li], _path_xy[_li + 1]
+              _seg = _b - _a
+              _seglen = float(np.linalg.norm(_seg))
+              _avail = _seglen * (1.0 - _lt)
+              if _avail >= _remain:
+                _look = _a + _seg * (_lt + _remain / max(_seglen, 1e-9))
+                break
+              _remain -= _avail
+              _li += 1
+              _lt = 0.0
+            # 3) holonomic action toward lookahead.
+            #    The robot is HOLONOMIC (independent vx,vy — motion-audit
+            #    confirmed). It does NOT need to face its motion direction.
+            #    → translation (vx,vy) follows the path in ANY direction;
+            #      rotation (omega) tracks only the FINAL goal heading.
+            #    Rotating toward the lookahead (classic car-like pursuit)
+            #    caused runaway spin on non-90° spawns.
+            #    Translation transform: STANDARD R(yaw) (audit ground truth,
+            #    body+x world = (cos yaw, sin yaw), confirmed yaw 0/90/180).
+            _dx, _dy = float(_look[0] - _cur[0]), float(_look[1] - _cur[1])
+            _goal_yaw = _final_yaw if _final_yaw is not None else _cyaw
+            _dyaw = (_goal_yaw - _cyaw + np.pi) % (2 * np.pi) - np.pi
+            _omega = float(np.clip(_dyaw * _kp_rot, -_omega_max, _omega_max))
+            _yawp = _cyaw + 0.5 * _omega
+            _vx =  _dx * np.cos(_yawp) + _dy * np.sin(_yawp)
+            _vy = -_dx * np.sin(_yawp) + _dy * np.cos(_yawp)
+            _act = np.zeros(3)
+            _act[0] = float(np.clip(_vx * _pp_kp, -1.0, 1.0))
+            _act[1] = float(np.clip(_vy * _pp_kp, -1.0, 1.0))
+            _act[2] = _omega
+            # speed modulation: with a fixed 0.4m lookahead the P-term always
+            # saturates → robot runs at max speed and overshoots curves into
+            # walls on long big-layout paths. Slow translation when the
+            # heading error is large (classic "slow down to turn").
+            _turn_slow = float(os.environ.get('PP_TURN_SLOW', '1.0'))
+            _tf = max(0.25, 1.0 - abs(_dyaw) / _turn_slow)
+            _act[0] *= _tf
+            _act[1] *= _tf
+            # endpoint deceleration: within PP_DECEL_R of the path end, scale
+            # translation down ∝ distance so the robot CONVERGES to _final_xy
+            # instead of running at full speed → overshooting → orbiting it.
+            _decel_r = float(os.environ.get('PP_DECEL_R', '0.6'))
+            _d_end = float(np.linalg.norm(_cur - _final_xy))
+            if _d_end < _decel_r:
+              _de = max(0.20, _d_end / _decel_r)
+              _act[0] *= _de
+              _act[1] *= _de
+            # per-step debug log (every 25 steps + first 6)
+            _pps = step_idx - _pp_start
+            if _pps < 6 or _pps % 25 == 0:
+              logger.info(f'[pp s{_pps}] cur=({_cur[0]:.2f},{_cur[1]:.2f}) '
+                          f'yaw={np.degrees(_cyaw):.0f} k={_bk}/{len(_path_xy)-1} '
+                          f'look=({_look[0]:.2f},{_look[1]:.2f}) '
+                          f'd=({_dx:+.2f},{_dy:+.2f}) gyaw={np.degrees(_goal_yaw):.0f} '
+                          f'act=[{_act[0]:+.2f},{_act[1]:+.2f},{_act[2]:+.2f}]')
+            _ci = self._nav_controller.execute(_act)
+            _ci['controller_step'] = step_idx
+            _ci['target_waypoint'] = (_look, _final_yaw if _final_yaw is not None else _cyaw, 1.0)
+            for _vc in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
+              _k = f"{_vc}_image"
+              if _k in _ci['mp_info'][0]:
+                _ci[_k] = _ci['mp_info'][0][_k][::-1]
+            controller_infos[step_idx] = _ci
+            step_idx += 1
+            pbar.update(1)
+          pbar.close()
+          step_info['controller_infos'] = controller_infos
+          execute_info.append(step_info)
+          continue   # skip the legacy wp-iteration loop below
+        # === End PURE-PURSUIT mode ===
+
         while i < len(traj_world):
           waypoint = traj_world[i]
           waypoint_reach = False
@@ -1231,7 +1555,7 @@ class NavigationLMPInterface():
       voxel_map[min_x:max_x, min_y:max_y, min_z:max_z] = value
     return voxel_map
   
-  def set_pixel_by_radius(self, pixel_map, pixel_xy_or_obj, radius_cm=0, value=1, gradient=True):
+  def set_pixel_by_radius(self, pixel_map, pixel_xy_or_obj, radius_cm=0, value=1, gradient=None):
     """Set `value` over a region of `pixel_map`. Two modes:
 
     Object mode (preferred for fixtures and grouped objects):
@@ -1262,6 +1586,16 @@ class NavigationLMPInterface():
     """
     if pixel_map is None or pixel_xy_or_obj is None:
         return pixel_map
+
+    # Infer gradient from value: full-value calls (value=1, used by affordance
+    # & avoidance composer code) keep gradient=True so planner is pulled toward
+    # centroid / soft obstacle boundary. Partial-value calls (value<1, only
+    # composer's velocity_map uses these — "30% speed in slow zone") use
+    # gradient=False so the slow zone is FLAT at `value` rather than a gradient
+    # 0→value (the gradient mode crawls robot at 5-10% near obstacles → stuck).
+    # Caller may still pass gradient=True/False to override.
+    if gradient is None:
+      gradient = (float(value) >= 0.999)
 
     # Skip robot self-avoidance: LLM-generated avoidance for the robot
     # itself produces a halo that traps the planner (start cell already
@@ -1623,7 +1957,11 @@ class NavigationLMPInterface():
       velocity_map = np.ones((self._map_size, self._map_size))
     traj = []
     cur_xy = self._env.env._get_observations()['robot0_base_pos'][:2]
-    initial_filtering = True
+    # initial_filtering drops path waypoints within 0.4m of the robot. For
+    # pure_pursuit this DELETES the A* path's safe wall-exit route → the
+    # controller cuts straight across it into walls. pure_pursuit projects
+    # onto the path so near-robot waypoints are harmless → keep full path.
+    initial_filtering = (self._nav_mode != 'pure_pursuit')
     # Rectangular-grid world conversion (scalar map_size was wrong for
     # non-square workspaces — produced traj_world starting at a totally
     # different position from path_pixel start, making (e) Cost panel
@@ -1834,6 +2172,12 @@ class NavigationLMPInterface():
   def _preprocess_avoidance_pixel_map(self, avoidance_map, affordance_map, movable_obs,
                                       robot_radius=0.50, r_scene_m=0.55, r_llm_m=0.32):
     scene_collision_map = self._get_scene_collision_pixel_map()
+    # Raw fixture obstacles BEFORE any target/start clearing. The robot can
+    # spawn closer than robot_radius to a fixture (e.g. fridge ~0.34m away);
+    # the robot-footprint mask (step E) would then erase that fixture from
+    # the avoidance map → A* routed a path through it → robot wedged. Keep a
+    # snapshot so step E never clears a genuine fixture cell.
+    scene_obstacle_raw = scene_collision_map > 0
     H, W = avoidance_map.shape
     # (A) Radii expressed in meters and converted to pixels via the actual cell
     # resolution — robust to workspace size changes.
@@ -1856,12 +2200,17 @@ class NavigationLMPInterface():
     target_dist = distance_transform_edt(~target_mask)
     scene_collision_map[target_dist <= r_scene] = 0
     av_arr[target_dist <= r_llm] = 0
-    # Clear collision around robot start position so it can move out.
-    # (B) Circular clear here too.
+    # Clear collision around robot start position so A* can move out.
+    # NOTE: this zeroes the RAW scene_collision (real counters/walls) inside
+    # the disk. The legacy radius (robot_radius/cell+1 ≈ 0.56m) wiped real
+    # counters near the spawn → A* routed paths THROUGH them → robot wedged.
+    # START_CLEAR_CELLS shrinks the disk to the minimum needed for A* escape
+    # (default small) so genuine counters near the start stay in the map.
     start_pos = movable_obs['position']
     sp0, sp1 = int(start_pos[0]), int(start_pos[1])
     xy = self._compute_pixel_resolution()
-    margin = int(np.ceil(robot_radius / float(xy.min()))) + 1
+    _legacy_margin = int(np.ceil(robot_radius / float(xy.min()))) + 1
+    margin = int(os.environ.get('START_CLEAR_CELLS', str(_legacy_margin)))
     yy, xx = np.ogrid[:H, :W]
     start_clear = (yy - sp0)**2 + (xx - sp1)**2 <= margin**2
     scene_collision_map[start_clear] = 0
@@ -1874,6 +2223,9 @@ class NavigationLMPInterface():
     # when extended.
     robot_mask = self._get_robot_floor_footprint(H, W)
     if robot_mask is not None:
+        # Never clear genuine fixtures even when they fall inside the robot
+        # footprint disk — only residual non-fixture cells get freed.
+        robot_mask = robot_mask & ~scene_obstacle_raw
         av_arr[robot_mask] = 0
     # (D) Force workspace boundary ring to obstacle — applied AFTER all clearing
     # logic so the border is never carved out by goal/start clear.
@@ -1882,6 +2234,7 @@ class NavigationLMPInterface():
     av_arr[-border_w:, :] = 1.0
     av_arr[:, :border_w] = 1.0
     av_arr[:, -border_w:] = 1.0
+    if _dbg: _dp('F.최종(return)')
     return avoidance_map
 
   def _get_robot_floor_footprint(self, H, W):
@@ -1930,18 +2283,35 @@ class NavigationLMPInterface():
       if bid not in robot_body_ids:
         continue
       p = sim.data.geom_xpos[gid]
-      # Skip geoms whose center is well below the floor (likely visualisation
-      # markers like *_target placed at z<0).
-      if p[2] < -0.05:
+      # Skip geoms below the floor (z<0 markers) AND elevated arm/gripper
+      # geoms (z>z_max). The arm is OVERHEAD — projecting it to the floor and
+      # forcing those cells free wrongly erases real counters UNDER the
+      # raised arm (the robot BASE cannot go there). Only mobile-base geoms
+      # (z≤~0.5m) define the true navigable floor footprint.
+      _zmax = float(os.environ.get('ROBOT_FOOTPRINT_Z_MAX', '0.6'))
+      if p[2] < -0.05 or p[2] > _zmax:
         continue
-      # World x → col (axis 1, width W); world y → row (axis 0, height H).
-      c_col = (p[0] - wmin[0]) / (wmax[0] - wmin[0]) * W
-      r_row = (p[1] - wmin[1]) / (wmax[1] - wmin[1]) * H
-      rb_m = float(model.geom_rbound[gid])
-      if rb_m <= 0:
+      # Project the geom's ACTUAL XY footprint rectangle (geom_size half-
+      # extents), NOT a geom_rbound enclosing-sphere disk. rbound hugely
+      # over-estimates wide/flat base geoms (rbound≈0.5m) → the robot mask
+      # ballooned and erased real counters (fridge) 0.3m+ from the robot.
+      gs = model.geom_size[gid]
+      hx, hy = float(gs[0]), float(gs[1])
+      if hx <= 0 or hy <= 0:
         continue
-      r_cells = max(1, int(np.ceil(rb_m / cell_min_m)))
-      mask |= (yy - r_row)**2 + (xx - c_col)**2 <= r_cells**2
+      gmat = sim.data.geom_xmat[gid].reshape(3, 3)
+      half_x = abs(gmat[0, 0]) * hx + abs(gmat[0, 1]) * hy
+      half_y = abs(gmat[1, 0]) * hx + abs(gmat[1, 1]) * hy
+      x0 = max(p[0] - half_x, wmin[0]); x1 = min(p[0] + half_x, wmax[0])
+      y0 = max(p[1] - half_y, wmin[1]); y1 = min(p[1] + half_y, wmax[1])
+      if x1 <= x0 or y1 <= y0:
+        continue
+      c0 = int(np.floor((x0 - wmin[0]) / sx_m)); c1 = int(np.ceil((x1 - wmin[0]) / sx_m))
+      r0 = int(np.floor((y0 - wmin[1]) / sy_m)); r1 = int(np.ceil((y1 - wmin[1]) / sy_m))
+      r0 = max(0, r0); r1 = min(H, r1); c0 = max(0, c0); c1 = min(W, c1)
+      if r1 <= r0 or c1 <= c0:
+        continue
+      mask[r0:r1, c0:c1] = True
     if not mask.any():
       return None
     return mask
