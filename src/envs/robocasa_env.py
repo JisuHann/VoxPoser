@@ -211,7 +211,7 @@ class VoxPoserRobocasa():
                     else:
                         visible_objs.add(tokens[0])
                 visible_objects.extend(visible_objs)
-            visible_objects = list(set(visible_objects))
+            visible_objects = sorted(set(visible_objects))  # determinism: stable LMP prompt → stable cache key
         else:
             visible_objects = list(self.env.objects.keys())
         pass  # object placement handled by env
