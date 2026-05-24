@@ -58,7 +58,9 @@ class NavigationLMPInterface():
     # Navigation mode: holonomic (default, body-frame v_x/v_y/omega) vs
     # translate_only (rotate-first toward lookahead wp, then forward-only).
     # NAV_MODE env-var overrides config.
-    self._nav_mode = os.environ.get('NAV_MODE', nav_controller_config.get('mode', 'holonomic'))
+    # Default = pure_pursuit (best config per sweep 2026-05-24, replaces
+    # legacy holonomic). NAV_MODE env-var or config override.
+    self._nav_mode = os.environ.get('NAV_MODE', nav_controller_config.get('mode', 'pure_pursuit'))
     assert self._nav_mode in ('holonomic', 'translate_only', 'holo_seq', 'holo_cont', 'pure_pursuit'), f"unknown nav_mode: {self._nav_mode}"
     # When True, parse_query_obj() / detect() auto-resolve fixture queries
     # (coffee_machine, sink, stove, ...) to fixture.pos instead of the
@@ -739,18 +741,20 @@ class NavigationLMPInterface():
           _final_xy = _path_xy[-1]
           _fy = np.asarray(traj_world[-1][1])
           _final_yaw = float(_fy.item()) if _fy.size == 1 and np.isfinite(_fy.item()) else None
-          _Ld      = float(os.environ.get('PP_LOOKAHEAD_M', '0.6'))
+          # Defaults reflect best config from sweep (2026-05-24): LH=0.5,
+          # replan_max=4, goal_tol=0.25, escape on, decel_r=0.4, turn_slow=100.
+          _Ld      = float(os.environ.get('PP_LOOKAHEAD_M', '0.5'))
           _pp_kp   = float(os.environ.get('PP_KP', '6.0'))
           # #29 REPLAN: when stuck FAR from goal, try replanning from current
           # position before aborting. Max replans capped to avoid infinite loop.
           _pp_replan_count = 0
-          _pp_replan_max   = int(os.environ.get('PP_REPLAN_MAX', '3'))
+          _pp_replan_max   = int(os.environ.get('PP_REPLAN_MAX', '4'))
           # incremental rotation: small omega cap → per-step rotation tiny →
           # rotation-translation coupling drift is sub-mm AND continuously
           # corrected by the pursuit loop (no uncorrected rotate-first burst).
           _omega_max = float(os.environ.get('PP_OMEGA_MAX', '0.1'))
           _kp_rot  = float(os.environ.get('CTRL_KP_ROT', '3.0'))
-          _succ_thr = float(os.environ.get('PP_GOAL_TOL', '0.45'))
+          _succ_thr = float(os.environ.get('PP_GOAL_TOL', '0.25'))
           _ws_min = np.asarray(self._env.workspace_bounds_min[:2], dtype=float)
           _ws_max = np.asarray(self._env.workspace_bounds_max[:2], dtype=float)
           # PP_STEP_CAP_MULT (default 0.5) halves the cap to bound wedge-case
@@ -775,7 +779,7 @@ class NavigationLMPInterface():
           # and either treat as arrived (near goal) or abort (far).
           _stuck_win = int(os.environ.get('PP_STUCK_WIN', '40'))
           _stuck_eps = float(os.environ.get('PP_STUCK_EPS', '0.04'))
-          _stuck_goal_r = float(os.environ.get('PP_STUCK_GOAL_R', '0.7'))
+          _stuck_goal_r = float(os.environ.get('PP_STUCK_GOAL_R', '0.6'))
           _pos_hist = []
           # rotate-first: align to the goal heading IN PLACE before travel.
           # During travel omega then stays ~0 → no rotation-translation
@@ -843,7 +847,7 @@ class NavigationLMPInterface():
                     # 0.1m). If none improve, fall through with robot at final
                     # tried position. Avoids cycling-mode regression where each
                     # replan picks single (sometimes wrong) direction.
-                    if os.environ.get('PP_ESCAPE_ENABLED', '0') == '1':
+                    if os.environ.get('PP_ESCAPE_ENABLED', '1') == '1':
                       _esc_dirs = [
                           ('back',    -1.0,  0.0),
                           ('forward',  1.0,  0.0),
@@ -1005,14 +1009,14 @@ class NavigationLMPInterface():
             # saturates → robot runs at max speed and overshoots curves into
             # walls on long big-layout paths. Slow translation when the
             # heading error is large (classic "slow down to turn").
-            _turn_slow = float(os.environ.get('PP_TURN_SLOW', '1.0'))
+            _turn_slow = float(os.environ.get('PP_TURN_SLOW', '100'))
             _tf = max(0.25, 1.0 - abs(_dyaw) / _turn_slow)
             _act[0] *= _tf
             _act[1] *= _tf
             # endpoint deceleration: within PP_DECEL_R of the path end, scale
             # translation down ∝ distance so the robot CONVERGES to _final_xy
             # instead of running at full speed → overshooting → orbiting it.
-            _decel_r = float(os.environ.get('PP_DECEL_R', '0.6'))
+            _decel_r = float(os.environ.get('PP_DECEL_R', '0.4'))
             _d_end = float(np.linalg.norm(_cur - _final_xy))
             if _d_end < _decel_r:
               _de = max(0.20, _d_end / _decel_r)
@@ -2210,7 +2214,9 @@ class NavigationLMPInterface():
     sp0, sp1 = int(start_pos[0]), int(start_pos[1])
     xy = self._compute_pixel_resolution()
     _legacy_margin = int(np.ceil(robot_radius / float(xy.min()))) + 1
-    margin = int(os.environ.get('START_CLEAR_CELLS', str(_legacy_margin)))
+    # Best config (sweep 2026-05-24): START_CLEAR_CELLS=2 (small disk so
+    # real counters near the start stay in the map; was legacy ~10 cells).
+    margin = int(os.environ.get('START_CLEAR_CELLS', '2'))
     yy, xx = np.ogrid[:H, :W]
     start_clear = (yy - sp0)**2 + (xx - sp1)**2 <= margin**2
     scene_collision_map[start_clear] = 0
@@ -2234,7 +2240,6 @@ class NavigationLMPInterface():
     av_arr[-border_w:, :] = 1.0
     av_arr[:, :border_w] = 1.0
     av_arr[:, -border_w:] = 1.0
-    if _dbg: _dp('F.최종(return)')
     return avoidance_map
 
   def _get_robot_floor_footprint(self, H, W):
