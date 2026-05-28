@@ -153,10 +153,12 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
         config['env_name'] = 'robocasa_navigation_safety_aware'
     elif few_shot == 'safety_aware_v2':
         config['env_name'] = 'robocasa_navigation_safety_aware_v2'
+    elif few_shot == 'qwen3vl_patched':
+        config['env_name'] = 'robocasa_navigation_qwen3vl_patched'
     elif few_shot == 'default':
         config['env_name'] = 'robocasa_navigation'
     else:
-        raise ValueError(f"--few-shot must be 'default' / 'safety_aware' / 'safety_aware_v2', got '{few_shot}'")
+        raise ValueError(f"--few-shot must be 'default' / 'safety_aware' / 'safety_aware_v2' / 'qwen3vl_patched', got '{few_shot}'")
     logger.info(f"Few-shot: {few_shot} (env_name={config['env_name']})")
     if model:
         for _, lmp_cfg in config['lmp_config']['lmps'].items():
@@ -284,8 +286,18 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                 logger.info(f"[{idx+1}/{len(parsed)}] {task_name} — SKIP (folder + entry already in results.json)")
                 continue
             if os.path.isdir(task_dir_check):
-                # Stale folder without a results.json entry — partial/orphan.
-                # Remove and re-run so the new run owns the slot.
+                # Stale folder without a results.json entry — could be:
+                # (a) partial/orphan from crashed run → rmtree + re-run
+                # (b) genuine completion whose results.json entry was wiped
+                #     by an auto-merger that deleted per-worker files between
+                #     completion and this resume → treat as done, do NOT rmtree.
+                # topview_image.mp4 is written only after successful eval, so
+                # its presence is a reliable "this task completed" marker that
+                # survives merger destruction of per-worker json files.
+                if os.path.exists(os.path.join(task_dir_check, "topview_image.mp4")):
+                    logger.info(f"[{idx+1}/{len(parsed)}] {task_name} — SKIP (folder has topview_image.mp4 → completed; results.json entry was wiped by merger)")
+                    done_dirs.add(task_rel_dir)
+                    continue
                 logger.warning(f"[{idx+1}/{len(parsed)}] {task_name} — orphan folder, removing and re-running")
                 shutil.rmtree(task_dir_check, ignore_errors=True)
 
@@ -870,11 +882,12 @@ def main():
                         help="System prompt: 'default' uses default_system_prompt.txt; "
                              "'safety_aware' overlays the 5-example concrete variant; "
                              "'safety_aware_v2' overlays the abstract no-example variant.")
-    parser.add_argument("--few-shot", choices=["default", "safety_aware", "safety_aware_v2"], default="default",
+    parser.add_argument("--few-shot", choices=["default", "safety_aware", "safety_aware_v2", "qwen3vl_patched"], default="default",
                         help="Few-shot directory: 'default' = prompts/robocasa_navigation/; "
                              "'safety_aware' = prompts/robocasa_navigation_safety_aware/; "
                              "'safety_aware_v2' = same as safety_aware but planner has "
-                             "the CRITICAL goal-vs-obstacle distinction NOTE restored.")
+                             "the CRITICAL goal-vs-obstacle distinction NOTE restored; "
+                             "'qwen3vl_patched' = default planner + 3 extra kitchen-scene examples to suppress over-generation in Qwen3-VL-32B.")
     parser.add_argument("--lmp-only", action="store_true",
                         help="Skip physics rollout: monkey-patch execute_navigation to call each "
                              "map lambda once (firing the LMPs so generated code is logged) then "

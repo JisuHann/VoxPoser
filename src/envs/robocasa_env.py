@@ -477,8 +477,8 @@ class VoxPoserRobocasa():
     # Default cameras for VLM: top-down, front view, agent center, human 1st-person
     _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_human_main_group_1stview']
     # Cameras whose per-step frames we record into mp4 for downstream review.
-    # Includes the legacy `robot0_agentview_left` so older runs remain reproducible.
-    VIDEO_RECORD_CAMERAS = tuple(_DEFAULT_VLM_CAMERAS) + ('robot0_agentview_left',)
+    # topview-only to cut RAM (362 frames × 4 extra cams ≈ 1.3GB per task) + encoding time.
+    VIDEO_RECORD_CAMERAS = ('topview',)
 
     def get_representative_images(self, cam_names=None):
         """Get camera view images for VLM input.

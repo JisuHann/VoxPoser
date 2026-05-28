@@ -385,21 +385,31 @@ class NavigationLMPInterface():
       for plan_iter in range(self._cfg['max_plan_iter']):
         step_info = dict()
         movable_obs = movable_obs_func()
-        _affordance_map = affordance_map()
-        _avoidance_map = avoidance_map()
-        _rotation_map = rotation_map()
-        _velocity_map = velocity_map()
-        # Defensive fallback: LMP-generated get_*_map sometimes omits `ret_val =`
-        # at the end → returns None → downstream crashes ('NoneType' subscriptable).
-        # Replace any None with the corresponding default voxel map.
-        if _rotation_map is None:
-            _rotation_map = self._get_default_voxel_map('rotation', task='navigation')()
-        if _velocity_map is None:
-            _velocity_map = self._get_default_voxel_map('velocity', task='navigation')()
-        if _affordance_map is None:
-            _affordance_map = self._get_default_voxel_map('target', task='navigation')()
-        if _avoidance_map is None:
-            _avoidance_map = self._get_default_voxel_map('obstacle', task='navigation')()
+        # LMP-generated get_*_map code can either: (a) return None (omitted
+        # `ret_val =`) or (b) raise — e.g. kimi-vl sometimes calls cm2index
+        # with a scalar direction for vague queries ("any of them"). Both
+        # paths fall back to the default voxel map so the episode survives
+        # one LLM-quality glitch rather than RETRYABLE-ing 3× and giving up.
+        def _safe_map(fn, kind):
+            try:
+                v = fn()
+                if v is None:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f'[execute_navigation] {kind}_map returned None → default'
+                    )
+                    return self._get_default_voxel_map(kind, task='navigation')()
+                return v
+            except Exception as _e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f'[execute_navigation] {kind}_map raised {type(_e).__name__}: {_e} → default'
+                )
+                return self._get_default_voxel_map(kind, task='navigation')()
+        _affordance_map = _safe_map(affordance_map, 'target')
+        _avoidance_map = _safe_map(avoidance_map, 'obstacle')
+        _rotation_map = _safe_map(rotation_map, 'rotation')
+        _velocity_map = _safe_map(velocity_map, 'velocity')
         _avoidance_map = self._preprocess_avoidance_pixel_map(_avoidance_map, _affordance_map, movable_obs)
         start_pos = movable_obs['position'][:2]
         start_time = time.time()
@@ -2483,8 +2493,20 @@ def setup_LMP(env, general_config, debug=False, output_dir=None):
   def _safe_parse_query_obj(query):
       try:
           result = _orig_parse_query_obj(query)
-          return result if result is not None else _SAFE_FALLBACK_OBS
-      except Exception:
+          if result is None:
+              import logging
+              logging.getLogger(__name__).warning(
+                  f'[_safe_parse_query_obj] query={query!r} → None, using [0,0,0] fallback'
+              )
+              return _SAFE_FALLBACK_OBS
+          return result
+      except Exception as _e:
+          import logging, traceback as _tb
+          logging.getLogger(__name__).warning(
+              f'[_safe_parse_query_obj] query={query!r} raised {type(_e).__name__}: {_e} '
+              f'→ using [0,0,0] fallback'
+          )
+          logging.getLogger(__name__).debug(f'[_safe_parse_query_obj] traceback:\n{_tb.format_exc()}')
           return _SAFE_FALLBACK_OBS
   variable_vars['parse_query_obj'] = _safe_parse_query_obj
 

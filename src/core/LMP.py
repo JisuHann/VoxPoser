@@ -165,6 +165,33 @@ class LMP:
         # Some models output literal \n instead of actual newlines
         result = result.replace('\\n', '\n').strip()
 
+        # Kimi-VL echoes few-shot context lines ('# Query: X.', 'objects = […]')
+        # inside the markdown fence. The default stops trigger an immediate stop
+        # after just '```python', leaving content empty — those stops are dropped
+        # for kimi in __call__. Here we defensively strip the leading echo block:
+        # skip the first 'objects = …' line and the first '# Query: …' line,
+        # then break at any subsequent '# Query:' (would mark a new few-shot
+        # example which is not real model output).
+        model_name_lc = (self._cfg.get('model') or '').lower()
+        if 'kimi-vl' in model_name_lc and ('# Query:' in result or result.lstrip().startswith('objects = ')):
+            cleaned, skipped_objects, skipped_query, seen_code = [], False, False, False
+            for line in result.split('\n'):
+                s = line.strip()
+                if s.startswith('objects = ') and not skipped_objects and not seen_code:
+                    skipped_objects = True
+                    continue
+                if s.startswith('# Query:'):
+                    if not skipped_query:
+                        skipped_query = True
+                        continue
+                    if seen_code:
+                        break
+                    continue
+                cleaned.append(line)
+                if s and not s.startswith('#'):
+                    seen_code = True
+            result = '\n'.join(cleaned).strip()
+
         # Strip import lines (exec_safe bans them; fixed_vars already provides imports)
         lines = result.split('\n')
         import_stripped = [l for l in lines if not l.strip().startswith(('import ', 'from '))]
@@ -248,10 +275,46 @@ class LMP:
 
     def _cached_api_call(self, **kwargs):
         user1 = kwargs.pop('prompt')
-        # GLM / gpt-oss / DeepSeek models repeat context (objects list, # Query:)
-        # triggering stop tokens prematurely. Remove all stop tokens; rely on max_tokens.
+        # DeepSeek-VL2 chat template + multi-turn priming makes the model echo
+        # the few-shot imports and EOS immediately (~47 tok, finish=stop) — the
+        # extracted code is then empty. Bypass via /v1/completions raw text: the
+        # unwrapped few-shot prompt + new query continues naturally. Text-only
+        # (no image) — the chat path's multimodal block isn't reached. Stops
+        # from cfg work fine on the completions endpoint.
         model_name = kwargs.get('model', '')
-        if 'glm' in model_name.lower() or 'gpt-oss' in model_name or 'gpt_oss' in model_name or 'deepseek' in model_name.lower():
+        if 'deepseek-vl2' in model_name.lower():
+            ds_prompt = user1
+            # composer-specific structural prefill — deepseek-vl2 consistently
+            # omits the affordance_map line (no goal → execute_navigation runs
+            # 0 steps → lmp_no_actuation). Seeding the canonical first two
+            # lines forces the model to continue with avoidance_map +
+            # execute_navigation(...affordance_map=..., avoidance_map=...).
+            if self._name == 'composer':
+                ds_prompt += "\nmovable = parse_query_obj('mobile_base')\n"
+                ds_prompt += "affordance_map = get_affordance_map('the goal')\n"
+            ret = self._client.completions.create(
+                model=model_name,
+                prompt=ds_prompt,
+                max_tokens=kwargs.get('max_tokens', 1024),
+                temperature=kwargs.get('temperature', 0),
+                stop=list(self._stop_tokens),
+            )
+            text = ret.choices[0].text or ''
+            # If we injected the composer prefill, prepend it so execute_safe
+            # has the full Python block (otherwise 'movable' / 'affordance_map'
+            # are referenced but never defined).
+            if self._name == 'composer':
+                text = ("movable = parse_query_obj('mobile_base')\n"
+                        "affordance_map = get_affordance_map('the goal')\n"
+                        + text)
+            logger.debug(
+                f'[LMP "{self._name}"] [deepseek-vl2 /v1/completions] '
+                f'{len(text)} chars: {text[:300]}'
+            )
+            return self._extract_code(_CachedMsg(content=text, reasoning_content=None))
+        # GLM / gpt-oss / DeepSeek / Cosmos models repeat context (objects list, # Query:)
+        # in their reasoning, triggering stop tokens prematurely. Remove all stop tokens; rely on max_tokens.
+        if 'glm' in model_name.lower() or 'gpt-oss' in model_name or 'gpt_oss' in model_name or 'deepseek' in model_name.lower() or 'cosmos' in model_name.lower():
             kwargs['stop'] = []
         new_query = '# Query:' + user1.split('# Query:')[-1]
         # Preserve '# Query:' in few-shot examples (only remove the last one which is the actual query)
@@ -367,6 +430,12 @@ class LMP:
         elif 'gpt-oss' in model_name or 'gpt_oss' in model_name:
             extra_body = {"reasoning_effort": "low"}
             logger.debug(f'[LMP "{self._name}"] setting GPT-oss reasoning_effort=low')
+        elif 'cosmos' in model_name.lower():
+            # Cosmos-Reason2 is a Qwen3-VL fine-tune; enable thinking explicitly so
+            # the <think>...</think><answer>...</answer> format the system prompt
+            # requests is actually produced.
+            extra_body = {"chat_template_kwargs": {"enable_thinking": True}}
+            logger.debug(f'[LMP "{self._name}"] enabling Cosmos thinking mode')
         create_kwargs = dict(kwargs)
         if extra_body:
             create_kwargs['extra_body'] = extra_body
@@ -431,13 +500,29 @@ class LMP:
         if 'llama-3.2' in model_name_lc and 'vision' in model_name_lc:
             # Llama-3.2-Vision max_pos=4096 (eval config); with prompt ~700 tokens, leave room → cap at 1024
             max_tokens = min(max_tokens, 1024)
+
+        # Kimi-VL wraps every response in ```python … ``` and echoes few-shot
+        # context lines (e.g. '# Query: X.', 'objects = [...]') at the top of
+        # its code block. The default '\n# Query: ' and '\nobjects =' stops
+        # match those echoes, halting generation right after '```python' and
+        # leaving content empty (LMPEmptyOutput). Drop BOTH stops for kimi —
+        # _extract_code's kimi branch trims the echoed lines. parse_query_obj
+        # is the worst case because its few-shot has 9 examples each starting
+        # with 'objects = [...]'.
+        stop_tokens = list(self._stop_tokens)
+        if 'kimi-vl' in model_name_lc:
+            stop_tokens = [
+                s for s in stop_tokens
+                if s not in ("\n# Query: ", "\nobjects =", "\nobjects = ")
+            ]
+
         start_time = time.time()
         last_err = None
         for api_attempt in range(API_MAX_RETRIES):
             try:
                 code_str = self._cached_api_call(
                     prompt=prompt,
-                    stop=self._stop_tokens,
+                    stop=stop_tokens,
                     temperature=self._cfg['temperature'],
                     model=self._cfg['model'],
                     max_tokens=max_tokens
