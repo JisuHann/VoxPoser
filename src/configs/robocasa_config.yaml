@@ -37,6 +37,30 @@ manipulation:
     stop_threshold: 0.001
     obstacle_map_gaussian_sigma: 10
     max_curvature: 3
+  controller:
+    horizon_length: 1
+  lmp_config:
+    env:
+      # Re-plan each executed map up to 4x: push targets recompute from the
+      # LIVE panel position, so successive iterations keep pushing the drawer/
+      # door shut (single iter left CloseDrawer at door_state 0.93 vs <0.05).
+      max_plan_iter: 8
+      # 3D cube voxel map. workspace bounds are NOT set here — they are
+      # computed at runtime from the scene point cloud min/max in
+      # robocasa_env.get_scene_3d_obs() (self.workspace_bounds_min/max),
+      # consumed by interfaces._world_to_voxel / _voxel_to_world.
+      map_size: 100
+  visualizer:
+    # 3D ValueMapVisualizer rendering knobs. render_mode + the keys below
+    # are consumed by the Task-7 visualizer (config-only until then).
+    render_mode: scatter        # scatter(light) | volume | auto
+    downsample_ratio: 2
+    costmap_opacity: 0.1
+    costmap_surface_count: 8
+    max_scene_points: 12000
+    voxel_scatter_threshold: 0.7
+    max_voxel_points: 3000
+    scene_scale: [1, 1, 1]
 
 # shared defaults
 planner:

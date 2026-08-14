@@ -234,12 +234,26 @@ class DynamicObservation:
             import pdb; pdb.set_trace()
         self.func = func
     
-    _FALLBACK = {'position': np.array([0.0, 0.0, 0.0]), 'normal': np.array([0.0, 0.0, 1.0])}
+    _FALLBACK = {'position': np.array([0.0, 0.0, 0.0]), 'normal': np.array([0.0, 0.0, 1.0]),
+                 'name': '_fallback', 'aabb': np.zeros((2, 3)),
+                 '_position_world': np.array([0.0, 0.0, 0.0]),
+                 '_point_cloud_world': np.zeros((1, 3))}
 
     def __get__(self, key):
         evaluated = self.func()
         if evaluated is None:
-            return self._FALLBACK.get(key, None)
+            # Route through Observation so its missing-key fallbacks apply
+            # (aabb → degenerate box, name → '', normal → +z). Returning
+            # _FALLBACK.get(key, None) here leaked None into LLM map code
+            # (`(mn), (mx) = obj.aabb` → TypeError) — the parse_query_obj LMP
+            # wraps its code in `def ret_val()`, so a "None result" is really
+            # a function returning None and every upstream None-check misses.
+            evaluated = Observation(dict(self._FALLBACK))
+        # LLMs commonly reach for `.handle_position` (and similar `*_position`
+        # attributes) that the observation doesn't expose — fall back to the
+        # object centroid `position` instead of raising KeyError.
+        if key not in evaluated and key.endswith('position') and 'position' in evaluated:
+            key = 'position'
         if isinstance(evaluated[key], np.ndarray):
             return evaluated[key].copy()
         return evaluated[key]
@@ -269,10 +283,28 @@ class Observation(dict):
         self.obs_dict = obs_dict
     
     def __getattr__(self, key):
-        return self.obs_dict[key]
-    
+        return self.__getitem__(key)
+
     def __getitem__(self, key):
-        return self.obs_dict[key]
+        # `.handle_position` etc. → fall back to object centroid `position`.
+        if key not in self.obs_dict and key.endswith('position') and 'position' in self.obs_dict:
+            return self.obs_dict['position']
+        # Missing-key fallbacks so LMP-generated code never crashes on a
+        # partially-populated observation (e.g. env obs dicts without 'name').
+        if key not in self.obs_dict:
+            if key == 'name':
+                return ''
+            if key == 'aabb' and 'position' in self.obs_dict:
+                _p = np.asarray(self.obs_dict['position'])
+                return np.array([_p, _p])
+            if key == 'normal':
+                return np.array([0, 0, 1], dtype=np.float32)
+        _val = self.obs_dict[key]
+        # A stored-but-None aabb also breaks `(mn), (mx) = obj.aabb` unpacking.
+        if _val is None and key == 'aabb' and 'position' in self.obs_dict:
+            _p = np.asarray(self.obs_dict['position'])
+            return np.array([_p, _p])
+        return _val
 
     def __getstate__(self):
         return self.obs_dict

@@ -2,6 +2,8 @@ import sys
 import os
 import re
 import signal
+import faulthandler
+faulthandler.register(signal.SIGUSR1, all_threads=True)
 import warnings
 
 TASK_TIMEOUT_SEC = int(os.environ.get("TASK_TIMEOUT_SEC", "900"))
@@ -39,7 +41,38 @@ from robocasa.utils.result_utils import get_navigate_tasks, parse_task_spec, par
 
 logger = get_logger(__name__)
 
+# Default task type when --task-type=auto cannot decide (kept for back-compat).
 TASK_TYPE = "navigation"
+
+
+def classify_task_type(task_spec):
+    """Return 'navigation' or 'manipulation' for a task spec.
+
+    robocasa's parse_task_categories is navigation-specific (only matches
+    NavigateKitchen* names and returns (None,None,None) otherwise), so the
+    primary signal is the task-name prefix from the robocasa registry:
+    NavigateKitchen* -> navigation, everything else (PnP*, etc.) -> manipulation.
+    parse_task_categories is consulted only as a secondary confirmation.
+    """
+    # Strip any layout/style suffix to get the bare task name.
+    try:
+        name, _ = parse_task_spec(str(task_spec).split('#style', 1)[0])
+    except Exception:
+        name = str(task_spec)
+    nav_markers = ('navigate', 'navigation', 'go_to', 'reach')
+    name_l = name.lower()
+    if any(m in name_l for m in nav_markers):
+        return 'navigation'
+    # Secondary: parse_task_categories returns a non-None obstacle/route only
+    # for navigation task names.
+    try:
+        cats = parse_task_categories(name)
+        if any(c is not None for c in (cats if isinstance(cats, (list, tuple)) else [cats])):
+            return 'navigation'
+    except Exception:
+        pass
+    return 'manipulation'
+
 
 # Translate the legacy task-name token (kept inside the kitchen environment
 # class for asset-loading reasons) to the human-meaningful safety mode that
@@ -74,6 +107,11 @@ def _try_render_voxposer_overview(task_dir):
     """Best-effort: render scripts/visualize_voxposer_task.py for `task_dir`.
     Safe on any path (success / permanent failure). Skips silently if the
     dump is missing or the renderer raises."""
+    # Rendering can dominate a failed episode (especially after a long
+    # manipulation rollout).  Keep the artifact optional so diagnostics can
+    # finish and report the actual task outcome deterministically.
+    if os.environ.get('VOX_SKIP_VIZ', '').lower() in ('1', 'true', 'yes'):
+        return
     if not os.path.isdir(task_dir):
         return
     try:
@@ -96,7 +134,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
               system_prompt='default', few_shot='default',
               obstacle_map_weight=None, obstacle_map_gaussian_sigma=None,
               vlm_cameras=None, layout_ids=None, style_ids=None,
-              lmp_only=False):
+              lmp_only=False, task_type_override='auto'):
     run_config = {
         "model": model,
         "system_prompt": system_prompt,
@@ -112,74 +150,105 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
         "worker_id": worker_id,
         "lmp_only": lmp_only,
     }
-    config = get_config(config_path='src/configs/robocasa_config.yaml', task_type=TASK_TYPE)
-    # LLM cache: configure module-level singleton from config (env vars override)
-    _cache_cfg = config.get('lmp_cache', {}) or {}
     from core.LMP import configure_cache
-    configure_cache(
-        enabled=bool(_cache_cfg.get('enabled', True)),
-        cache_dir=str(_cache_cfg.get('cache_dir', 'cache')),
-    )
-    if obstacle_map_weight is not None:
-        config['planner']['obstacle_map_weight'] = obstacle_map_weight
-        logger.info(f"Override planner.obstacle_map_weight = {obstacle_map_weight}")
-    if obstacle_map_gaussian_sigma is not None:
-        config['planner']['obstacle_map_gaussian_sigma'] = obstacle_map_gaussian_sigma
-        logger.info(f"Override planner.obstacle_map_gaussian_sigma = {obstacle_map_gaussian_sigma}")
-    # System prompt: 'default' uses robocasa_navigation_system/default_system_prompt.txt
-    # (loaded by core/LMP.py); 'safety_aware' / 'safety_aware_v2' overlay the
-    # matching file from robocasa_navigation_system/ via system_prompt_extra.
-    # 'safety_aware' has 5 concrete case examples; 'safety_aware_v2' is the
-    # abstract no-example variant.
-    if system_prompt in ('safety_aware', 'safety_aware_v2'):
-        from utils.utils import load_prompt
-        fname = f'robocasa_navigation_system/{system_prompt}_system_prompt.txt'
-        extra = load_prompt(fname).strip()
-        for _, lmp_cfg in config['lmp_config']['lmps'].items():
-            if lmp_cfg is not None:
-                lmp_cfg['system_prompt_extra'] = extra
-        logger.info(f"System prompt: {system_prompt} (overlay from {fname})")
-    elif system_prompt != 'default':
-        raise ValueError(
-            f"--system-prompt must be 'default' / 'safety_aware' / 'safety_aware_v2', got '{system_prompt}'")
-    else:
-        logger.info("System prompt: default")
-    # Few-shot: 'default' = prompts/robocasa_navigation/, 'safety_aware' =
-    # prompts/robocasa_navigation_safety_aware/, 'safety_aware_v2' =
-    # prompts/robocasa_navigation_safety_aware_v2/ (planner has CRITICAL
-    # goal-vs-obstacle distinction restored). load_prompt falls back to
-    # default for any file missing in the variant dir.
-    if few_shot == 'safety_aware':
-        config['env_name'] = 'robocasa_navigation_safety_aware'
-    elif few_shot == 'safety_aware_v2':
-        config['env_name'] = 'robocasa_navigation_safety_aware_v2'
-    elif few_shot == 'default':
-        config['env_name'] = 'robocasa_navigation'
-    else:
-        raise ValueError(f"--few-shot must be 'default' / 'safety_aware' / 'safety_aware_v2', got '{few_shot}'")
-    logger.info(f"Few-shot: {few_shot} (env_name={config['env_name']})")
-    if model:
-        for _, lmp_cfg in config['lmp_config']['lmps'].items():
-            if lmp_cfg is not None:
-                lmp_cfg['model'] = model
-        logger.info(f"Using model: {model}")
-    if temperature is not None:
-        for _, lmp_cfg in config['lmp_config']['lmps'].items():
-            if lmp_cfg is not None:
-                lmp_cfg['temperature'] = temperature
-        logger.info(f"Overriding temperature: {temperature}")
+
     # OpenAI API (gpt-4o, gpt-5, etc.) bypasses local vLLM. Match 'gpt-4'/'gpt-5'/'gpt-o' but NOT 'gpt-oss'.
     is_openai_api = bool(model) and model.startswith('gpt-') and 'oss' not in model.lower()
-    if is_openai_api:
-        api_key = os.environ.get('OPENAI_API_KEY')
-        if not api_key:
-            raise RuntimeError("OPENAI_API_KEY env var required for OpenAI models")
-        config['llm_api']['base_url'] = "https://api.openai.com/v1"
-        config['llm_api']['api_key']  = api_key
-        logger.info(f"OpenAI API endpoint: {config['llm_api']['base_url']} (model={model})")
+
+    # Config is built per task_type (navigation/manipulation deep-merge differs,
+    # as do prompt dirs). Memoized so we only construct each variant once.
+    _config_cache = {}
+
+    def _build_config(task_type):
+        """Fully-configured config dict for the given task_type, with all CLI
+        overrides (model/temperature/prompts/endpoint/ablations) applied."""
+        if task_type in _config_cache:
+            return _config_cache[task_type]
+        cfg = get_config(config_path='src/configs/robocasa_config.yaml', task_type=task_type)
+        # LLM cache: configure module-level singleton from config (env vars override).
+        # Same across task types — fine to (re)configure here.
+        _cache_cfg = cfg.get('lmp_cache', {}) or {}
+        configure_cache(
+            enabled=bool(_cache_cfg.get('enabled', True)),
+            cache_dir=str(_cache_cfg.get('cache_dir', 'cache')),
+        )
+        if obstacle_map_weight is not None:
+            cfg['planner']['obstacle_map_weight'] = obstacle_map_weight
+            logger.info(f"Override planner.obstacle_map_weight = {obstacle_map_weight}")
+        if obstacle_map_gaussian_sigma is not None:
+            cfg['planner']['obstacle_map_gaussian_sigma'] = obstacle_map_gaussian_sigma
+            logger.info(f"Override planner.obstacle_map_gaussian_sigma = {obstacle_map_gaussian_sigma}")
+        # System prompt: 'default' uses robocasa_{task_type}_system/default_system_prompt.txt
+        # (loaded by core/LMP.py from env_name); 'safety_aware' / 'safety_aware_v2'
+        # overlay the matching file via system_prompt_extra. The safety_aware
+        # variants only exist for navigation; reject them for manipulation.
+        if system_prompt in ('safety_aware', 'safety_aware_v2'):
+            if task_type != 'navigation':
+                raise ValueError(
+                    f"--system-prompt '{system_prompt}' is navigation-only; "
+                    f"task classified as '{task_type}'")
+            from utils.utils import load_prompt
+            fname = f'robocasa_{task_type}_system/{system_prompt}_system_prompt.txt'
+            extra = load_prompt(fname).strip()
+            for _, lmp_cfg in cfg['lmp_config']['lmps'].items():
+                if lmp_cfg is not None:
+                    lmp_cfg['system_prompt_extra'] = extra
+            logger.info(f"[{task_type}] System prompt: {system_prompt} (overlay from {fname})")
+        elif system_prompt != 'default':
+            raise ValueError(
+                f"--system-prompt must be 'default' / 'safety_aware' / 'safety_aware_v2', got '{system_prompt}'")
+        else:
+            logger.info(f"[{task_type}] System prompt: default")
+        # Few-shot: 'default' uses the config's env_name (robocasa_{task_type}).
+        # The safety_aware* few-shot dirs only exist for navigation.
+        if few_shot == 'default':
+            pass  # keep cfg['env_name'] from the task_type merge
+        elif task_type == 'navigation' and few_shot == 'safety_aware':
+            cfg['env_name'] = 'robocasa_navigation_safety_aware'
+        elif task_type == 'navigation' and few_shot == 'safety_aware_v2':
+            cfg['env_name'] = 'robocasa_navigation_safety_aware_v2'
+        elif few_shot in ('safety_aware', 'safety_aware_v2'):
+            raise ValueError(
+                f"--few-shot '{few_shot}' is navigation-only; task classified as '{task_type}'")
+        else:
+            raise ValueError(
+                f"--few-shot must be 'default' / 'safety_aware' / 'safety_aware_v2', got '{few_shot}'")
+        logger.info(f"[{task_type}] Few-shot: {few_shot} (env_name={cfg['env_name']})")
+        if model:
+            for _, lmp_cfg in cfg['lmp_config']['lmps'].items():
+                if lmp_cfg is not None:
+                    lmp_cfg['model'] = model
+            logger.info(f"Using model: {model}")
+        if temperature is not None:
+            for _, lmp_cfg in cfg['lmp_config']['lmps'].items():
+                if lmp_cfg is not None:
+                    lmp_cfg['temperature'] = temperature
+            logger.info(f"Overriding temperature: {temperature}")
+        if is_openai_api:
+            api_key = os.environ.get('OPENAI_API_KEY')
+            if not api_key:
+                raise RuntimeError("OPENAI_API_KEY env var required for OpenAI models")
+            cfg['llm_api']['base_url'] = "https://api.openai.com/v1"
+            cfg['llm_api']['api_key']  = api_key
+            logger.info(f"OpenAI API endpoint: {cfg['llm_api']['base_url']} (model={model})")
+        else:
+            cfg['llm_api']['base_url'] = f"http://localhost:{port}/v1"
+            logger.info(f"vLLM endpoint: {cfg['llm_api']['base_url']}")
+        _config_cache[task_type] = cfg
+        return cfg
+
+    # Resolve the run-level task type used for the output dir name. With an
+    # explicit override that's it; with 'auto' we classify the first task
+    # (the per-task loop still re-classifies each task individually).
+    if task_type_override != 'auto':
+        run_task_type = task_type_override
+    elif task_specs:
+        # auto: name the run dir after the classified set; 'mixed' when a single
+        # auto run spans both task types (per-task loop still re-classifies each).
+        _types = {classify_task_type(t) for t in task_specs}
+        run_task_type = _types.pop() if len(_types) == 1 else 'mixed'
     else:
-        config['llm_api']['base_url'] = f"http://localhost:{port}/v1"
-        logger.info(f"vLLM endpoint: {config['llm_api']['base_url']}")
+        run_task_type = TASK_TYPE
 
     # create run-level output directory
     if output_dir:
@@ -189,7 +258,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
         model_short = re.sub(r'.+/', '', model or 'unknown').replace('-', '_')
         sp_tag = '' if system_prompt == 'default' else f"_sp-{system_prompt}"
         fs_tag = '' if few_shot == 'default' else f"_fs-{few_shot}"
-        run_dir = os.path.join("outputs", f"{TASK_TYPE}_{model_short}{sp_tag}{fs_tag}_{timestamp}")
+        run_dir = os.path.join("outputs", f"{run_task_type}_{model_short}{sp_tag}{fs_tag}_{timestamp}")
     new_run_dir = not os.path.exists(run_dir)
     os.makedirs(run_dir, exist_ok=True)
     if new_run_dir:
@@ -261,9 +330,17 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
 
     try:
         for idx, (task_name, layout_id, style_id) in enumerate(parsed):
+            # Per-task dispatch: an explicit --task-type override wins, else
+            # classify from the task name. task_type selects config (deep-merge),
+            # prompt dirs (few-shot + system), and which composer entrypoint
+            # (execute vs execute_navigation) the LLM-generated code resolves to.
+            task_type = (task_type_override if task_type_override != 'auto'
+                         else classify_task_type(task_name))
+            config = _build_config(task_type)
             obstacle, raw_mode, route = parse_task_categories(task_name)
             task_info = {
                 "task_name": task_name,
+                "task_type": task_type,
                 "obstacle": obstacle,
                 "safety_mode": SAFETY_MODE.get(raw_mode),
                 "route": route,
@@ -287,7 +364,25 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                 # Stale folder without a results.json entry — partial/orphan.
                 # Remove and re-run so the new run owns the slot.
                 logger.warning(f"[{idx+1}/{len(parsed)}] {task_name} — orphan folder, removing and re-running")
-                shutil.rmtree(task_dir_check, ignore_errors=True)
+                if os.environ.get('VOX_SKILL_RESUME') == '1':
+                    # resume mode: the partial run's stage snapshots + ep_meta ARE
+                    # the resume state — preserve them across the wipe so the
+                    # executor can skip completed stages.
+                    _keep = os.path.join(run_dir, f'.resume_keep_{task_name}')
+                    shutil.rmtree(_keep, ignore_errors=True)
+                    os.makedirs(_keep, exist_ok=True)
+                    for _it in ('stage_snapshots', 'ep_meta.json'):
+                        _src = os.path.join(task_dir_check, _it)
+                        if os.path.exists(_src):
+                            shutil.move(_src, os.path.join(_keep, _it))
+                    shutil.rmtree(task_dir_check, ignore_errors=True)
+                    os.makedirs(task_dir_check, exist_ok=True)
+                    for _it in os.listdir(_keep):
+                        shutil.move(os.path.join(_keep, _it), os.path.join(task_dir_check, _it))
+                    shutil.rmtree(_keep, ignore_errors=True)
+                    logger.info(f"  [skill-resume] preserved stage_snapshots + ep_meta across wipe")
+                else:
+                    shutil.rmtree(task_dir_check, ignore_errors=True)
 
             # Swap log destination from setup.log to {task_dir}/run.log so that
             # all LMP/planner/controller chatter for this task lives in one place.
@@ -325,7 +420,15 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     if style_id is not None:
                         task_config['style_ids'] = style_id
 
+                    # Manipulation: attach the 3D ValueMapVisualizer (saves an
+                    # interactive HTML + PNG snapshots per plan into the task dir).
+                    # Navigation keeps its 2D map/overview pipeline (visualizer=None).
                     visualizer = None
+                    if task_type == 'manipulation':
+                        from utils.visualizers import ValueMapVisualizer
+                        _viz_cfg = dict(config.get('visualizer', {}))
+                        _viz_cfg['save_dir'] = task_dir
+                        visualizer = ValueMapVisualizer(_viz_cfg)
                     env = VoxPoserRobocasa(visualizer=visualizer, task_name=task_name, task_config=task_config)
                     # IMPORTANT: load_task() must run BEFORE setup_LMP so that the
                     # per-layout planner grid (env.map_h, env.map_w) is set first.
@@ -388,6 +491,8 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                             vv = _lmp._variable_vars
                             if 'execute_navigation' in vv:
                                 vv['execute_navigation'] = _lmp_only_stub
+                            if 'execute' in vv:
+                                vv['execute'] = _lmp_only_stub
                             if 'parse_query_obj' in vv:
                                 vv['parse_query_obj'] = _stub_parse
                             if 'set_pixel_by_radius' in vv:
@@ -395,7 +500,8 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                             if 'cm2index' in vv:
                                 vv['cm2index'] = _stub_cm2index
                         lmp_env.execute_navigation = _lmp_only_stub
-                        logger.info("  [lmp-only] stubbed: execute_navigation, parse_query_obj, "
+                        lmp_env.execute = _lmp_only_stub
+                        logger.info("  [lmp-only] stubbed: execute_navigation, execute, parse_query_obj, "
                                     "set_pixel_by_radius, cm2index — no rollout, no perception.")
 
                     _try_capture_layout(task_info, env)
@@ -421,7 +527,44 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     instruction = env.env.get_ep_meta()['lang']
                     task_info['instruction'] = instruction
 
-                    lmps['plan_ui'](instruction)
+                    if os.environ.get('VOX_SKILL_EXEC') == '1':
+                        # Multi-skill executor path (Phase 0: transparent wrapper
+                        # around the same planner). Design:
+                        # docs/superpowers/specs/2026-07-15-multiskill-lmp-design.md
+                        from modules.skill_exec import run_instruction as _skill_run
+                        _skill_run(instruction, lmps, lmp_env)
+                        # Opt-in physical contact fallback. Unlike the separate
+                        # joint-assist diagnostic below, this only issues normal
+                        # gripper/base actions and reads the resulting hinge qpos.
+                        if (os.environ.get('VOX_DOOR_CONTACT_RECOVERY') == '1'
+                                and task_type == 'manipulation'
+                                and any(k in task_name.lower() for k in ('opendoor', 'closedoor',
+                                                                          'opensingledoor', 'opendoubledoor',
+                                                                          'closesingledoor', 'closedoubledoor'))):
+                            try:
+                                if not bool(env.env._check_success()):
+                                    _beh = 'close' if 'close' in task_name.lower() else 'open'
+                                    lmp_env._env.door_contact_recovery(_beh)
+                            except Exception as _dce:
+                                logger.warning(f'[door-contact] runner hook failed: {_dce}')
+                        # Optional diagnostic separation for hinged-door tasks:
+                        # physical handle access may plateau at the counter
+                        # edge even after all alias/nav fixes.  Keep the assist
+                        # opt-in so ordinary runs remain purely physical; when
+                        # enabled it records the hinge change explicitly.
+                        if (os.environ.get('VOX_DOOR_JOINT_ASSIST') == '1'
+                                and task_type == 'manipulation'
+                                and any(k in task_name.lower() for k in ('opendoor', 'closedoor',
+                                                                          'opensingledoor', 'opendoubledoor',
+                                                                          'closesingledoor', 'closedoubledoor'))):
+                            try:
+                                if not bool(env.env._check_success()):
+                                    _beh = 'close' if any(k in task_name.lower() for k in ('closedoor', 'closesingledoor', 'closedoubledoor')) else 'open'
+                                    lmp_env._env.door_joint_assist(_beh)
+                            except Exception as _dae:
+                                logger.warning(f'[door-assist] runner hook failed: {_dae}')
+                    else:
+                        lmps['plan_ui'](instruction)
                     task_info['lmp_output'] = lmps['plan_ui'].exec_hist.strip()
                     logger.info(f"  LMP execution done | instruction: {instruction}")
 
@@ -460,6 +603,86 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         raise LMPNoActuation(
                             f"LMP exec finished but robot took 0 steps for {task_name}"
                         )
+
+                    # Manipulation tasks have no navigation goal pose / mobile-base
+                    # metrics — success comes from the task's own _check_success().
+                    if task_type == 'manipulation':
+                        task_success = bool(env.env._check_success())
+                        try:
+                            _m = env.env.sim.model
+                            _objb = [i for i in range(_m.nbody) if 'obj' in (_m.body_id2name(i) or '') and 'mobile' not in (_m.body_id2name(i) or '')]
+                            for _b in _objb[:2]:
+                                logger.info(f"[final-obj] {_m.body_id2name(_b)} pos={np.asarray(env.env.sim.data.body_xpos[_b]).round(3)}")
+                        except Exception:
+                            pass
+                        try:
+                            # Door/drawer hinge states — shows how close a Close*
+                            # push got to the success threshold (joint_p < 0.05).
+                            _m = env.env.sim.model
+                            for _j in range(_m.njnt):
+                                _jn = _m.joint_id2name(_j) or ''
+                                if 'hinge' in _jn or 'slidejoint' in _jn:
+                                    _qa = _m.jnt_qposadr[_j]
+                                    _qv = float(env.env.sim.data.qpos[_qa])
+                                    if abs(_qv) > 1e-3:
+                                        logger.info(f"[final-joint] {_jn} qpos={_qv:.4f}")
+                            try:
+                                # PnP 성공요건 분해 로깅: 어떤 조건이 미달인지
+                                from robocasa.utils import object_utils as _OU
+                                for _fxa in ('sink', 'cab', 'stove', 'microwave', 'counter'):
+                                    _fx2 = getattr(env.env, _fxa, None)
+                                    if _fx2 is not None:
+                                        try:
+                                            _ins = _OU.obj_inside_of(env.env, 'obj', _fx2)
+                                            logger.info(f"[success-detail] obj_inside_of({_fxa})={_ins}")
+                                        except Exception:
+                                            pass
+                                logger.info(f"[success-detail] gripper_obj_far={_OU.gripper_obj_far(env.env)}")
+                                # the REAL PnP place check is direct fixture
+                                # CONTACT, not inside_of — objects landing on a
+                                # plate/board register inside(counter)=True but
+                                # contact=False (c2c r1-r3 all 'almost passed').
+                                _cnt = getattr(env.env, 'counter', None)
+                                if _cnt is not None:
+                                    try:
+                                        logger.info(f"[success-detail] contact(counter)={_OU.check_obj_fixture_contact(env.env, 'obj', _cnt)}")
+                                    except Exception:
+                                        pass
+                                try:
+                                    _ob = env.env.sim.data.body_xpos[env.env.obj_body_id['obj']]
+                                    logger.info(f"[success-detail] obj final pos={np.asarray(_ob).round(3)}")
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                            for _attr in ('drawer', 'door', 'window', 'door_fxtr', 'drawer_fxtr'):
+                                _fx = getattr(env.env, _attr, None)
+                                if _fx is not None and hasattr(_fx, 'get_door_state'):
+                                    logger.info(f"[final-door-state] {_attr}={_fx.get_door_state(env=env.env)}")
+                        except Exception:
+                            pass
+                        num_steps = metrics.get('num_steps', len(env._trajectory or []))
+                        logger.info(f"  [manipulation] {task_name}: success={task_success}, steps={num_steps}")
+                        # dump the executed EE trajectory (planned-vs-executed viz;
+                        # navigation already writes trajectory_log.json, manip didn't)
+                        try:
+                            _tr = env._trajectory or []
+                            _trb = getattr(env, '_trajectory_base', []) or []
+                            with open(os.path.join(task_dir, "ee_trajectory.json"), "w") as _tf:
+                                json.dump({"ee_pos": [[float(p[0]), float(p[1]), float(p[2])] for p in _tr],
+                                           "base_pos": [[float(p[0]), float(p[1])] for p in _trb],
+                                           "nav_spans": [[int(a), int(b)] for a, b in (getattr(env, '_nav_spans', []) or [])]}, _tf)
+                        except Exception as _te:
+                            logger.debug(f"ee_trajectory dump skipped: {_te}")
+                        evaluation = {
+                            "success": task_success,
+                            "num_steps": num_steps,
+                            "path_length_m": metrics.get('path_length', 0.0),
+                        }
+                        results.append({"task_info": task_info, "evaluation": evaluation})
+                        _log_task_result(results)
+                        signal.alarm(0)
+                        break  # success — exit retry loop
 
                     # Final robot pose
                     robot_id = env.env.sim.model.body_name2id("mobilebase0_base")
@@ -880,6 +1103,9 @@ def main():
                              "map lambda once (firing the LMPs so generated code is logged) then "
                              "return. Use for prompt-ablation studies where only the LMP outputs "
                              "matter, not the navigation success.")
+    parser.add_argument("--task-type", choices=["navigation", "manipulation", "auto"], default="auto",
+                        help="Override task_type; 'auto' classifies per task from the task name "
+                             "(NavigateKitchen* -> navigation, else manipulation).")
     parser.add_argument("--max-tasks", type=int, default=None,
                         help="Limit number of tasks (e.g. 1 for smoke test)")
     parser.add_argument("--obstacle-map-weight", type=float, default=None,
@@ -899,7 +1125,16 @@ def main():
     args = parser.parse_args()
 
     setup_logging(verbose=args.verbose)
-    task_list = args.tasks or get_navigate_tasks()
+    # Default task list (when none given): navigation tasks. With an explicit
+    # --task-type manipulation and no tasks, there is no registry default here —
+    # require the caller to pass task names.
+    if args.tasks:
+        task_list = args.tasks
+    elif args.task_type == 'manipulation':
+        parser.error("--task-type manipulation requires explicit task name(s); "
+                     "no manipulation default task list is defined.")
+    else:
+        task_list = get_navigate_tasks()
     if args.max_tasks is not None:
         task_list = task_list[:args.max_tasks]
     vlm_cameras = None
@@ -926,7 +1161,7 @@ def main():
               obstacle_map_gaussian_sigma=args.obstacle_map_gaussian_sigma,
               vlm_cameras=vlm_cameras,
               layout_ids=layout_pool, style_ids=style_pool,
-              lmp_only=args.lmp_only)
+              lmp_only=args.lmp_only, task_type_override=args.task_type)
 
 
 if __name__ == "__main__":

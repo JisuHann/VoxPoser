@@ -113,6 +113,52 @@ class PathPlanner:
         self.config = planner_config
         self.map_size = map_size
 
+    def optimize(self, start_pos: np.ndarray, target_map: np.ndarray, obstacle_map: np.ndarray, object_centric=False):
+        """3D voxel greedy-descent planner (manipulation).
+        start_pos: (3,); target_map/obstacle_map: (S,S,S); returns (path[n,3], info)."""
+        logger.debug(f'[{get_clock_time(milliseconds=True)}] planner start')
+        info = dict()
+        start_pos, raw_start_pos = start_pos.copy(), start_pos
+        target_map, raw_target_map = target_map.copy(), target_map
+        obstacle_map, raw_obstacle_map = obstacle_map.copy(), obstacle_map
+        target_map = distance_transform_edt(1 - target_map)
+        target_map = normalize_map(target_map)
+        obstacle_map = gaussian_filter(obstacle_map, sigma=self.config.obstacle_map_gaussian_sigma)
+        obstacle_map = normalize_map(obstacle_map)
+        costmap = target_map * self.config.target_map_weight + obstacle_map * self.config.obstacle_map_weight
+        costmap = normalize_map(costmap)
+        _costmap = costmap.copy()
+        stop_criteria = self._get_stop_criteria()
+        path, current_pos = [start_pos], start_pos
+        for i in range(self.config.max_steps):
+            all_nearby_voxels = self._calculate_nearby_voxel(current_pos, object_centric=object_centric)
+            nearby_score = _costmap[all_nearby_voxels[:, 0], all_nearby_voxels[:, 1], all_nearby_voxels[:, 2]]
+            steepest_idx = np.argmin(nearby_score)
+            next_pos = all_nearby_voxels[steepest_idx]
+            _costmap[current_pos[0].round().astype(int),
+                     current_pos[1].round().astype(int),
+                     current_pos[2].round().astype(int)] += 1
+            path.append(next_pos)
+            current_pos = next_pos
+            if stop_criteria(current_pos, _costmap, self.config.stop_threshold):
+                break
+        raw_path = np.array(path)
+        logger.info(f'[{get_clock_time(milliseconds=True)}] path optimized: {len(raw_path)} pts')
+        processed_path = self._postprocess_path(raw_path, raw_target_map, object_centric=object_centric)
+        logger.info(f'[{get_clock_time(milliseconds=True)}] after postprocessing: {len(processed_path)} pts')
+        info['start_pos'] = start_pos
+        info['target_map'] = target_map
+        info['obstacle_map'] = obstacle_map
+        info['costmap'] = costmap
+        info['costmap_altered'] = _costmap
+        info['raw_start_pos'] = raw_start_pos
+        info['raw_target_map'] = raw_target_map
+        info['raw_obstacle_map'] = raw_obstacle_map
+        info['planner_raw_path'] = raw_path.copy()
+        info['planner_postprocessed_path'] = processed_path.copy()
+        info['targets_voxel'] = np.argwhere(raw_target_map == 1)
+        return processed_path, info
+
     def navigation_optimize(self, start_pos: np.ndarray, target_map: np.ndarray, obstacle_map: np.ndarray, object_centric=False, robot_radius_cells: int = 0):
         """
         config:
@@ -405,6 +451,10 @@ class PathPlanner:
         if check_waypoint == 0:
             # find the closest target position
             target_pos = np.argwhere(raw_target_map == 1)
+            if len(target_pos) == 0:
+                # affordance values may be smoothed below 1; fall back to peak cells
+                _peak = raw_target_map.max()
+                target_pos = np.argwhere(raw_target_map >= _peak * 0.99) if _peak > 0 else np.array([last_waypoint])
             closest_target_idx = np.argmin(np.linalg.norm(target_pos - last_waypoint, axis=1))
             closest_target = target_pos[closest_target_idx]
             # for object centric motion, we assume we can only push in the xy plane

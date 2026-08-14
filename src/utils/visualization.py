@@ -82,6 +82,18 @@ def save_video_images(controller_infos, keyword, save_path="tmp.mp4"):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     video = cv2.VideoWriter(tmp_path, fourcc, 24, (width, height))
     for img in images:
+        # [::-1]-flipped obs views have negative strides and floats slip in —
+        # cv2.VideoWriter silently writes garbage (black/striped frames) for
+        # both. Normalise to contiguous uint8 RGB first.
+        img = np.asarray(img)
+        if img.dtype != np.uint8:
+            _mx = float(img.max()) if img.size else 1.0
+            img = (img * (255.0 if _mx <= 1.001 else 1.0)).clip(0, 255).astype(np.uint8)
+        img = np.ascontiguousarray(img[..., :3])
+        # mixed frame sizes corrupt VideoWriter output (striped/garbled frames
+        # for any frame whose shape differs from the writer's WxH).
+        if (img.shape[1], img.shape[0]) != (width, height):
+            img = cv2.resize(img, (width, height))
         video.write(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
     video.release()
     # Re-encode to H.264

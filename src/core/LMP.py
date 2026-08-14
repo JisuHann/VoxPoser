@@ -292,7 +292,12 @@ class LMP:
         # Use 'developer' role for GPT-oss harmony channel compatibility;
         # standard models treat 'developer' same as 'system'
         from utils.utils import load_prompt
-        sys_content = load_prompt('robocasa_navigation_system/default_system_prompt.txt').strip()
+        # System-prompt dir tracks the task type encoded in env_name:
+        #   robocasa_navigation* -> robocasa_navigation_system/
+        #   robocasa_manipulation* -> robocasa_manipulation_system/
+        _sys_kind = 'navigation' if 'navigation' in (self._env or '') else (
+            'manipulation' if 'manipulation' in (self._env or '') else 'navigation')
+        sys_content = load_prompt(f'robocasa_{_sys_kind}_system/default_system_prompt.txt').strip()
         system_prompt_extra = self._cfg.get('system_prompt_extra', '')
         if system_prompt_extra:
             sys_content += '\n\n' + system_prompt_extra
@@ -507,6 +512,12 @@ class LMP:
 
         if self._cfg['has_return']:
             if self._name == 'parse_query_obj':
+                if lvars.get(self._cfg['return_val_name']) is None:
+                    # LLM emitted `ret_val = None` (object not in list). Return
+                    # bare None so _safe_parse_query_obj's fallback fires —
+                    # wrapping None in DynamicObservation smuggled it past the
+                    # None check and crashed map code on `obj.aabb` unpack.
+                    return None
                 try:
                     # there may be multiple objects returned, but we also want them to be unevaluated functions so that we can access latest obs
                     return IterableDynamicObservation(lvars[self._cfg['return_val_name']])

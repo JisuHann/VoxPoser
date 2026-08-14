@@ -1,10 +1,24 @@
-## VoxPoser implemented in RoboCasa (navigation-only)
+## VoxPoser implemented in RoboCasa (navigation + manipulation)
 
-Mobile-robot safety-aware navigation built on top of RoboCasa (kitchen sim)
-and the VoxPoser LMP (Language Model Program) framework. The original
-VoxPoser supported manipulation; this fork strips the arm/gripper path
-and focuses entirely on navigating a holonomic base safely through a
-populated kitchen.
+Safety-aware robot control built on top of RoboCasa (kitchen sim) and the
+VoxPoser LMP (Language Model Program) framework. The fork supports **two
+task types**, selected automatically per task (or forced with
+`--task-type`):
+
+- **navigation** — drive a holonomic mobile base safely through a populated
+  kitchen, using **2D** value maps (`H × W` grid). Entry point
+  `execute_navigation` → `PathPlanner.navigation_optimize` →
+  `NavigationController`.
+- **manipulation** — pick-and-place with the arm end-effector, using **3D**
+  voxel value maps (`S × S × S` cube) plus a gripper map. Entry point
+  `execute` → `PathPlanner.optimize` → `ManipulationController`.
+
+`run_LMP.py` classifies each task (`NavigateKitchen*` → navigation, otherwise
+→ manipulation) and loads the matching config section, prompt directory, and
+system prompt. The two paths live side-by-side as siblings in the same
+modules; navigation behaviour is unchanged. Manipulation is pick-and-place
+only — the original VoxPoser pushing/MPC dynamics path is intentionally not
+restored.
 
 ## End-to-end pipeline
 
@@ -129,6 +143,46 @@ prompt can be the plain `default_system_prompt.txt` or the
 `safety_aware_system_prompt.txt` which instructs the model to scale
 clearance and speed by inferred obstacle character.
 
+## Manipulation (3D) pipeline
+
+The manipulation path mirrors the navigation one but operates on **3D voxel
+maps** and drives the **end-effector** instead of the base. The same PLANNER
+→ COMPOSER → MAP-LMP structure applies; the differences:
+
+```
+                 navigation (2D)                manipulation (3D)
+  maps           H × W grid                     S × S × S voxel cube
+  default maps   get_empty_*  (task='navigation')  get_empty_*  (task='manipulation')
+  extra map      —                              get_gripper_map (per-voxel open/close)
+  composer call  execute_navigation(...)        execute(movable, affordance, avoidance,
+                                                         rotation, velocity, gripper)
+  planner        PathPlanner.navigation_optimize  PathPlanner.optimize  (3D greedy descent)
+  annotation     _path2traj_navigation          _path2traj  (adds gripper state)
+  controller     NavigationController            ManipulationController
+                  → env.apply_navigation_action     → env.apply_action (EE pose + gripper)
+```
+
+- The `NavigationLMPInterface` derives `self._task_type` from the env name, so
+  the LLM-facing `get_empty_*` helpers return the correctly-shaped (2D vs 3D)
+  default map without the prompt having to pass `task=`.
+- **3D visualization** — `utils/visualizers.py:ValueMapVisualizer` renders the
+  costmap, planned path, start/target, and scene point cloud as an interactive
+  plotly `latest.html` (plus `latest_iso.png` / `latest_top.png` snapshots when
+  the `kaleido` package is installed). `visualizer.render_mode` selects:
+  `scatter` (light, downsampled point cloud — default), `volume`
+  (`go.Volume` isosurface, heaviest), or `auto` (volume when few voxels are
+  occupied, else scatter). This is the 3D analogue of navigation's 2D
+  `voxposer_overview.png`.
+
+### maps → trajectory helper (both task types)
+
+`modules/trajectory_builder.py:build_trajectory(...)` turns value maps +
+`start_pos` directly into a trajectory (planner + path2traj) with **no env
+rollout or LLM call** — handy for tests, visualization, and debugging. It is
+exposed on the interface as `maps_to_trajectory(..., task_type=...)`, and the
+initial plan step of both `execute_navigation` and `execute` route through it
+(navigation behaviour is preserved).
+
 ## Pure-pursuit navigator (current default)
 
 Since 2026-05-24 the default `NAV_MODE` is **`pure_pursuit`** with
@@ -211,8 +265,32 @@ docker exec robocasa-eval-0 bash -c "
 "
 ```
 
+Task type is auto-classified per task, but you can force it. A manipulation
+(pick-and-place) run:
+
+```shell
+docker exec robocasa-eval-0 bash -c "
+  cd /workspace/policy/Voxposer && MUJOCO_GL=egl \
+  python3 src/run_LMP.py -m Qwen/Qwen3-VL-8B-Instruct -p 8001 -w 0 \
+    --task-type manipulation --style-ids 3 \
+    PnPCounterToCab
+"
+```
+
+`--task-type {navigation, manipulation, auto}` defaults to `auto`
+(per-task classification). 3D viz lands in
+`outputs/manipulation_<run>/.../latest.html`; install `kaleido` in the
+container for the PNG snapshots.
+
 LMP-only mode (no physics rollout — useful for prompt ablation) is
-enabled with `--lmp-only`.
+enabled with `--lmp-only` (stubs both `execute_navigation` and `execute`).
+
+A unit smoke for the manipulation path (planner, 3D viz, classifier,
+maps→trajectory — no live env) runs with:
+
+```shell
+docker exec robocasa-container python3 /workspace/policy/Voxposer/src/smoke_manip.py
+```
 
 ## Multi-container parallel evaluation (6 docker workers)
 
@@ -247,10 +325,14 @@ that fully utilises all six workers.
 
 ## CLI knobs that change behaviour
 
+- `--task-type {navigation, manipulation, auto}` — `auto` (default)
+  classifies each task (`NavigateKitchen*` → navigation, else
+  manipulation) and loads the matching config/prompts/system prompt.
+  Force a type to override. `safety_aware*` prompts are navigation-only.
 - `--system-prompt {default, safety_aware}` — picks
-  `prompts/robocasa_navigation_system/<sp>_system_prompt.txt`. The
-  `safety_aware` overlay instructs the model to scale clearance and
-  speed by inferred obstacle character.
+  `prompts/robocasa_<task_type>_system/<sp>_system_prompt.txt`. The
+  `safety_aware` overlay (navigation only) instructs the model to scale
+  clearance and speed by inferred obstacle character.
 - `--few-shot {default, safety_aware, safety_aware_v2}` — picks the
   example directory under `prompts/`. `safety_aware_v2` adds the
   CRITICAL goal-vs-obstacle distinction note for tasks where the
@@ -266,21 +348,31 @@ that fully utilises all six workers.
 
 ```
 src/
-├── run_LMP.py                  # entry point, argparse, per-task runner
-├── core/LMP.py                 # one LMP = (prompt → vLLM → code → exec)
+├── run_LMP.py                  # entry point, argparse, per-task runner,
+│                               #   classify_task_type (nav vs manip)
+├── core/LMP.py                 # one LMP = (prompt → vLLM → code → exec);
+│                               #   system-prompt dir derived from env_name
 ├── modules/
 │   ├── interfaces.py           # LMP_interface: APIs the LLM sees
-│   │                           #   (parse_query_obj, set_pixel_by_radius,
-│   │                           #    get_*_map, execute_navigation)
-│   ├── planners.py             # PathPlanner.navigation_optimize
-│   └── controllers.py          # NavigationController.execute
+│   │                           #   (parse_query_obj, set_pixel/voxel_by_radius,
+│   │                           #    get_*_map, execute_navigation, execute,
+│   │                           #    maps_to_trajectory)
+│   ├── planners.py             # PathPlanner.navigation_optimize (2D) +
+│   │                           #   PathPlanner.optimize (3D manip)
+│   ├── controllers.py          # NavigationController + ManipulationController
+│   └── trajectory_builder.py   # build_trajectory: maps → trajectory (both)
 ├── envs/robocasa_env.py        # MuJoCo wrapper + safety metrics
-├── configs/robocasa_config.yaml
-├── utils/                      # logging, prompts, cache, ssi
+├── configs/robocasa_config.yaml  # navigation: / manipulation: overrides
+├── utils/
+│   ├── visualizers.py          # ValueMapVisualizer (3D, scatter/volume/auto)
+│   └── ...                     # logging, prompts, cache, ssi
+├── smoke_manip.py              # manipulation unit smoke (no live env)
 └── prompts/
     ├── robocasa_navigation/                    (baseline few-shot)
     ├── robocasa_navigation_safety_aware/       (character-aware few-shot)
     ├── robocasa_navigation_safety_aware_v2/    (safety_aware + CRITICAL note)
     ├── robocasa_navigation_system/             (system prompt variants)
-    └── robocasa_navigation_tier/               (legacy tier-implicit)
+    ├── robocasa_navigation_tier/               (legacy tier-implicit)
+    ├── robocasa_manipulation/                  (3D pick-and-place few-shot)
+    └── robocasa_manipulation_system/           (manip system prompt)
 ```
