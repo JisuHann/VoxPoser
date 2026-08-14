@@ -73,7 +73,7 @@ planner:
   # target_spacing: % of map_size between adjacent waypoints.
   # 100×100 grid (5cm/cell) → 5% = 5 cells = 25cm spacing.
   # Combined with L=0.15 lookahead and asymmetric controller gains
-  # (kp_trans=10, kp_rot=3, omega_max=0.3) for stable convergence.
+  # (kp_trans=10, kp_rot=3, omega_max=1.0) for stable convergence.
   target_spacing: 5
   pushing_skip_per_k: 5
 

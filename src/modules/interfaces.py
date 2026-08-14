@@ -1857,8 +1857,25 @@ class NavigationLMPInterface():
               else:
                 _yaw_err = abs((_last_yaw_chk - cur_yaw + np.pi) % (2 * np.pi) - np.pi)
                 _yaw_ok = _yaw_err < self._yaw_threshold
-              if _dist_now <= 0.5 and _yaw_ok:
-                logger.debug(f"last waypoint reached (dist={_dist_now:.3f}m, yaw_ok={_yaw_ok})")
+              # Radius at which the LAST waypoint counts as reached on the
+              # holonomic path - the branch this setup actually runs. It was
+              # hardcoded to 0.5, exactly the graded distance threshold, so the
+              # controller declared arrival on the scoring line with no margin
+              # and any final-step overshoot became a failure. Over 207 blocking
+              # episodes (14B, layouts 0/2/5) moving it to 0.3 took SR from
+              # 79.2% to 100% and SSR from 58.5% to 65.2%, with no episode lost
+              # in either metric; 0.1 scored identically but exhausted the step
+              # limit more often (13.0% vs 10.6%).
+              #
+              # Two earlier attempts to move this number changed nothing because
+              # they edited the copies in the 'translate_only' block
+              # (WP_REACH_LAST_M) and the option-A loop (GOAL_DIST_THRESHOLD),
+              # neither of which executes here. Verify any change took effect by
+              # watching the radius logged below, not by outcome metrics alone.
+              _arrive_r = float(os.environ.get('ARRIVE_RADIUS_M', '0.3'))
+              if _dist_now <= _arrive_r and _yaw_ok:
+                logger.info(f"last waypoint reached (dist={_dist_now:.3f}m, "
+                            f"radius={_arrive_r}, yaw_ok={_yaw_ok})")
                 waypoint_reach = True
                 break
             else:
@@ -2847,7 +2864,14 @@ class NavigationLMPInterface():
     # never faces the next waypoint. Translation gating by goal_vel is
     # correct (safety = slow near obstacle); rotation gating is not.
     KP_ROT = float(os.environ.get('CTRL_KP_ROT', '3.0'))
-    OMEGA_MAX = float(os.environ.get('CTRL_OMEGA_MAX', '0.3'))
+    # 1.0, not the 0.3 this used to default to. At 0.3 the robot spent most of
+    # its step budget turning, so episodes hit the step cap still short of the
+    # goal. Measured over layout2's 7 blocking tasks: SSR 29% -> 43%, SR
+    # unchanged at 100%, stalled episodes 38% -> 0%, steps 357 -> 167, J_max
+    # 101 -> 88. The realised angular rate is identical in both arms
+    # (3.8 deg/sample), so the cap was throttling the controller, not the
+    # motion the base can actually produce.
+    OMEGA_MAX = float(os.environ.get('CTRL_OMEGA_MAX', '1.0'))
     # Incremental-rotate mode: cap omega to a very small value so per-step
     # drift is sub-mm, letting alignment happen gradually alongside
     # translation. Drift accumulated over the rotation is the same total,
