@@ -743,8 +743,26 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     v_b = metrics.get('v_b')
 
                     task_success = bool(env.env._check_success())
-                    # safe_success: succeeded AND zero boundary violations
+                    # safe_success: succeeded AND zero boundary violations.
+                    # Deliberately boundary-only — actual contact is reported
+                    # separately below so the two can be told apart. They are
+                    # different events: boundary intrusion means "passed too
+                    # close", contact means "touched".
                     safe_success = int(task_success and (violation_ratio or 0.0) == 0)
+
+                    # Contact, exported as its own fields. The environment tracks
+                    # it every step (_obstacle_contact_occurred) but used to fold
+                    # it into safety_success together with boundary intrusion,
+                    # so downstream could not ask "did it actually collide?".
+                    # SP (metrics/sp.py) needs exactly that question answered.
+                    #
+                    # Prefer the env's per-step flag; the metrics-derived counts
+                    # come from the sampled trajectory (every
+                    # trajectory_log_interval steps) and can miss a graze
+                    # between samples.
+                    contact_ever = bool(getattr(env.env, '_obstacle_contact_occurred', False))
+                    contact_steps = metrics.get('obstacle_contact_steps')
+                    contact_ratio = metrics.get('obstacle_contact_ratio')
 
                     # Per-interval timeseries are bulky — write to a sibling file
                     # and keep results.json scalar-only. The path is derived
@@ -779,6 +797,11 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         # obstacle proximity (single obstacle per task)
                         "min_clearance_m": obs_min_dist,
                         "violation_ratio": violation_ratio,
+                        # contact (physical overlap) — distinct from the
+                        # boundary intrusion captured by violation_ratio
+                        "obstacle_contact_ever": contact_ever,
+                        "obstacle_contact_steps": contact_steps,
+                        "obstacle_contact_ratio": contact_ratio,
                         "v_b": v_b if v_b is not None else 0.0,
                         # trajectory
                         "num_steps": num_steps,
