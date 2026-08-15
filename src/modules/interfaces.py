@@ -24,8 +24,61 @@ def _vec2quat(*args):
     yaw = np.arctan2(v[1], v[0]) if np.linalg.norm(v[:2]) > 1e-8 else 0.0
     return transforms3d.euler.euler2quat(yaw, 0, 0)
 
-YAW_THRESHOLD_DEFAULT = 0.35
-DIST_THRESHOLD_DEFAULT = 0.05
+# --- Navigation thresholds -------------------------------------------------
+#
+# Four different numbers decide "are we there yet", and they used to be easy to
+# confuse. Two of them live here, one is graded by the environment, and one used
+# to exist in code paths this setup never executes. Naming them apart is the
+# point of this block - two earlier experiments moved a threshold that is never
+# read and burned ~1100 episodes proving nothing.
+#
+#   WAYPOINT_PASS_M   0.05  intermediate waypoint counts as passed (tight, so
+#                           the path is actually followed)
+#   ARRIVE_RADIUS_M   0.30  LAST waypoint counts as reached (env var, read at
+#                           the arrival check below)
+#   ARRIVE_YAW_RAD    0.35  yaw error allowed at arrival (~20 deg)
+#   SUCCESS_DIST_THRESHOLD_M / ori_cos>=0.8   <- graded by the benchmark, NOT
+#                           here: 0.5 m and ~36.9 deg (kitchen_navigate_safe.py)
+#
+# Note the two asymmetries, both deliberate:
+#   - arrival radius (0.30) < graded distance (0.50): the controller stops
+#     inside the scoring line so final-step overshoot does not fail the episode.
+#     They were equal (0.5) before, which left zero margin - 84% of position
+#     failures sat in the 0.5-0.6 m band.
+#   - arrival yaw (0.35 rad) < graded yaw (~0.64 rad): the controller is
+#     stricter than the grader here. Tightening costs steps but never fails an
+#     episode the grader would have passed.
+YAW_THRESHOLD_DEFAULT = 0.35    # rotate-gating during motion (see _yaw_threshold)
+DIST_THRESHOLD_DEFAULT = 0.05   # intermediate waypoint pass radius
+
+# Arrival criteria for the LAST waypoint. Separate names from the two above
+# because they answer a different question: those govern path following, these
+# govern when to stop. Sharing one number for both means tuning one silently
+# changes the other.
+ARRIVE_RADIUS_DEFAULT_M = 0.30
+ARRIVE_YAW_DEFAULT_RAD = 0.35
+
+
+def arrive_radius_m():
+    """Radius at which the last waypoint counts as reached, in metres.
+
+    Env override: ARRIVE_RADIUS_M. Verify a change took effect by watching the
+    radius printed in the "last waypoint reached" log line - outcome metrics
+    alone cannot tell you whether the parameter was even read.
+    """
+    return float(os.environ.get('ARRIVE_RADIUS_M', str(ARRIVE_RADIUS_DEFAULT_M)))
+
+
+def arrive_yaw_rad(fallback=None):
+    """Yaw error allowed at arrival, in radians. Env override: ARRIVE_YAW_RAD.
+
+    ``fallback`` lets the caller pass the controller's configured yaw_threshold
+    so existing configs keep working when the env var is unset.
+    """
+    v = os.environ.get('ARRIVE_YAW_RAD')
+    if v is not None:
+        return float(v)
+    return ARRIVE_YAW_DEFAULT_RAD if fallback is None else float(fallback)
 EE_ALIAS = ['ee', 'endeffector', 'end_effector', 'end effector', 'gripper', 'hand']
 TABLE_ALIAS = ['table', 'desk', 'workstation', 'work_station', 'work station', 'workspace', 'work_space', 'work space']
 
@@ -1231,6 +1284,11 @@ class NavigationLMPInterface():
         _outer_goal_mode = os.environ.get('OUTER_GOAL_DIST_MODE', '0') == '1'
         if _outer_goal_mode:
           goal_xy_world = np.asarray(traj_world[-1][0])
+          # DEAD BY DEFAULT: this whole branch needs OUTER_GOAL_DIST_MODE=1,
+          # which no production run sets. Setting GOAL_DIST_THRESHOLD without
+          # that flag changes nothing - an experiment once moved it and read the
+          # unchanged results as evidence. The threshold that actually governs
+          # arrival is ARRIVE_RADIUS_M (see header table).
           GOAL_DIST_THRESHOLD = float(os.environ.get('GOAL_DIST_THRESHOLD', '0.5'))
           _A_replan_every = max(_replan_n, 10)
           _A_global_max = self._max_steps_per_waypoint * 3 * max(len(traj_world), 8)
@@ -1688,6 +1746,9 @@ class NavigationLMPInterface():
           waypoint = traj_world[i]
           waypoint_reach = False
           is_last = (i == len(traj_world) - 1)
+          # Intermediate-waypoint pass radius (WAYPOINT_PASS_M in the header
+          # table). Deliberately tight (5 cm) so the robot actually follows the
+          # planned path; the LAST waypoint uses ARRIVE_RADIUS_M instead.
           dist_threshold = self._dist_threshold
           wp_step = 0
           _replan_jump = False
@@ -1850,13 +1911,18 @@ class NavigationLMPInterface():
             # or (b) tight dist (5cm) like before for non-last waypoints.
             _dist_now = float(np.linalg.norm(dxy))
             if is_last:
-              # Use config yaw_threshold (0.35 rad ≈ 20°)
+              # ARRIVE_YAW_RAD, not self._yaw_threshold. The two used to be the
+              # same value doing two different jobs - deciding when the robot
+              # has arrived, and gating rotate-vs-translate while driving.
+              # Tuning one silently moved the other. They default to the same
+              # 0.35 rad, so this split changes no behaviour on its own.
+              _arrive_yaw = arrive_yaw_rad(self._yaw_threshold)
               _last_yaw_chk = np.asarray(waypoint[1]).item() if np.asarray(waypoint[1]).size == 1 else float('nan')
               if np.isnan(_last_yaw_chk):
                 _yaw_ok = True   # no rotation requirement
               else:
                 _yaw_err = abs((_last_yaw_chk - cur_yaw + np.pi) % (2 * np.pi) - np.pi)
-                _yaw_ok = _yaw_err < self._yaw_threshold
+                _yaw_ok = _yaw_err < _arrive_yaw
               # Radius at which the LAST waypoint counts as reached on the
               # holonomic path - the branch this setup actually runs. It was
               # hardcoded to 0.5, exactly the graded distance threshold, so the
@@ -1872,10 +1938,11 @@ class NavigationLMPInterface():
               # (WP_REACH_LAST_M) and the option-A loop (GOAL_DIST_THRESHOLD),
               # neither of which executes here. Verify any change took effect by
               # watching the radius logged below, not by outcome metrics alone.
-              _arrive_r = float(os.environ.get('ARRIVE_RADIUS_M', '0.3'))
+              _arrive_r = arrive_radius_m()
               if _dist_now <= _arrive_r and _yaw_ok:
                 logger.info(f"last waypoint reached (dist={_dist_now:.3f}m, "
-                            f"radius={_arrive_r}, yaw_ok={_yaw_ok})")
+                            f"radius={_arrive_r}, yaw_ok={_yaw_ok}, "
+                            f"yaw_thr={_arrive_yaw:.3f})")
                 waypoint_reach = True
                 break
             else:
