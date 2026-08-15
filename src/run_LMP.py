@@ -134,7 +134,16 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
               system_prompt='default', few_shot='default',
               obstacle_map_weight=None, obstacle_map_gaussian_sigma=None,
               vlm_cameras=None, layout_ids=None, style_ids=None,
-              lmp_only=False, task_type_override='auto'):
+              lmp_only=False, task_type_override='auto',
+              external_planner=None):
+    """...
+
+    external_planner: 다른 정책이 waypoint 를 대신 만들도록 하는 훅. None 이면
+        기존 costmap+A* 경로를 그대로 탄다. 이 인자를 쓰는 쪽(예:
+        policy/keypoint_nav/run_keypoint.py)은 환경 생성·에피소드 루프·평가·
+        판정문 기록을 여기와 **공유**하게 되므로, 두 정책이 같은 잣대로 채점된다.
+        평가 코드를 복제하면 미묘한 차이가 비교를 오염시킨다.
+    """
     run_config = {
         "model": model,
         "system_prompt": system_prompt,
@@ -438,6 +447,9 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     # rectangular workspaces).
                     env.load_task()
                     lmps, lmp_env = setup_LMP(env, config, debug=False, output_dir=task_dir)
+                    if external_planner is not None:
+                        # 계획 단계만 갈아끼운다. 컨트롤러·도달 임계·판정문은 그대로다.
+                        lmp_env.external_planner = external_planner
 
                     if lmp_only:
                         # Replace bound methods captured in setup_LMP's variable_vars

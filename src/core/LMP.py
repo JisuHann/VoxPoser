@@ -436,6 +436,14 @@ class LMP:
         if 'llama-3.2' in model_name_lc and 'vision' in model_name_lc:
             # Llama-3.2-Vision max_pos=4096 (eval config); with prompt ~700 tokens, leave room → cap at 1024
             max_tokens = min(max_tokens, 1024)
+        # General escape hatch. The two cases above hardcode a model name, which
+        # means every short-context model needs a code change; LMP_MAX_TOKENS
+        # lets the caller cap the output budget for whatever it is serving.
+        # Needed when a model is served with a small max_model_len: the server
+        # rejects the request outright if input + max_tokens exceeds it.
+        _env_cap = os.environ.get('LMP_MAX_TOKENS')
+        if _env_cap:
+            max_tokens = min(max_tokens, int(_env_cap))
         start_time = time.time()
         last_err = None
         for api_attempt in range(API_MAX_RETRIES):

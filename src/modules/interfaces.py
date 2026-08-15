@@ -1073,10 +1073,25 @@ class NavigationLMPInterface():
                       f"cell_m={_cell_m:.3f} → robot_radius_cells={_robot_radius_cells}")
         except Exception:
           _robot_radius_cells = 0
-        _plan = self.maps_to_trajectory(start_pos, _affordance_map, _avoidance_map,
-                                        rotation_map=_rotation_map, velocity_map=_velocity_map,
-                                        task_type='navigation', object_centric=object_centric,
-                                        robot_radius_cells=_robot_radius_cells)
+        # An alternative policy can supply the waypoints instead of the
+        # costmap+A* planner. Everything downstream — controller, arrival
+        # thresholds, evaluation, verdict line — stays identical, which is the
+        # point: the two policies must be judged by the same yardstick, and the
+        # controller must not be able to tell them apart.
+        #
+        # Default is None, so an unset hook leaves this path byte-for-byte the
+        # behaviour it had before.
+        _ext = getattr(self, 'external_planner', None)
+        if _ext is not None:
+          _plan = _ext(self, start_pos=start_pos, affordance_map=_affordance_map,
+                       avoidance_map=_avoidance_map, rotation_map=_rotation_map,
+                       velocity_map=_velocity_map,
+                       robot_radius_cells=_robot_radius_cells)
+        else:
+          _plan = self.maps_to_trajectory(start_pos, _affordance_map, _avoidance_map,
+                                          rotation_map=_rotation_map, velocity_map=_velocity_map,
+                                          task_type='navigation', object_centric=object_centric,
+                                          robot_radius_cells=_robot_radius_cells)
         path_pixel, planner_info, traj_world = _plan['path'], _plan['planner_info'], _plan['traj_world']
         logger.debug(f'[{get_clock_time()}] planner time: {time.time() - start_time:.3f}s')
         assert len(path_pixel) > 0, 'path_pixel is empty'
