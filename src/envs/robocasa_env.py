@@ -577,7 +577,7 @@ class VoxPoserRobocasa():
 
         rgb = rgb[::-1]
         depth = depth[::-1]
-        # Open3D로 point cloud 생성
+        # Build the point cloud with Open3D
         rgb_o3d = o3d.geometry.Image(rgb.astype(np.uint8))
         depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
@@ -589,11 +589,11 @@ class VoxPoserRobocasa():
         intrinsic = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic)
 
-        # 카메라 좌표계 점들
+        # Points in the camera frame
         points_cam = np.asarray(pcd.points)
         colors = np.asarray(pcd.colors)
         
-        # Open3D -> MuJoCo 카메라 좌표계 변환
+        # Open3D -> MuJoCo camera frame
         # Open3D: X-right, Y-down, Z-forward
         # MuJoCo: X-right, Y-down, -Z-forward
         points_cam[:, 1] = -points_cam[:, 1]
@@ -603,7 +603,7 @@ class VoxPoserRobocasa():
         cam_pos = data.cam_xpos[cam_id]
         cam_rot = data.cam_xmat[cam_id].reshape(3, 3)
         
-        # 월드 좌표로 변환
+        # Into world coordinates
         points_world = (cam_rot @ points_cam.T).T + cam_pos
         point_cloud = np.hstack([points_world, colors])
         if len(point_cloud) == 0:
@@ -1078,9 +1078,9 @@ class VoxPoserRobocasa():
     def get_grasped_object(self, gripper):
         gripper_contacts = set(gripper.contact_geoms)
         
-        # 환경 내의 모든 물체에 대해 확인
+        # Check every object in the scene
         for obj_name, obj in self.env.objects.items():
-            # 물체의 충돌체와 그리퍼 충돌체 간의 접촉 확인
+            # Contact between the object's collision geoms and the gripper's
             touching_left = False
             touching_right = False
             
@@ -1088,11 +1088,11 @@ class VoxPoserRobocasa():
                 geom1 = self.env.sim.model.geom_id2name(contact.geom1)
                 geom2 = self.env.sim.model.geom_id2name(contact.geom2)
                 
-                # 한쪽이 그리퍼고 다른 한쪽이 물체인 경우
+                # One side is the gripper, the other is the object
                 if (geom1 in gripper_contacts and geom2 in obj.contact_geoms) or \
                 (geom2 in gripper_contacts and geom1 in obj.contact_geoms):
-                    # 구체적으로 어느 손가락인지 체크 로직을 추가하여 
-                    # 양쪽 손가락 사이(grasp)에 있는지 판별 가능
+                    # Adding a per-finger check here would let us tell a true grasp
+                    # (object held between both fingers) from a one-sided touch.
                     return obj_name
         return None
 
