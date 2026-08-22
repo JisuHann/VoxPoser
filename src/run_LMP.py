@@ -130,7 +130,7 @@ def _try_render_voxposer_overview(task_dir):
 
 
 def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None,
-              max_retries=3, temperature=None,
+              max_retries=3, temperature=None, seed=None,
               system_prompt='default', few_shot='default',
               obstacle_map_weight=None, obstacle_map_gaussian_sigma=None,
               vlm_cameras=None, layout_ids=None, style_ids=None,
@@ -149,6 +149,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
         "system_prompt": system_prompt,
         "few_shot": few_shot,
         "temperature": temperature,
+        "seed": seed,
         "obstacle_map_weight": obstacle_map_weight,
         "obstacle_map_gaussian_sigma": obstacle_map_gaussian_sigma,
         "vlm_cameras": list(vlm_cameras) if vlm_cameras else None,
@@ -233,6 +234,15 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                 if lmp_cfg is not None:
                     lmp_cfg['temperature'] = temperature
             logger.info(f"Overriding temperature: {temperature}")
+        # Sampling seed for every LMP. temperature=0 alone does not make a run
+        # reproducible under vLLM's continuous batching; the seed is what closes
+        # that. It is also part of the LLM cache key, so a seeded run never
+        # serves answers generated under a different one.
+        if seed is not None:
+            for _, lmp_cfg in cfg['lmp_config']['lmps'].items():
+                if lmp_cfg is not None:
+                    lmp_cfg['seed'] = seed
+            logger.info(f"Using sampling seed: {seed}")
         if is_openai_api:
             api_key = os.environ.get('OPENAI_API_KEY')
             if not api_key:
@@ -1124,6 +1134,7 @@ def main():
     parser.add_argument("-o", "--output-dir", default=None, help="Shared output directory (for parallel eval)")
     parser.add_argument("--max-retries", type=int, default=3, help="Max retries for transient rendering errors")
     parser.add_argument("--temperature", type=float, default=None, help="Override LLM temperature for all LMPs (e.g. 0.5 for stochastic runs)")
+    parser.add_argument("--seed", type=int, default=None, help="Sampling seed sent to the LLM and included in the cache key (temperature=0 alone is not reproducible under vLLM batching)")
     parser.add_argument("--system-prompt", choices=["default", "safety_aware", "safety_aware_v2"], default="default",
                         help="System prompt: 'default' uses default_system_prompt.txt; "
                              "'safety_aware' overlays the 5-example concrete variant; "
@@ -1190,7 +1201,7 @@ def main():
     style_pool  = _parse_id_list(args.style_ids,  [3])
     run_tasks(task_list, model=args.model, port=args.port, worker_id=args.worker_id,
               output_dir=args.output_dir, max_retries=args.max_retries,
-              temperature=args.temperature,
+              temperature=args.temperature, seed=args.seed,
               system_prompt=args.system_prompt, few_shot=args.few_shot,
               obstacle_map_weight=args.obstacle_map_weight,
               obstacle_map_gaussian_sigma=args.obstacle_map_gaussian_sigma,

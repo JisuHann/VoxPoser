@@ -373,6 +373,15 @@ class LMP:
             extra_body = {"reasoning_effort": "low"}
             logger.debug(f'[LMP "{self._name}"] setting GPT-oss reasoning_effort=low')
         create_kwargs = dict(kwargs)
+        # Sampling seed. temperature=0 alone does not make a run reproducible:
+        # vLLM batches requests continuously, so the same prompt can come back
+        # different depending on what it was batched with. Measured on the ReKep
+        # navigation policy, one episode returned 98.2 / 80.0 / 10.9 % violation
+        # across three identical runs. None means the field is omitted, so an
+        # endpoint that does not understand `seed` still works.
+        _seed = self._cfg.get('seed')
+        if _seed is not None:
+            create_kwargs['seed'] = int(_seed)
         if extra_body:
             create_kwargs['extra_body'] = extra_body
 
@@ -391,6 +400,10 @@ class LMP:
                     'max_tokens': kwargs.get('max_tokens'),
                     'stop': kwargs.get('stop'),
                     'extra_body': extra_body,
+                    # The seed belongs in the key. Without it a seeded run would
+                    # silently serve answers generated before the seed existed,
+                    # and the run would look reproducible without being so.
+                    'seed': create_kwargs.get('seed'),
                 }
                 # JSON-serializable check (skips weird types)
                 import json as _json
