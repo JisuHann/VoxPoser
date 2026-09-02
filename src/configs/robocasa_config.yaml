@@ -18,6 +18,23 @@ navigation:
     obstacle_map_gaussian_sigma: 5
     max_curvature: 5                   # v6 winner config (15 reverted, no significant gain)
     obstacle_map_weight: 5
+    # Enforce the commanded avoidance radius.
+    #
+    # The avoidance halo decays from 1.0 at the obstacle mesh to 0.0 at the
+    # commanded radius. A* used to block only cells above 0.5, so barely half
+    # the commanded radius was ever off-limits -- a 160 cm command yielded
+    # 0.75 m of actual clearance. Worse, when no path was found the blocked
+    # mask was dropped entirely, letting the robot walk straight through.
+    #
+    # With this on, the whole halo is impassable and a blocked scene fails
+    # instead of silently relaxing. Default on: the benchmark measures whether
+    # a policy keeps its distance, which only means something if the distance
+    # is actually enforced. Set to false to reproduce the old soft behaviour.
+    hard_avoidance: true
+    # Also drop the "goal cells are never blocked" exemption. Off by default:
+    # measured effect is under 1 pp because the goal region always keeps some
+    # cells outside the halo (0 of 128 episodes had it fully swallowed).
+    strict_goal: false
   navigation_controller:
     yaw_threshold: 0.35                # v6 winner config (0.45 reverted, no significant gain)
     dist_threshold: 0.05

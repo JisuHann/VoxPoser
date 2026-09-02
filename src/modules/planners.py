@@ -1,4 +1,5 @@
 """Greedy path planner."""
+import os
 import heapq
 import numpy as np
 from scipy.ndimage import gaussian_filter
@@ -9,7 +10,8 @@ from utils.utils import get_clock_time, normalize_map, calc_curvature, get_logge
 logger = get_logger(__name__)
 
 
-def _astar_pixel(start_pos, costmap, target_mask, blocked_mask=None):
+def _astar_pixel(start_pos, costmap, target_mask, blocked_mask=None,
+                 strict_goal=False):
     """A* search on a 2D cost grid to any cell in `target_mask`.
 
     Args:
@@ -46,11 +48,21 @@ def _astar_pixel(start_pos, costmap, target_mask, blocked_mask=None):
         ( 1, -1, 1.41421356), ( 1, 0, 1.0), ( 1, 1, 1.41421356),
     )
 
-    # Respect blocked_mask but always allow start and target cells
+    # Respect blocked_mask, always allowing the start cell.
+    #
+    # Target cells are exempt unless strict_goal is set. Without the exemption
+    # a goal swallowed by an avoidance halo becomes unreachable, which is what
+    # "the destination is undetermined" looks like. That happens to the goal
+    # centre in 8-19% of episodes, but the goal region always keeps some cells
+    # outside the halo, so the measured effect is under 1 pp. The start cell
+    # stays exempt either way: blocking it would stop the search from
+    # beginning at all.
     def _is_blocked(pos):
         if blocked_mask is None:
             return False
-        if pos == start or target_mask[pos]:
+        if pos == start:
+            return False
+        if target_mask[pos] and not strict_goal:
             return False
         return bool(blocked_mask[pos])
 
@@ -112,6 +124,15 @@ class PathPlanner:
     def __init__(self, planner_config, map_size):
         self.config = planner_config
         self.map_size = map_size
+
+    def _flag(self, name, default, env):
+        """Read a boolean planner setting; the env var wins when set."""
+        raw = os.environ.get(env)
+        if raw is not None:
+            return raw == '1'
+        if hasattr(self.config, 'get'):
+            return bool(self.config.get(name, default))
+        return bool(getattr(self.config, name, default))
 
     def optimize(self, start_pos: np.ndarray, target_map: np.ndarray, obstacle_map: np.ndarray, object_centric=False):
         """3D voxel greedy-descent planner (manipulation).
@@ -200,12 +221,23 @@ class PathPlanner:
         # paths around obstacle regions that local greedy can't see, and avoids
         # the "stops far from goal → force-append teleport" failure mode.
         use_astar = bool(self.config.get('use_astar', False)) if hasattr(self.config, 'get') else getattr(self.config, 'use_astar', False)
+        # Avoidance enforcement, from config (robocasa_config.yaml planner
+        # block). Env vars override so a single run can be flipped without
+        # editing the config.
+        hard_avoid = self._flag('hard_avoidance', True, 'VOXPOSER_HARD_AVOID')
+        strict_goal = self._flag('strict_goal', False, 'VOXPOSER_STRICT_GOAL')
         if use_astar:
             # Threshold 0.5: filters out outer-halo cells (gradient affordance has
             # value < 0.5 there). A* terminates only in inner half-radius zone,
             # pulling the robot deeper than the standard "any halo cell" termination.
             target_mask = raw_target_map > 0.5
-            obs_binary = (raw_obstacle_map > 0.5)
+            # The avoidance halo decays from 1.0 at the mesh to 0.0 at the
+            # commanded radius, so a 0.5 threshold enforces only half of what
+            # was asked for -- a 160 cm command produced 0.75 m of clearance.
+            # hard_avoidance lowers the threshold so the whole halo is
+            # off-limits, for oracle and model-generated code alike.
+            _thr = 0.05 if hard_avoid else 0.5
+            obs_binary = (raw_obstacle_map > _thr)
             # Scale cost map up so the obstacle gradient is not drowned by
             # the Euclidean heuristic in the fallback (no-inflation) case.
             # Without scaling, costmap ∈ [0, 1] vs h_map ∈ [0, ~141 pixels]
@@ -236,9 +268,18 @@ class PathPlanner:
                 if r > 0:
                     from scipy.ndimage import binary_dilation
                     inflated = binary_dilation(obs_binary, iterations=int(r))
+                elif hard_avoid:
+                    # The final attempt normally drops blocking altogether to
+                    # reach the goal at any cost, which is what kept the
+                    # avoidance region from ever being absolute. Keep the
+                    # region blocked and only give up the robot-radius
+                    # inflation; if no path exists, let the episode fail.
+                    inflated = obs_binary
                 else:
                     inflated = None
-                p = _astar_pixel(start_pos, cm_for_astar, target_mask, blocked_mask=inflated)
+                p = _astar_pixel(start_pos, cm_for_astar, target_mask,
+                                 blocked_mask=inflated,
+                                 strict_goal=strict_goal)
                 if p is None or len(p) < 2:
                     continue
                 _last = p[-1].astype(int)

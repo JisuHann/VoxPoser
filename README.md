@@ -228,6 +228,61 @@ outputs/<run_name>/                           # one dir per evaluation run
 └── setup_w*.log                              # per-worker setup log
 ```
 
+## Safety evaluation: enforced avoidance and the reference oracle
+
+Two pieces were added to make "how far did the robot stay away" a question the
+benchmark can actually answer.
+
+### Enforced avoidance (`planner.hard_avoidance`, default **on**)
+
+`set_pixel_by_radius` paints an avoidance halo that decays from 1.0 at the
+obstacle mesh to 0.0 at the commanded radius. A* used to treat only cells
+above 0.5 as blocked, so **barely half the commanded radius was ever
+off-limits** — commanding 160 cm produced 0.75 m of real clearance. And when
+no path was found, the last attempt dropped the blocked mask entirely, so the
+robot walked through the obstacle rather than failing.
+
+With `hard_avoidance` on, the threshold drops to 0.05 (the whole halo is
+impassable) and the blocked region survives the final attempt. A scene with no
+route now fails instead of quietly relaxing. This applies to model-generated
+code exactly as it does to the oracle.
+
+`planner.strict_goal` (default off) additionally removes the "goal cells are
+never blocked" exemption. Measured effect is under 1 pp: the goal region always
+keeps some cells outside the halo, so a swallowed goal centre does not make the
+destination unreachable.
+
+Both read from `robocasa_config.yaml`; `VOXPOSER_HARD_AVOID` and
+`VOXPOSER_STRICT_GOAL` override per run.
+
+### Reference oracle (`src/core/oracle.py`)
+
+Set `VOXPOSER_ORACLE` and the planner step runs a rule-built program with **no
+LLM call at all** — it needs no server and its results do not depend on which
+model is loaded.
+
+```bash
+VOXPOSER_ORACLE=uniform:80        # same radius for every obstacle
+VOXPOSER_ORACLE=tier:20/40/60     # low / medium / high tier radii
+VOXPOSER_ORACLE_OBSTACLE=cat      # tier lookup; the runner sets this
+```
+
+Sweeping the radius maps the frontier the layout allows. On the 128-episode
+balanced set (Blocking condition):
+
+| radius | task-success | safety-pass | median clearance |
+|--------|--------------|-------------|------------------|
+| 40 cm  | 100%         | 92%         | 0.69 m |
+| 80 cm  | 97%          | **94%**     | 0.95 m |
+| 120 cm | 91%          | 91%         | 0.99 m |
+| 160 cm | 42%          | 77%         | 0.97 m |
+
+Clearance saturates near 1 m — what the corridors allow — while commanding
+more keeps costing reach and, past 120 cm, safety as well. At 160 cm even the
+low tier (0.2 m boundary) starts failing, because the halo blocks the corridor
+and the path itself degrades. **Caution has an optimum, and it is not the
+largest radius.**
+
 ## Quick start
 
 ```shell
@@ -351,7 +406,12 @@ src/
 ├── run_LMP.py                  # entry point, argparse, per-task runner,
 │                               #   classify_task_type (nav vs manip)
 ├── core/LMP.py                 # one LMP = (prompt → vLLM → code → exec);
-│                               #   system-prompt dir derived from env_name
+│                               #   system-prompt dir derived from env_name;
+│                               #   planner step hands over to the oracle when
+│                               #   VOXPOSER_ORACLE is set
+├── core/oracle.py              # rule-based reference: fixes the avoidance
+│                               #   radius, emits the same program an LMP would,
+│                               #   and makes no LLM call
 ├── modules/
 │   ├── interfaces.py           # LMP_interface: APIs the LLM sees
 │   │                           #   (parse_query_obj, set_pixel/voxel_by_radius,

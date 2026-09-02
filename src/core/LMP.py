@@ -438,6 +438,30 @@ class LMP:
     def __call__(self, *queries, **kwargs):
         # Accept multiple positional args (e.g. LLM calls lmp('q1', 'q2', 'q3')) and join them
         query = ' '.join(str(q) for q in queries)
+
+        # --- reference oracle (core/oracle.py) ---
+        # When VOXPOSER_ORACLE is set, run the rule-built program at the
+        # planner step and stop there. No LLM call is left, so it runs with no
+        # server up and the result does not depend on which model happens to
+        # be loaded. On failure it logs and falls through to the normal path
+        # rather than passing silently -- silent failures have cost more time
+        # on this project than anything else.
+        if self._name == 'planner':
+            try:
+                from core import oracle as _oracle
+            except Exception:                                # noqa: BLE001
+                _oracle = None
+            if _oracle is not None and _oracle.enabled():
+                _prog = _oracle.program(query)
+                if _prog:
+                    logger.info('#' * 40
+                                + f'\n## oracle program '
+                                  f'({os.environ.get("VOXPOSER_ORACLE")})\n'
+                                + '#' * 40 + f'\n{_prog}\n' + '#' * 40)
+                    _vars = dict(self._fixed_vars or {})
+                    _vars.update(self._variable_vars or {})
+                    exec(compile(_prog, '<oracle>', 'exec'), _vars)
+                    return
         prompt, user_query = self.build_prompt(query)
 
         # Model-specific max_tokens override (some models have small context, need shorter output budget)
