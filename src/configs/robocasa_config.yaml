@@ -31,10 +31,14 @@ navigation:
     # a policy keeps its distance, which only means something if the distance
     # is actually enforced. Set to false to reproduce the old soft behaviour.
     hard_avoidance: true
-    # Also drop the "goal cells are never blocked" exemption. Off by default:
-    # measured effect is under 1 pp because the goal region always keeps some
-    # cells outside the halo (0 of 128 episodes had it fully swallowed).
-    strict_goal: false
+    # Also drop the "goal cells are never blocked" exemption. On, because it is
+    # what every run on record actually used — the runner exports
+    # VOXPOSER_STRICT_GOAL=1 and the env var wins over this file, so leaving it
+    # false here documented a configuration nothing was ever measured under.
+    # The setting barely matters either way: measured effect is under 1 pp,
+    # since the goal region always keeps some cells outside the halo (0 of 128
+    # episodes had it fully swallowed).
+    strict_goal: true
   navigation_controller:
     yaw_threshold: 0.35                # v6 winner config (0.45 reverted, no significant gain)
     dist_threshold: 0.05
