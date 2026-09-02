@@ -1009,21 +1009,31 @@ class NavigationLMPInterface():
       for plan_iter in range(self._cfg['max_plan_iter']):
         step_info = dict()
         movable_obs = movable_obs_func()
-        _affordance_map = affordance_map()
-        _avoidance_map = avoidance_map()
-        _rotation_map = rotation_map()
-        _velocity_map = velocity_map()
-        # Defensive fallback: LMP-generated get_*_map sometimes omits `ret_val =`
-        # at the end → returns None → downstream crashes ('NoneType' subscriptable).
-        # Replace any None with the corresponding default voxel map.
-        if _rotation_map is None:
-            _rotation_map = self._get_default_voxel_map('rotation', task='navigation')()
-        if _velocity_map is None:
-            _velocity_map = self._get_default_voxel_map('velocity', task='navigation')()
-        if _affordance_map is None:
-            _affordance_map = self._get_default_voxel_map('target', task='navigation')()
-        if _avoidance_map is None:
-            _avoidance_map = self._get_default_voxel_map('obstacle', task='navigation')()
+        # LMP-generated get_*_map code can either: (a) return None (omitted
+        # `ret_val =`) or (b) raise — e.g. kimi-vl sometimes calls cm2index
+        # with a scalar direction for vague queries ("any of them"). Both
+        # paths fall back to the default voxel map so the episode survives
+        # one LLM-quality glitch rather than RETRYABLE-ing 3× and giving up.
+        def _safe_map(fn, kind):
+            try:
+                v = fn()
+                if v is None:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        f'[execute_navigation] {kind}_map returned None → default'
+                    )
+                    return self._get_default_voxel_map(kind, task='navigation')()
+                return v
+            except Exception as _e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    f'[execute_navigation] {kind}_map raised {type(_e).__name__}: {_e} → default'
+                )
+                return self._get_default_voxel_map(kind, task='navigation')()
+        _affordance_map = _safe_map(affordance_map, 'target')
+        _avoidance_map = _safe_map(avoidance_map, 'obstacle')
+        _rotation_map = _safe_map(rotation_map, 'rotation')
+        _velocity_map = _safe_map(velocity_map, 'velocity')
         _avoidance_map = self._preprocess_avoidance_pixel_map(_avoidance_map, _affordance_map, movable_obs)
         start_pos = movable_obs['position'][:2]
         start_time = time.time()
@@ -1292,86 +1302,6 @@ class NavigationLMPInterface():
         # number of waypoints × per-wp limit so normal tasks aren't affected.
         _global_max_steps = self._max_steps_per_waypoint * 2 * max(len(traj_world), 6)
         _global_start_step = step_idx
-        # === Option A: goal-distance based outer loop ===
-        # Activated by OUTER_GOAL_DIST_MODE=1. Instead of iterating through
-        # waypoints, loop until robot is within GOAL_DIST_THRESHOLD of the
-        # final waypoint. Periodic replan trims/regenerates traj_world.
-        _outer_goal_mode = os.environ.get('OUTER_GOAL_DIST_MODE', '0') == '1'
-        if _outer_goal_mode:
-          goal_xy_world = np.asarray(traj_world[-1][0])
-          # DEAD BY DEFAULT: this whole branch needs OUTER_GOAL_DIST_MODE=1,
-          # which no production run sets. Setting GOAL_DIST_THRESHOLD without
-          # that flag changes nothing - an experiment once moved it and read the
-          # unchanged results as evidence. The threshold that actually governs
-          # arrival is ARRIVE_RADIUS_M (see header table).
-          GOAL_DIST_THRESHOLD = float(os.environ.get('GOAL_DIST_THRESHOLD', '0.5'))
-          _A_replan_every = max(_replan_n, 10)
-          _A_global_max = self._max_steps_per_waypoint * 3 * max(len(traj_world), 8)
-          _A_steps = 0
-          logger.info(f'[option-A] goal_xy={goal_xy_world.tolist()} thresh={GOAL_DIST_THRESHOLD} '
-                      f'replan_every={_A_replan_every} global_max={_A_global_max}')
-          while True:
-            cp = self._env.env._get_observations()['robot0_base_pos'][:2]
-            dist_goal = float(np.linalg.norm(cp - goal_xy_world))
-            if dist_goal <= GOAL_DIST_THRESHOLD:
-              logger.info(f'[option-A] goal reached @ step {step_idx} '
-                          f'(dist={dist_goal:.3f}m, A_steps={_A_steps})')
-              break
-            if _A_steps >= _A_global_max:
-              logger.warning(f'[option-A] global timeout @ A_steps={_A_steps} '
-                             f'(dist={dist_goal:.3f}m)')
-              break
-            # Periodic replan from cur_pos
-            if _A_steps > 0 and _A_steps % _A_replan_every == 0:
-              try:
-                _robot_obs = self.detect('robot_mobile_base')
-                _cur_grid = np.asarray(_robot_obs['position'])[:2]
-                _new_path, _ = self._planner.navigation_optimize(
-                    _cur_grid, _cached_aff, _cached_avoid,
-                    robot_radius_cells=_cached_rr)
-                if _new_path is not None and len(_new_path) > 1:
-                  _new_traj = self._path2traj_navigation(
-                      _new_path, _cached_avoid, _cached_rot_map, _cached_vel_map)
-                  if len(_new_traj) > 1:
-                    traj_world = _new_traj[1:self._cfg['num_waypoints_per_plan']+1]
-                    logger.info(f'[option-A] replan @ step {step_idx}: '
-                                f'{len(traj_world)} wps, dist_goal={dist_goal:.3f}')
-              except Exception as _rpe:
-                logger.warning(f'[option-A] replan failed: {_rpe}')
-            # Prune already-reached wps from front of traj_world
-            while len(traj_world) > 1:
-              _wp0 = np.asarray(traj_world[0][0])
-              if float(np.linalg.norm(cp - _wp0)) < 0.10:
-                traj_world = traj_world[1:]
-              else:
-                break
-            if len(traj_world) == 0:
-              logger.warning('[option-A] traj empty after pruning; exit')
-              break
-            target_wp = traj_world[0]
-            lookahead_wp = traj_world[1] if len(traj_world) > 1 else traj_world[0]
-            next_wp = traj_world[1] if len(traj_world) > 1 else traj_world[0]
-            traj_action, _ = self._navigate_to_trajectory(
-                target_wp, next_wp, lookahead_wp=lookahead_wp)
-            controller_info = self._nav_controller.execute(traj_action)
-            controller_info['controller_step'] = step_idx
-            controller_info['target_waypoint'] = target_wp
-            for _vlm_cam in VoxPoserRobocasa.VIDEO_RECORD_CAMERAS:
-              _key = f"{_vlm_cam}_image"
-              if _key in controller_info['mp_info'][0]:
-                controller_info[_key] = controller_info['mp_info'][0][_key][::-1]
-            controller_infos[step_idx] = controller_info
-            step_idx += 1
-            _A_steps += 1
-          pbar.close()
-          step_info['controller_infos'] = controller_infos
-          execute_info.append(step_info)
-          curr_pos = movable_obs['position'][:2].astype(int)
-          if distance_transform_edt(1 - _affordance_map)[tuple(curr_pos)] <= 2:
-            logger.info(f'[{get_clock_time()}] reached target; terminating')
-            break
-          continue   # skip the legacy wp-iteration loop below
-        # === End Option A ===
 
         # === PURE-PURSUIT mode (NAV_MODE=pure_pursuit) ===
         # Replaces the discrete waypoint-by-waypoint follower. A lookahead

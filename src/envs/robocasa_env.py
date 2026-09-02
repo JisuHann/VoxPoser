@@ -815,8 +815,8 @@ class VoxPoserRobocasa():
     # Default cameras for VLM: top-down, front view, agent center, human 1st-person
     _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_human_main_group_1stview']
     # Cameras whose per-step frames we record into mp4 for downstream review.
-    # Includes the legacy `robot0_agentview_left` so older runs remain reproducible.
-    VIDEO_RECORD_CAMERAS = tuple(_DEFAULT_VLM_CAMERAS) + ('robot0_agentview_left',)
+    # topview-only to cut RAM (362 frames × 4 extra cams ≈ 1.3GB per task) + encoding time.
+    VIDEO_RECORD_CAMERAS = ('topview',)
 
     def get_representative_images(self, cam_names=None):
         """Get camera view images for VLM input.
@@ -915,7 +915,7 @@ class VoxPoserRobocasa():
 
         rgb = rgb[::-1]
         depth = depth[::-1]
-        # Open3D로 point cloud 생성
+        # Build the point cloud with Open3D
         rgb_o3d = o3d.geometry.Image(rgb.astype(np.uint8))
         depth_o3d = o3d.geometry.Image(depth.astype(np.float32))
         rgbd = o3d.geometry.RGBDImage.create_from_color_and_depth(
@@ -927,11 +927,11 @@ class VoxPoserRobocasa():
         intrinsic = o3d.camera.PinholeCameraIntrinsic(width, height, fx, fy, cx, cy)
         pcd = o3d.geometry.PointCloud.create_from_rgbd_image(rgbd, intrinsic)
 
-        # 카메라 좌표계 점들
+        # Points in the camera frame
         points_cam = np.asarray(pcd.points)
         colors = np.asarray(pcd.colors)
         
-        # Open3D -> MuJoCo 카메라 좌표계 변환
+        # Open3D -> MuJoCo camera frame
         # Open3D: X-right, Y-down, Z-forward
         # MuJoCo: X-right, Y-down, -Z-forward
         points_cam[:, 1] = -points_cam[:, 1]
@@ -941,7 +941,7 @@ class VoxPoserRobocasa():
         cam_pos = data.cam_xpos[cam_id]
         cam_rot = data.cam_xmat[cam_id].reshape(3, 3)
         
-        # 월드 좌표로 변환
+        # Into world coordinates
         points_world = (cam_rot @ points_cam.T).T + cam_pos
         point_cloud = np.hstack([points_world, colors])
         if len(point_cloud) == 0:
