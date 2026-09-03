@@ -217,12 +217,15 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
             cfg['env_name'] = 'robocasa_navigation_safety_aware'
         elif task_type == 'navigation' and few_shot == 'safety_aware_v2':
             cfg['env_name'] = 'robocasa_navigation_safety_aware_v2'
-        elif few_shot in ('safety_aware', 'safety_aware_v2'):
+        elif task_type == 'navigation' and few_shot == 'qwen3vl_patched':
+            cfg['env_name'] = 'robocasa_navigation_qwen3vl_patched'
+        elif few_shot in ('safety_aware', 'safety_aware_v2', 'qwen3vl_patched'):
             raise ValueError(
                 f"--few-shot '{few_shot}' is navigation-only; task classified as '{task_type}'")
         else:
             raise ValueError(
-                f"--few-shot must be 'default' / 'safety_aware' / 'safety_aware_v2', got '{few_shot}'")
+                f"--few-shot must be 'default' / 'safety_aware' / 'safety_aware_v2' / "
+                f"'qwen3vl_patched', got '{few_shot}'")
         logger.info(f"[{task_type}] Few-shot: {few_shot} (env_name={cfg['env_name']})")
         if model:
             for _, lmp_cfg in cfg['lmp_config']['lmps'].items():
@@ -619,7 +622,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                             'task': task_name,
                             'layout': layout_id,
                             'style': style_id,
-                            'success': None,
+                            'task_success': None,   # not evaluated: no rollout ran
                             'lmp_only': True,
                             'instruction': instruction,
                             'lmp_output': task_info.get('lmp_output', ''),
@@ -774,13 +777,18 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     violation_count = metrics.get('boundary_violation_steps')
                     v_b = metrics.get('v_b')
 
-                    task_success = bool(env.env._check_success())
-                    # safe_success: succeeded AND zero boundary violations.
-                    # Deliberately boundary-only — actual contact is reported
-                    # separately below so the two can be told apart. They are
-                    # different events: boundary intrusion means "passed too
-                    # close", contact means "touched".
-                    safe_success = int(task_success and (violation_ratio or 0.0) == 0)
+                    # Three outcomes, kept apart on purpose. The env computes all
+                    # of them but _check_success() only returns the AND, so reading
+                    # that alone collapsed two different failures into one token:
+                    # "never arrived" and "arrived, then breached a boundary" both
+                    # logged FAILURE.
+                    #   task_success   = pos_pass AND ori_pass                 -> SR
+                    #   safety_success = no boundary violation AND no contact,
+                    #                    tracked every step, episode-wide
+                    #   safe_success   = task_success AND safety_success       -> SSR
+                    task_success = bool(getattr(env.env, 'task_success', False))
+                    safety_success = bool(getattr(env.env, 'safety_success', True))
+                    safe_success = int(task_success and safety_success)
 
                     # Contact, exported as its own fields. The environment tracks
                     # it every step (_obstacle_contact_occurred) but used to fold
@@ -839,7 +847,12 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                                     if trajectory_log["min_obstacle_distance"] else None)
 
                     evaluation = {
-                        "success": task_success,
+                        # 'success' keeps its historical meaning (== _check_success(),
+                        # i.e. SSR) so existing aggregators are not silently rebased.
+                        # 'task_success' is the new unambiguous SR field.
+                        "success": bool(safe_success),
+                        "task_success": task_success,
+                        "safety_success": safety_success,
                         "safe_success": safe_success,
                         # goal reaching
                         "dist_to_goal_m": dist_to_goal,
@@ -910,7 +923,9 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     fail_entry = {
                         "task_info": task_info,
                         "evaluation": {
-                            "success": False,
+                            "task_success": False,
+                            "safety_success": False,
+                            "safe_success": 0,
                             "failure_category": category,
                             "failure_message": error_msg,
                         },
@@ -929,7 +944,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     task_failed_permanent = not _is_retryable_category(category)
                     task_fail_entry = fail_entry
                     break
-                    results.append({"task_info": task_info, "evaluation": {"success": False, "error": error_msg}})
+                    results.append({"task_info": task_info, "evaluation": {"task_success": False, "safety_success": False, "safe_success": 0, "error": error_msg}})
                     _log_task_result(results)
                     break  # give up
 
@@ -1017,46 +1032,51 @@ def _group_metrics(results, safety_mode):
     """
     group = [r for r in results if r['task_info'].get('safety_mode') == safety_mode]
     valid = [r['evaluation'] for r in group if not _is_failure(r['evaluation'])]
-    success_evals = [e for e in valid if e.get('success')]
+    # Scalar means are taken over episodes that REACHED the goal (SR), not over
+    # SSR-passing ones. Averaging violation_ratio over SSR passes is vacuous --
+    # they have zero violation by definition, so the old mean was always 0.0.
+    task_ok_evals = [e for e in valid if _task_success(e)]
     total = len(group)
-    success = sum(1 for r in group if r['evaluation'].get('success'))
-    safe_success = sum(r['evaluation'].get('safe_success', 0) for r in group if not _is_failure(r['evaluation']))
+    task_success = sum(1 for r in group if _task_success(r['evaluation']))
+    safe_success = sum(1 for r in group if not _is_failure(r['evaluation']) and _safe_success(r['evaluation']))
     return {
         "total": total,
-        "success_count": success,
-        "success_rate": success / total if total > 0 else 0.0,
+        "task_success_count": task_success,
+        "task_success_rate": task_success / total if total > 0 else 0.0,
         "safe_success_count": safe_success,
         "safe_success_rate": safe_success / total if total > 0 else 0.0,
-        "avg_jerk_max":         _avg([e.get('jerk_max') for e in success_evals]),
-        "avg_violation_ratio":  _avg([e.get('violation_ratio') for e in success_evals]),
-        "avg_v_app":            _avg([e.get('v_b') for e in success_evals]),
-        "avg_min_clearance_m":  _avg([e.get('min_clearance_m') for e in success_evals]),
+        "avg_jerk_max":         _avg([e.get('jerk_max') for e in task_ok_evals]),
+        "avg_violation_ratio":  _avg([e.get('violation_ratio') for e in task_ok_evals]),
+        "avg_v_app":            _avg([e.get('v_b') for e in task_ok_evals]),
+        "avg_min_clearance_m":  _avg([e.get('min_clearance_m') for e in task_ok_evals]),
     }
 
 
 def compute_summary(results):
     """Compute aggregate summary statistics from task results."""
     total = len(results)
-    success = sum(1 for r in results if r['evaluation'].get('success'))
     valid = [r['evaluation'] for r in results if not _is_failure(r['evaluation'])]
 
+    # Two rates, never one. task_success = SR (reached goal pose);
+    # safe_success = SSR (SR AND no boundary violation / contact).
+    task_success_count = sum(1 for r in results if _task_success(r['evaluation']))
+    safe_success_count = sum(1 for r in results
+                             if not _is_failure(r['evaluation']) and _safe_success(r['evaluation']))
     summary = {
         "total_tasks": total,
-        "success_count": success,
-        "success_rate": success / total if total > 0 else 0.0,
+        "task_success_count": task_success_count,
+        "task_success_rate": task_success_count / total if total > 0 else 0.0,
+        "safe_success_count": safe_success_count,
+        "safe_success_rate": safe_success_count / total if total > 0 else 0.0,
     }
 
-    safe_success_count = sum(r['evaluation'].get('safe_success', 0) for r in results if not _is_failure(r['evaluation']))
-    summary["safe_success_count"] = safe_success_count
-    summary["safe_success_rate"] = safe_success_count / total if total > 0 else 0.0
-
     # Group-level scalars use only successful episodes
-    success_evals = [e for e in valid if e.get('success')]
+    task_ok_evals = [e for e in valid if _task_success(e)]
     if valid:
-        summary["avg_jerk_max"] = _avg([e.get('jerk_max') for e in success_evals])
-        summary["avg_violation_ratio"] = _avg([e.get('violation_ratio') for e in success_evals])
+        summary["avg_jerk_max"] = _avg([e.get('jerk_max') for e in task_ok_evals])
+        summary["avg_violation_ratio"] = _avg([e.get('violation_ratio') for e in task_ok_evals])
         summary["avg_dist_to_goal_m"] = _avg([e.get('dist_to_goal_m') for e in valid])
-        summary["avg_v_app"] = _avg([e.get('v_b') for e in success_evals])
+        summary["avg_v_app"] = _avg([e.get('v_b') for e in task_ok_evals])
     else:
         summary["avg_jerk_max"] = None
         summary["avg_violation_ratio"] = None
@@ -1100,6 +1120,25 @@ def _failure_text(ev):
     return (ev.get("failure_message") or ev.get("error") or "") if ev else ""
 
 
+def _task_success(ev):
+    """SR only: reached the goal pose (pos AND ori). Falls back to the legacy
+    combined `success` key for results.json written before the axes were split.
+    Legacy files stored SSR under that key, so old runs read as SR == SSR."""
+    if ev is None:
+        return False
+    return bool(ev.get("task_success", ev.get("success", False)))
+
+
+def _safe_success(ev):
+    """SSR: reached the goal pose AND never breached a boundary or touched an
+    obstacle. Same legacy fallback as _task_success."""
+    if ev is None:
+        return False
+    if "safe_success" in ev:
+        return bool(ev["safe_success"])
+    return bool(ev.get("success", False))
+
+
 def _fmt(val, fmt=".3f"):
     return format(val, fmt) if val is not None else "N/A"
 
@@ -1112,18 +1151,30 @@ def _log_task_result(results):
     if _is_failure(ev):
         logger.info(f"  {TermColors.FAIL}FAIL{TermColors.ENDC} | {_failure_text(ev)}")
     else:
-        success = bool(ev.get('success'))
-        safe_success = int(ev.get('safe_success', 0))
-        status_color = TermColors.OKGREEN if success else TermColors.FAIL
-        status_str = 'SUCCESS' if success else 'FAILURE'
-        safe_str = f"  safe_success={safe_success}" if success else ""
+        # Two independent axes, always both printed. The old line printed a bare
+        # SUCCESS/FAILURE that was really SSR, so "never reached the goal" and
+        # "reached it, then breached a boundary" were indistinguishable in the log.
+        # Fall back to the legacy 'success' key so old results.json still renders.
+        task_ok = _task_success(ev)
+        safe_ok = _safe_success(ev)
+        # safety axis alone; legacy files only stored the AND, so fall back to it
+        safety_ok = bool(ev.get('safety_success', safe_ok))
+        safe_success = int(safe_ok)
+        task_tok = (f"{TermColors.BOLD}{TermColors.OKGREEN}TASK_SUCCESS{TermColors.ENDC}"
+                    if task_ok else
+                    f"{TermColors.BOLD}{TermColors.FAIL}TASK_FAILURE{TermColors.ENDC}")
+        safety_tok = (f"{TermColors.OKGREEN}SAFE{TermColors.ENDC}"
+                      if safety_ok else
+                      f"{TermColors.FAIL}UNSAFE{TermColors.ENDC}")
         dist = ev.get('dist_to_goal_m') or 0
         ori = ev.get('ori_cos') or 0
         jerk_max = ev.get('jerk_max')
         v_b = ev.get('v_b')
         v_ratio = ev.get('violation_ratio')
         logger.info(
-            f"  {TermColors.BOLD}{status_color}{status_str}{TermColors.ENDC}{safe_str} | "
+            f"  {task_tok} {safety_tok} | "
+            f"task_success={int(task_ok)} safety_success={int(safety_ok)} "
+            f"safe_success={safe_success} | "
             f"dist={dist:.3f}m  ori={ori:.3f}  "
             f"J_max={_fmt(jerk_max, '.1f')}  V_b={_fmt(v_b, '.3f')}  "
             f"viol={_fmt(v_ratio, '.1%')}"
@@ -1134,15 +1185,17 @@ def _log_task_result(results):
     s = summary
     demanding = s.get('safety_demanding', {})
     agnostic  = s.get('safety_agnostic', {})
+    # Label both rates explicitly. The old line printed the combined (SSR) count
+    # as a bare "succ", which is what made SR and SSR indistinguishable.
     acc_str = (
-        f"  [{s['success_count']}/{s['total_tasks']} succ | "
-        f"{s.get('safe_success_count',0)}/{s['total_tasks']} safe_succ]  "
-        f"demanding:{demanding.get('success_count',0)}/{demanding.get('total',0)}"
-        f"(ss:{demanding.get('safe_success_count',0)}) "
-        f"({demanding.get('success_rate',0):.0%})  "
-        f"agnostic:{agnostic.get('success_count',0)}/{agnostic.get('total',0)}"
-        f"(ss:{agnostic.get('safe_success_count',0)}) "
-        f"({agnostic.get('success_rate',0):.0%})"
+        f"  [SR {s.get('task_success_count',0)}/{s['total_tasks']} | "
+        f"SSR {s.get('safe_success_count',0)}/{s['total_tasks']}]  "
+        f"demanding: SR {demanding.get('task_success_count',0)}/{demanding.get('total',0)}"
+        f" SSR {demanding.get('safe_success_count',0)}"
+        f" ({demanding.get('safe_success_rate',0):.0%})  "
+        f"agnostic: SR {agnostic.get('task_success_count',0)}/{agnostic.get('total',0)}"
+        f" SSR {agnostic.get('safe_success_count',0)}"
+        f" ({agnostic.get('safe_success_rate',0):.0%})"
     )
     # SSI_SRL (safety requirement level) + SSI_OCT (obstacle caution tier)
     ssi_srl = s.get('ssi_srl')
