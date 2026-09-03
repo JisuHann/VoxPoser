@@ -995,11 +995,16 @@ class VoxPoserRobocasa():
             _n = np.array([[0.0, 0.0, 1.0]])
             return (_p, _n), (_p, _n)
         # gather points and masks from all cameras
-        self.update_latest_obs()
         # Fresh point clouds/masks for every model camera — but RESTORE
         # latest_obs afterwards: update_latest_obs() replaces it with
         # _get_observations() output, which froze the navigation controller's
         # base-pos feedback mid-episode (robot ran 60m off the map).
+        #
+        # PERF: this used to call update_latest_obs() twice in a row. The
+        # first call was pure waste (a full ncam-camera render pass, 0.79 s)
+        # AND it corrupted the backup — _obs_backup captured the refreshed
+        # obs instead of the controller's live obs. Backing up first is both
+        # faster and closer to what the comment above says it wants.
         _obs_backup = self.latest_obs
         self.update_latest_obs()
         points, colors, masks, normals = [], [], [], []
@@ -1013,16 +1018,21 @@ class VoxPoserRobocasa():
             # then matched zero points). Align each camera before appending.
             _n = min(len(_pc), len(_im), len(_mk))
             points.append(_pc[:_n]); colors.append(_im[:_n]); masks.append(_mk[:_n])
-            # estimate normals using o3d
-            pcd = o3d.geometry.PointCloud()
-            pcd.points = o3d.utility.Vector3dVector(points[-1])
-            pcd.colors = o3d.utility.Vector3dVector(colors[-1])
-            pcd.estimate_normals()
-            
-            cam_normals = np.asarray(pcd.normals)
-            # use lookat vector to adjust normal vectors TODO(jshan) not sur
-            flip_indices = np.dot(cam_normals, self.lookat_vectors[cam]) > 0
-            cam_normals[flip_indices] *= -1
+            # PERF: per-point normals were estimated with o3d for every camera
+            # (Vector3dVector x2 + estimate_normals over 307k points), which
+            # measured 126 s of this function's 163 s on one episode — and
+            # nothing consumes the result. The scene normals are discarded at
+            # every call site ((_, _) / (workspace_pc, _)), and the object
+            # normals only reach obs_dict['normal'], which has zero readers
+            # (see interfaces.py:526 — "camera-derived per-point average ->
+            # biased to -z, useless").
+            #
+            # Emit the camera-facing constant instead: the o3d code flipped
+            # every normal so that dot(normal, lookat) <= 0, so -lookat is the
+            # sign-consistent constant. Shape contract (normals aligned 1:1
+            # with points) is preserved for the masks[] slicing below.
+            cam_normals = np.broadcast_to(
+                -np.asarray(self.lookat_vectors[cam], dtype=np.float64), (_n, 3))
             normals.append(cam_normals)
             logger.debug(f"cam={cam}: pc={points[-1].shape}, img={colors[-1].shape}, mask={masks[-1].shape}, normals={cam_normals.shape}")
 
