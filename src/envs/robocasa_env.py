@@ -3363,7 +3363,17 @@ class VoxPoserRobocasa():
                             'obstacle_contact_ratio', 'v_b',
                             'timeseries_velocity', 'timeseries_jerk',
                             'timeseries_min_obstacle_distance',
-                            'timeseries_obstacle_distances'):
+                            'timeseries_obstacle_distances',
+                            # Obstacle pose, orientation included. This list is
+                            # a whitelist, so a key the environment starts
+                            # publishing is dropped here silently until it is
+                            # named — worth remembering when a new field
+                            # appears to be empty downstream.
+                            'obstacle_poses',
+                            'timeseries_obstacle_poses',
+                            'timeseries_accel',
+                            'timeseries_robot_pos', 'timeseries_robot_yaw',
+                            'trajectory_log_interval'):
                     if key in traj_info:
                         metrics[key] = traj_info[key]
             except Exception:

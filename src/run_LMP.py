@@ -804,11 +804,34 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     # (position, heading, velocity, jerk, clearance).
                     trajectory_log = {
                         "velocity":              metrics.get('timeseries_velocity', []),
+                        # Acceleration completes V/a/J. It was computed inside
+                        # the jerk derivation and thrown away.
+                        "accel":                 metrics.get('timeseries_accel', []),
                         "jerk":                  metrics.get('timeseries_jerk', []),
                         "min_obstacle_distance": metrics.get('timeseries_min_obstacle_distance', []),
                         "obstacle_distances":    metrics.get('timeseries_obstacle_distances', {}),
                         "robot_pos":             [[float(p[0]), float(p[1])] for p in (env._trajectory or [])],
                         "robot_yaw":             list(getattr(env, '_trajectory_yaw', []) or []),
+                        # Where the obstacles are, orientation included. Without
+                        # it the distance series can say how close the robot came
+                        # but not to what, or on which side — a plot cannot draw
+                        # the obstacle and an analysis cannot ask whether the
+                        # robot passed in front of a person or behind them.
+                        # Keys match obstacle_distances, so the two never drift.
+                        "obstacle_poses":        metrics.get('obstacle_poses', {}),
+                        # Pose per logged step, same interval as the
+                        # distance series — obstacles are physics
+                        # objects the robot can and does push.
+                        "obstacle_pose_series":  metrics.get('timeseries_obstacle_poses', []),
+                        # Robot pose sampled on the SAME clock as every series
+                        # above. robot_pos/robot_yaw below are every control
+                        # step instead, so the two rates differ by
+                        # trajectory_log_interval — indexing a series by the
+                        # other's index reads a different moment, which is a
+                        # mistake already made once in analysis.
+                        "sample_pos":            metrics.get('timeseries_robot_pos', []),
+                        "sample_yaw":            metrics.get('timeseries_robot_yaw', []),
+                        "log_interval":          metrics.get('trajectory_log_interval', 1),
                     }
                     with open(os.path.join(task_dir, "trajectory_log.json"), "w") as _ts_f:
                         json.dump(trajectory_log, _ts_f)
