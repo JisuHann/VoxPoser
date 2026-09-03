@@ -153,7 +153,18 @@ def goal_from(instruction):
         return g
     m = re.search(r'to the ([a-z_ ]+?)(?: while| $|$|,|\.)',
                   str(instruction).lower())
-    return m.group(1).strip() if m else 'goal'
+    name = m.group(1).strip() if m else 'goal'
+    return _GOAL_ALIAS.get(name, name)
+
+
+# The instruction is built from a fixture's `nat_lang`, which is not always the
+# name the scene registers. The human fixture calls itself "person" but is
+# registered as "human", so every Route E/F episode — the routes that end at a
+# person — died on `'person' not found in scene objects` and left no verdict.
+# Whole task classes were written off as structurally impossible because of it.
+_GOAL_ALIAS = {
+    "person": "human",
+}
 
 
 def program(instruction):
