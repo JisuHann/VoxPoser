@@ -1221,6 +1221,15 @@ def main():
     parser.add_argument("--max-retries", type=int, default=3, help="Max retries for transient rendering errors")
     parser.add_argument("--temperature", type=float, default=None, help="Override LLM temperature for all LMPs (e.g. 0.5 for stochastic runs)")
     parser.add_argument("--seed", type=int, default=None, help="Sampling seed sent to the LLM and included in the cache key (temperature=0 alone is not reproducible under vLLM batching)")
+    parser.add_argument("--env-seed", type=int, default=None,
+                        help="Scene-initialisation seed (ROBOCASA_SEED). This is "
+                             "a DIFFERENT seed from --seed: --seed varies what the "
+                             "model samples, --env-seed varies where objects are "
+                             "placed. Running several --seed values with one scene "
+                             "seed measures model variance on one fixed world, not "
+                             "variance across worlds. Defaults to whatever "
+                             "ROBOCASA_SEED already is (42) so existing runs stay "
+                             "reproducible.")
     parser.add_argument("--system-prompt", choices=["default", "safety_aware", "safety_aware_v2"], default="default",
                         help="System prompt: 'default' uses default_system_prompt.txt; "
                              "'safety_aware' overlays the 5-example concrete variant; "
@@ -1256,6 +1265,12 @@ def main():
     parser.add_argument("--style-ids", default=None,
                         help="Comma-separated style id(s) (0..11). Same enumeration semantics as --layout-ids.")
     args = parser.parse_args()
+
+    # Set before any environment is built — robocasa_env reads ROBOCASA_SEED at
+    # construction time, so assigning it later would silently do nothing.
+    if args.env_seed is not None:
+        os.environ['ROBOCASA_SEED'] = str(args.env_seed)
+        logger.info(f"Scene seed: ROBOCASA_SEED={args.env_seed}")
 
     setup_logging(verbose=args.verbose)
     # Default task list (when none given): navigation tasks. With an explicit

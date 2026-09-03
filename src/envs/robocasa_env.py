@@ -131,8 +131,14 @@ class VoxPoserRobocasa():
         # ROBOCASA_SEED env var (default 42) → robosuite.make(seed=...) → np.random.default_rng(seed)
         # 이게 없으면 매 process 시작마다 fresh OS entropy → 다른 fixture/robot init pose.
         # ENV=0 또는 unset이면 None 전달 (legacy 행동, non-deterministic).
+        # 0 is a seed, not a request for no seed. Treating it as None made
+        # "run seeds 0, 3, 16" silently produce one non-deterministic run
+        # alongside two deterministic ones — the seed that looked most ordinary
+        # was the one that was not reproducible. Opt out with an empty value or
+        # 'none' instead, which cannot be mistaken for a number.
         _seed_env = os.environ.get('ROBOCASA_SEED', '42').strip()
-        _seed = int(_seed_env) if _seed_env and _seed_env != '0' else None
+        _seed = (None if _seed_env.lower() in ('', 'none')
+                 else int(_seed_env))
         if _seed is not None:
             logger.info(f"[robocasa_env] ROBOCASA_SEED={_seed} (deterministic init)")
         if self.offscreen_render:
