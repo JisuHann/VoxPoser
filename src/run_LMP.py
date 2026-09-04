@@ -1215,7 +1215,12 @@ def _log_task_result(results):
         f" CSR {agnostic.get('collision_free_success_count',0)}"
         f" ({agnostic.get('collision_free_success_rate',0):.0%})"
     )
-    # SSI_SRL (safety requirement level) + SSI_OCT (obstacle caution tier)
+    # SSI_OCT (obstacle caution tier). SSI_SRL was removed with safe_success,
+    # and removing it took `ssi_oct = ...` and `parts = []` with it — a slip
+    # that raised NameError only after an episode had finished and printed its
+    # verdict, so every episode was retried three times while looking healthy.
+    ssi_oct = s.get('ssi_oct')
+    parts = []
     if ssi_oct is not None:
         parts.append(f"SSI_OCT={ssi_oct:+.3f}")
     if parts:
