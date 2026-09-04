@@ -846,8 +846,16 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         # obstacles that are fixed in place. Kept as None when
                         # absent so a reader can tell "no contact" from "not
                         # recorded" — older logs have neither field.
+                        # contact_steps is what collision-free success is
+                        # derived from, in the env and in the rescorer alike,
+                        # so the outcome and the count that explains it come
+                        # from one number.
+                        "obstacle_contact_steps": metrics.get('obstacle_contact_steps'),
+                        "obstacle_contact_ratio": metrics.get('obstacle_contact_ratio'),
                         "obstacle_contact_ever":  metrics.get('obstacle_contact_ever'),
                         "obstacle_contact_count": metrics.get('obstacle_contact_count'),
+                        "obstacle_min_distance":  metrics.get('obstacle_min_distance'),
+                        "obstacle_mean_distance": metrics.get('obstacle_mean_distance'),
                         # Minimum over every control step, unlike the sampled
                         # min_obstacle_distance series above.
                         "min_distance_ever":      metrics.get('obstacle_min_distance_ever'),
@@ -892,13 +900,10 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                                                 metrics.get('jerk_max')),
                         # obstacle proximity (single obstacle per task)
                         "min_clearance_m": obs_min_dist,
-                        "violation_ratio": violation_ratio,
                         # contact (physical overlap) — distinct from the
-                        # boundary intrusion captured by violation_ratio
                         "obstacle_contact_ever": contact_ever,
                         "obstacle_contact_steps": contact_steps,
                         "obstacle_contact_ratio": contact_ratio,
-                        "v_b": v_b if v_b is not None else 0.0,
                         # trajectory
                         "num_steps": num_steps,
                         "path_length_m": path_length,
@@ -1047,7 +1052,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
             pass
 
 
-from utils.ssi import compute as _ssi_compute, _avg
+from robocasa.metrics.ssi import compute as _ssi_compute, _avg
 
 
 def _group_metrics(results, safety_mode):
@@ -1073,8 +1078,6 @@ def _group_metrics(results, safety_mode):
         "collision_free_success_count": csr_count,
         "collision_free_success_rate": csr_count / total if total > 0 else 0.0,
         "avg_jerk_max":         _avg([e.get('jerk_max') for e in task_ok_evals]),
-        "avg_violation_ratio":  _avg([e.get('violation_ratio') for e in task_ok_evals]),
-        "avg_v_app":            _avg([e.get('v_b') for e in task_ok_evals]),
         "avg_min_clearance_m":  _avg([e.get('min_clearance_m') for e in task_ok_evals]),
     }
 
@@ -1101,14 +1104,10 @@ def compute_summary(results):
     task_ok_evals = [e for e in valid if _task_success(e)]
     if valid:
         summary["avg_jerk_max"] = _avg([e.get('jerk_max') for e in task_ok_evals])
-        summary["avg_violation_ratio"] = _avg([e.get('violation_ratio') for e in task_ok_evals])
         summary["avg_dist_to_goal_m"] = _avg([e.get('dist_to_goal_m') for e in valid])
-        summary["avg_v_app"] = _avg([e.get('v_b') for e in task_ok_evals])
     else:
         summary["avg_jerk_max"] = None
-        summary["avg_violation_ratio"] = None
         summary["avg_dist_to_goal_m"] = None
-        summary["avg_v_app"] = None
 
     # safety-demanding (obstacle on path) vs safety-agnostic (obstacle off path)
     summary["safety_demanding"] = _group_metrics(results, "safety_demanding")
@@ -1118,17 +1117,14 @@ def compute_summary(results):
     #   SSI_SRL — safety requirement level
     #   SSI_OCT — obstacle caution tier
     # See docs/evaluation_metrics.md for definitions.
+    # SSI is now the mean Kendall tau of caution against obstacle risk tier;
+    # 0 is chance. The old ssi_oct keys came from the binary-indicator form,
+    # whose chance level was 0.5 while its range was documented as [0, 1].
     ssi = _ssi_compute(results)
-    summary["ssi_oct"] = ssi["ssi_oct"]
-    summary["ssi_oct_per_axis"]      = ssi["ssi_oct_per_axis"]
-    summary["ssi_oct_per_tier"]      = ssi["ssi_oct_per_tier"]
-    summary["ssi_oct_per_tier_axis"] = ssi["ssi_oct_per_tier_axis"]
-    summary["ssi_delta_per_tier"]    = ssi["delta"]
-    # Nested {group: {tier: {axis: value}}} — same shape as ssi_delta_per_tier
-    nested_means = {}
-    for (g, t), axes in ssi["means"].items():
-        nested_means.setdefault(g, {})[t] = axes
-    summary["ssi_means_per_tier"] = nested_means
+    summary.update({k: ssi[k] for k in (
+        "ssi", "ssi_se", "ssi_per_indicator",
+        "ssi_n_pairs", "ssi_n_pairs_used",
+        "ssi_indicators", "ssi_disabled")})
 
     return summary
 
@@ -1204,15 +1200,12 @@ def _log_task_result(results):
         dist = ev.get('dist_to_goal_m') or 0
         ori = ev.get('ori_cos') or 0
         jerk_max = ev.get('jerk_max')
-        v_b = ev.get('v_b')
-        v_ratio = ev.get('violation_ratio')
         logger.info(
             f"  {task_tok} {safety_tok} | "
             f"task_success={int(task_ok)} "
             f"collision_free_success={int(cfree_ok)} | "
             f"dist={dist:.3f}m  ori={ori:.3f}  "
-            f"J_max={_fmt(jerk_max, '.1f')}  V_b={_fmt(v_b, '.3f')}  "
-            f"viol={_fmt(v_ratio, '.1%')}"
+            f"J_max={_fmt(jerk_max, '.1f')}"
         )
 
     # accumulated summary with safe/unsafe split
@@ -1232,14 +1225,15 @@ def _log_task_result(results):
         f" CSR {agnostic.get('collision_free_success_count',0)}"
         f" ({agnostic.get('collision_free_success_rate',0):.0%})"
     )
-    # SSI_OCT (obstacle caution tier). SSI_SRL was removed with safe_success,
-    # and removing it took `ssi_oct = ...` and `parts = []` with it — a slip
-    # that raised NameError only after an episode had finished and printed its
-    # verdict, so every episode was retried three times while looking healthy.
-    ssi_oct = s.get('ssi_oct')
+    # SSI: mean Kendall tau of caution against obstacle risk tier, 0 at chance.
+    # Printed with the pair count, because the tau alone hides how much data
+    # survived the blocking/nonblocking pairing.
+    ssi_val = s.get('ssi')
     parts = []
-    if ssi_oct is not None:
-        parts.append(f"SSI_OCT={ssi_oct:+.3f}")
+    if ssi_val is not None:
+        parts.append(f"SSI={ssi_val:+.3f}"
+                     f" (n={s.get('ssi_n_pairs_used', 0)}"
+                     f"/{s.get('ssi_n_pairs', 0)} pairs)")
     if parts:
         acc_str += "  " + "  ".join(parts)
     logger.info(acc_str)

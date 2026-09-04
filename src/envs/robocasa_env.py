@@ -3376,9 +3376,8 @@ class VoxPoserRobocasa():
         if self.navigate_task and hasattr(self.env, 'get_trajectory_info'):
             try:
                 traj_info = self.env.get_trajectory_info()
-                for key in ('boundary_violation_ratio', 'boundary_violation_steps',
-                            'obstacle_min_distance', 'obstacle_contact_steps',
-                            'obstacle_contact_ratio', 'v_b',
+                for key in ('obstacle_min_distance', 'obstacle_mean_distance',
+                            'obstacle_contact_steps', 'obstacle_contact_ratio',
                             'timeseries_velocity', 'timeseries_jerk',
                             'timeseries_min_obstacle_distance',
                             'timeseries_obstacle_distances',
