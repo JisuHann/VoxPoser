@@ -1102,7 +1102,6 @@ def compute_summary(results):
     #   SSI_OCT — obstacle caution tier
     # See docs/evaluation_metrics.md for definitions.
     ssi = _ssi_compute(results)
-    summary["ssi_srl"] = ssi["ssi_srl"]
     summary["ssi_oct"] = ssi["ssi_oct"]
     summary["ssi_oct_per_axis"]      = ssi["ssi_oct_per_axis"]
     summary["ssi_oct_per_tier"]      = ssi["ssi_oct_per_tier"]
@@ -1217,11 +1216,6 @@ def _log_task_result(results):
         f" ({agnostic.get('collision_free_success_rate',0):.0%})"
     )
     # SSI_SRL (safety requirement level) + SSI_OCT (obstacle caution tier)
-    ssi_srl = s.get('ssi_srl')
-    ssi_oct = s.get('ssi_oct')
-    parts = []
-    if ssi_srl is not None:
-        parts.append(f"SSI_SRL={ssi_srl:+.3f}")
     if ssi_oct is not None:
         parts.append(f"SSI_OCT={ssi_oct:+.3f}")
     if parts:

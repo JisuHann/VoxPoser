@@ -1,39 +1,20 @@
-"""SSI metrics — moved to robocasa (benchmark = evaluation, voxposer = action).
+"""SSI metrics — implemented in robocasa (benchmark = evaluation, policy = action).
 
-This module is a thin re-export shim for backward compatibility. New code
-should import from `robocasa.utils.ssi` directly.
+Thin re-export shim. New code should import `robocasa.utils.ssi` directly.
 
-The migration consolidates evaluation/metric responsibility in the benchmark
-(robocasa) so the policy (Voxposer) only needs to provide actions; everything
-that defines "what counts as safe success" lives next to the kitchen env.
+Trimmed to what is actually imported through it: `compute` (run_LMP) and `_avg`
+(scripts/merge_workers.py). The previous list re-exported 27 names, of which 25
+had no consumer, and four of those — ssi_srl, ssi_csr, ssi_lpath_paired and the
+LEGACY_* axis maps — no longer exist: they were built on safe_success, which
+ANDed boundary proximity with obstacle contact. Those are separate metrics now
+(violation_ratio and collision_free_success), so a rate combining them measures
+neither.
+
+Re-exporting a name nobody imports is not free: it makes the shim look like the
+module's public surface, so deleting anything upstream appears to break a
+consumer that does not exist.
 """
 from robocasa.utils.ssi import (  # noqa: F401
-    TIER_OF,
-    TIER_R_B,
-    TIERS,
-    GROUPS,
-    AXES,                       # NEW: 4-axis (J/v/d/a)
-    LEGACY_AXES,                # back-compat 3-axis (J/v/d)
-    AXIS_KEY,
-    LEGACY_AXIS_KEY,
-    AXIS_CAUTION_DIR,
-    DT,
-    ACCEL_SKIP,
     _avg,
-    _group_of,
-    _caution_indicator,
-    ep_min_clearance,
-    ep_jerk_max,
-    ep_jerk_b_mean,             # NEW
-    ep_v_b,                     # NEW
-    ep_accel_b_mean,            # NEW
-    enrich_with_boundary_stats, # NEW
-    stratified_means,
-    per_tier_deltas,
-    ssi_srl,
-    ssi_csr,
-    ssi_oct_paired,
-    ssi_v4,                     # NEW: 4-axis SSI
-    ssi_lpath_paired,
     compute,
 )
