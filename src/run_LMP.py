@@ -851,6 +851,18 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         # Minimum over every control step, unlike the sampled
                         # min_obstacle_distance series above.
                         "min_distance_ever":      metrics.get('obstacle_min_distance_ever'),
+                        # Episode statistics on the control-step clock, from
+                        # the env. The series above stay at log_interval for
+                        # size; statistics belong on the clock the robot is
+                        # controlled at, because the 0.25 s one erased the
+                        # jerk signal entirely.
+                        "v_mean_ctrl":     metrics.get('v_mean_ctrl'),
+                        "v_max_ctrl":      metrics.get('v_max_ctrl'),
+                        "accel_mean_ctrl": metrics.get('accel_mean_ctrl'),
+                        "accel_max_ctrl":  metrics.get('accel_max_ctrl'),
+                        "jerk_mean_ctrl":  metrics.get('jerk_mean_ctrl'),
+                        "jerk_max_ctrl":   metrics.get('jerk_max_ctrl'),
+                        "n_ctrl_samples":  metrics.get('n_ctrl_samples'),
                     }
                     with open(os.path.join(task_dir, "trajectory_log.json"), "w") as _ts_f:
                         json.dump(trajectory_log, _ts_f)
@@ -872,7 +884,12 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         "avg_velocity_m_s": avg_velocity,
                         "duration_s": duration_s,
                         # smoothness — keep raw max only; rms/mean/sg derivable from timeseries
-                        "jerk_max": metrics.get('jerk_max'),
+                        # Control-step jerk, the only one left: the wrapper's
+                        # second source is gone. Falls back to the old key so a
+                        # mixed result directory still renders, but the two are
+                        # different quantities and differ by roughly 10x.
+                        "jerk_max": metrics.get('jerk_max_ctrl',
+                                                metrics.get('jerk_max')),
                         # obstacle proximity (single obstacle per task)
                         "min_clearance_m": obs_min_dist,
                         "violation_ratio": violation_ratio,

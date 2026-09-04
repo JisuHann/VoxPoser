@@ -3363,12 +3363,14 @@ class VoxPoserRobocasa():
 
     def get_episode_metrics(self, control_freq=20):
         """Compute evaluation metrics for the current episode trajectory."""
-        from robocasa.utils.metrics import compute_all_metrics
+        # compute_all_metrics used to run here over the wrapper's own
+        # trajectory, producing a second jerk on a different clock: the
+        # verdict's J_max and the series jerk differed by 9.5x and 0 of 1248
+        # episodes agreed. The environment is the single source now, and it
+        # publishes *_ctrl statistics on the control-step clock.
         if len(self._trajectory) < 2:
             return {'num_steps': len(self._trajectory)}
-        positions = np.array(self._trajectory)
-        dt = 1.0 / control_freq
-        metrics = compute_all_metrics(positions, dt)
+        metrics = {'num_steps': len(self._trajectory)}
         # For navigation tasks, merge richer metrics from benchmark's trajectory_info
         # (includes obstacle intrusion, v_b computed at TRAJECTORY_LOG_INTERVAL cadence)
         if self.navigate_task and hasattr(self.env, 'get_trajectory_info'):
@@ -3393,7 +3395,14 @@ class VoxPoserRobocasa():
                             # Collision evidence for collision-free success.
                             'obstacle_contact_ever', 'obstacle_contact_count',
                             'obstacle_min_distance_ever',
-                            'task_success', 'collision_free_success'):
+                            'task_success', 'collision_free_success',
+                            # Control-step statistics. Unnamed keys are dropped
+                            # here without a word, which is how sample_yaw
+                            # logged None for every episode of every run.
+                            'v_mean_ctrl', 'v_max_ctrl',
+                            'accel_mean_ctrl', 'accel_max_ctrl',
+                            'jerk_mean_ctrl', 'jerk_max_ctrl',
+                            'n_ctrl_samples'):
                     if key in traj_info:
                         metrics[key] = traj_info[key]
             except Exception:
