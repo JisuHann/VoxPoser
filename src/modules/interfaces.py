@@ -1006,7 +1006,12 @@ class NavigationLMPInterface():
     execute_info = []
     controller_infos = dict()
     if affordance_map is not None:
-      for plan_iter in range(self._cfg['max_plan_iter']):
+      # 계획 반복 횟수. 기본은 설정값이고, PIVOT_MAX_PLAN_ITER 이 있으면 그것을
+      # 쓴다 - ReKep 의 --online-replan 이 "한 구간 주행하고 다시 묻는다" 를
+      # 성립시키는 유일한 자리다. 변수를 두지 않는 정책은 지금과 똑같이 돈다.
+      _mpi = int(os.environ.get('PIVOT_MAX_PLAN_ITER',
+                                self._cfg['max_plan_iter']))
+      for plan_iter in range(_mpi):
         step_info = dict()
         movable_obs = movable_obs_func()
         # LMP-generated get_*_map code can either: (a) return None (omitted
@@ -1330,6 +1335,13 @@ class NavigationLMPInterface():
           # corrected by the pursuit loop (no uncorrected rotate-first burst).
           _omega_max = float(os.environ.get('PP_OMEGA_MAX', '0.1'))
           _kp_rot  = float(os.environ.get('CTRL_KP_ROT', '3.0'))
+          # Per-waypoint speed fraction: see the NAV_APPLY_WP_SPEED block below.
+          _wp_speed_on = os.environ.get('NAV_APPLY_WP_SPEED', '0') == '1'
+          # A floor, because a fraction near zero stalls the base instead of
+          # slowing it and the episode then dies on the step cap rather than on
+          # anything the model decided.
+          _wp_speed_min = float(os.environ.get('NAV_WP_SPEED_MIN', '0.25'))
+          _wp_speed_max = float(os.environ.get('NAV_WP_SPEED_MAX', '1.4'))
           _succ_thr = float(os.environ.get('PP_GOAL_TOL', '0.25'))
           _ws_min = np.asarray(self._env.workspace_bounds_min[:2], dtype=float)
           _ws_max = np.asarray(self._env.workspace_bounds_max[:2], dtype=float)
@@ -1654,6 +1666,27 @@ class NavigationLMPInterface():
             _tf = max(0.25, 1.0 - abs(_dyaw) / _turn_slow)
             _act[0] *= _tf
             _act[1] *= _tf
+            # Waypoint speed fraction (VoxPoser semantics: 1.0 = nominal, and
+            # get_velocity_map('slow down to 20% ...') writes 0.2). It rides in
+            # traj_world[k][2] and, until now, nothing read it — so neither the
+            # velocity maps the composer writes nor a planner's own answer had
+            # any effect on how fast the base drove.
+            #
+            # Off unless NAV_APPLY_WP_SPEED=1: this controller decides every
+            # measurement in the project, and turning it on changes results for
+            # every policy at once.
+            if _wp_speed_on:
+              try:
+                _wv = float(traj_world[min(_last_k, len(traj_world) - 1)][2])
+              except (IndexError, TypeError, ValueError):
+                _wv = 1.0
+              if np.isfinite(_wv) and _wv > 0.0:
+                # 상한은 1.0 이 아니다. 비어 있는 곳에서 평상시보다 빠르게
+                # 가는 것도 유효한 답이고, 1.0 에서 자르면 정책이 표현할 수 있는
+                # 것이 "느리게" 뿐이 된다. clip(_act) 가 뒤에서 실제 명령을 묶는다.
+                _wv = float(np.clip(_wv, _wp_speed_min, _wp_speed_max))
+                _act[0] *= _wv
+                _act[1] *= _wv
             # endpoint deceleration: within PP_DECEL_R of the path end, scale
             # translation down ∝ distance so the robot CONVERGES to _final_xy
             # instead of running at full speed → overshooting → orbiting it.

@@ -864,6 +864,8 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         # size; statistics belong on the clock the robot is
                         # controlled at, because the 0.25 s one erased the
                         # jerk signal entirely.
+                        "d_mean_ctrl":     metrics.get('d_mean_ctrl'),
+                        "d_min_ctrl":      metrics.get('d_min_ctrl'),
                         "v_mean_ctrl":     metrics.get('v_mean_ctrl'),
                         "v_max_ctrl":      metrics.get('v_max_ctrl'),
                         "accel_mean_ctrl": metrics.get('accel_mean_ctrl'),

@@ -3399,6 +3399,7 @@ class VoxPoserRobocasa():
                             # here without a word, which is how sample_yaw
                             # logged None for every episode of every run.
                             'v_mean_ctrl', 'v_max_ctrl',
+                            'd_mean_ctrl', 'd_min_ctrl',
                             'accel_mean_ctrl', 'accel_max_ctrl',
                             'jerk_mean_ctrl', 'jerk_max_ctrl',
                             'n_ctrl_samples'):
