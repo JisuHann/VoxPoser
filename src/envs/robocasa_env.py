@@ -3389,7 +3389,11 @@ class VoxPoserRobocasa():
                             'timeseries_obstacle_poses',
                             'timeseries_accel',
                             'timeseries_robot_pos', 'timeseries_robot_yaw',
-                            'trajectory_log_interval'):
+                            'trajectory_log_interval',
+                            # Collision evidence for collision-free success.
+                            'obstacle_contact_ever', 'obstacle_contact_count',
+                            'obstacle_min_distance_ever',
+                            'task_success', 'collision_free_success'):
                     if key in traj_info:
                         metrics[key] = traj_info[key]
             except Exception:
