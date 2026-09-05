@@ -3402,7 +3402,10 @@ class VoxPoserRobocasa():
                             'd_mean_ctrl', 'd_min_ctrl',
                             'accel_mean_ctrl', 'accel_max_ctrl',
                             'jerk_mean_ctrl', 'jerk_max_ctrl',
-                            'n_ctrl_samples'):
+                            'n_ctrl_samples',
+                            # The scoring thresholds, so the log can print what
+                            # was actually applied instead of a literal.
+                            'pos_threshold', 'ori_threshold'):
                     if key in traj_info:
                         metrics[key] = traj_info[key]
             except Exception:

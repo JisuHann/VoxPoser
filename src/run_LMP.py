@@ -39,6 +39,17 @@ import robosuite.utils.transform_utils as T
 from envs.robocasa_env import VoxPoserRobocasa
 from robocasa.utils.result_utils import get_navigate_tasks, parse_task_spec, parse_task_categories, save_results
 
+# The scoring settings, read from the config the runs are scored against so
+# this line cannot drift from what actually happens. It is printed at the top
+# of every episode: the arrival radius lived in two places with two values
+# (env 0.6 m, config 0.5 m) for months, and no log showed both.
+from robocasa.metrics import _config as _mcfg
+
+_SCORING = (f"arrival <= {_mcfg.DIST_TH} m AND |ori| >= {_mcfg.ORI_TH}"
+            f" | motion on the control clock (dt={_mcfg.CONTROL_DT} s)"
+            f" | jerk savgol w={_mcfg.JERK_SMOOTHING['window']}"
+            f" p={_mcfg.JERK_SMOOTHING['polyorder']}")
+
 logger = get_logger(__name__)
 
 # Default task type when --task-type=auto cannot decide (kept for back-compat).
@@ -436,6 +447,15 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     attempt_str = f" (attempt {attempt+1}/{max_retries})" if attempt > 0 else ""
                     logger.info(f"\n{TermColors.BOLD}{TermColors.OKCYAN}[{idx+1}/{len(parsed)}] {task_name}{layout_str}{style_str}{attempt_str}{TermColors.ENDC}")
 
+                    # The scoring settings, at the top of every episode.
+                    #
+                    # They are identical for all 1250 episodes, which is the
+                    # reason to print them: a log that does not say what it
+                    # scored against cannot be read later, and the arrival
+                    # radius in particular lived in two places with two values
+                    # for months without anyone seeing them side by side.
+                    logger.info(f"  scoring: {_SCORING}")
+
                     # Per-task layout: run_dir/style{S}/layout{L}/{TaskName}/
                     # task_rel_dir was computed above for the .done check.
                     task_dir = task_dir_check
@@ -767,9 +787,32 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         logger.info(f"  Goal   pos=({goal_pos[0]:.3f}, {goal_pos[1]:.3f}), yaw={np.degrees(goal_yaw):.1f}deg")
                     else:
                         logger.info(f"  Goal   pos=({goal_pos[0]:.3f}, {goal_pos[1]:.3f})")
-                    logger.info(f"  dist_to_goal={dist_to_goal:.3f}m (threshold=0.5m)"
-                                + (f", ori_cos={ori_cos:.4f} (threshold=0.8)" if ori_cos is not None else ""))
-                    logger.info(f"  velocity={avg_velocity:.3f}m/s, jerk_rms={metrics.get('jerk_rms', 0):.2f}")
+                    # Print the thresholds the environment actually applied,
+                    # not a literal. These used to be hard-coded "0.5m"/"0.8"
+                    # in the format string, so the log showed the intended
+                    # value whatever the env was scoring with — and for a long
+                    # time the env scored at 0.6 m, and 0.9 m for the human.
+                    _pth = metrics.get('pos_threshold')
+                    _oth = metrics.get('ori_threshold')
+                    logger.info(
+                        f"  dist_to_goal={dist_to_goal:.3f}m "
+                        f"(threshold={_fmt(_pth, '.2f')}m)"
+                        + (f", ori_cos={ori_cos:.4f} (threshold={_fmt(_oth, '.2f')})"
+                           if ori_cos is not None else ""))
+
+                    # Motion comes from the control-step clock. The old line
+                    # divided path_length by a duration derived from the
+                    # sampled step counter, which this execution path never
+                    # increments, so it printed 0.000m/s and jerk_rms 0.00 for
+                    # every episode ever run — two numbers that looked measured
+                    # and were structurally always zero.
+                    logger.info(
+                        f"  v_mean={_fmt(metrics.get('v_mean_ctrl'))}m/s "
+                        f"v_max={_fmt(metrics.get('v_max_ctrl'))}m/s, "
+                        f"a_max={_fmt(metrics.get('accel_max_ctrl'), '.2f')}m/s2, "
+                        f"J_mean={_fmt(metrics.get('jerk_mean_ctrl'), '.1f')} "
+                        f"J_max={_fmt(metrics.get('jerk_max_ctrl'), '.1f')} "
+                        f"({metrics.get('n_ctrl_samples') or 0} control steps)")
 
                     # violation_ratio and violation_count now come from benchmark
                     # trajectory_info via get_episode_metrics (boundary_violation_*)
