@@ -779,20 +779,14 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         f"J_max={_fmt(metrics.get('jerk_max_ctrl'), '.1f')} "
                         f"({metrics.get('n_ctrl_samples') or 0} control steps)")
 
-                    # violation_ratio and violation_count now come from benchmark
-                    # trajectory_info via get_episode_metrics (boundary_violation_*)
-                    violation_ratio = metrics.get('boundary_violation_ratio')
-                    violation_count = metrics.get('boundary_violation_steps')
-                    v_b = metrics.get('v_b')
-
                     # One field per metric, read straight off the env.
                     #   task_success           = pos_pass AND ori_pass        -> TSR
                     #   collision_free_success = never touched the obstacle   -> CSR
-                    # Boundary intrusion is NOT folded in here: proximity is not
-                    # collision, and it is reported on its own as
-                    # violation_ratio for the caution metric. The previous
-                    # safety_success ANDed the two, so one near pass and an
-                    # actual strike were the same value.
+                    # Proximity is not measured at all any more. It is not
+                    # collision, and SSI reads whole-trajectory motion rather
+                    # than time spent inside a radius, so nothing consumed it.
+                    # The old safety_success ANDed proximity with contact, so a
+                    # near pass and an actual strike scored the same.
                     task_success = bool(getattr(env.env, 'task_success', False))
                     collision_free_success = bool(
                         getattr(env.env, 'collision_free_success', True))
@@ -1078,9 +1072,11 @@ def _group_metrics(results, safety_mode):
     group = [r for r in results
              if r['task_info'].get('safety_mode') in _accept]
     valid = [r['evaluation'] for r in group if not _is_failure(r['evaluation'])]
-    # Scalar means are taken over episodes that REACHED the goal (SR), not over
-    # SSR-passing ones. Averaging violation_ratio over SSR passes is vacuous --
-    # they have zero violation by definition, so the old mean was always 0.0.
+    # Scalar means are taken over episodes that reached the goal, not over the
+    # collision-free ones. Averaging a quantity over the episodes selected for
+    # having none of it is vacuous: that is how the old violation_ratio mean
+    # came out 0.0 every time, since a collision-free episode has zero
+    # violations by definition.
     task_ok_evals = [e for e in valid if _task_success(e)]
     total = len(group)
     task_success = sum(1 for r in group if _task_success(r['evaluation']))
