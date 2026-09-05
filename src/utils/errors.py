@@ -41,6 +41,21 @@ class LMPNoActuation(Exception):
     """
 
 
+class LMPUnresolvedTarget(Exception):
+    """Raised when the affordance map names no reachable goal cell.
+
+    The planner few-shots tell the model to write placeholder names ('the
+    goal', 'object_1', ...) and promise that "the harness replaces these
+    placeholders with the actual scene names". No such substitution exists,
+    so ``parse_query_obj('goal')`` resolves to nothing. Until 2026-09-04 that
+    silently returned a fallback observation positioned at the world origin,
+    and the robot dutifully navigated to (0, 0) — logged as an ordinary
+    goal-miss. layout8 RouteC failed this way 36/36 with no error recorded
+    anywhere. Fail loudly instead: an unresolvable goal is a broken plan, not
+    a navigation attempt, and must not be scored as one.
+    """
+
+
 # --- Pattern → category map ------------------------------------------------
 
 # Order matters: first match wins. Keep more-specific patterns above generic
@@ -84,6 +99,7 @@ LLM_CATEGORIES = frozenset({
     "lmp_import_banned",
     "lmp_exec_error",
     "lmp_no_actuation",
+    "lmp_unresolved_target",
 })
 
 
@@ -98,6 +114,8 @@ def classify(exc: BaseException) -> str:
         return "lmp_empty"
     if name == "LMPNoActuation":
         return "lmp_no_actuation"
+    if name == "LMPUnresolvedTarget":
+        return "lmp_unresolved_target"
     s = str(exc).lower()
     for cat, pats in ERROR_PATTERNS:
         for p in pats:

@@ -34,7 +34,7 @@ from utils.errors import (
     LLM_CATEGORIES as _LLM_CATEGORIES,
     VLLM_CATEGORIES as _VLLM_CATEGORIES,
 )
-from modules.interfaces import setup_LMP
+from modules.interfaces import setup_LMP, UNRESOLVED_QUERIES
 import robosuite.utils.transform_utils as T
 from envs.robocasa_env import VoxPoserRobocasa
 from robocasa.utils.result_utils import get_navigate_tasks, parse_task_spec, parse_task_categories, save_results
@@ -908,6 +908,13 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         "final_yaw_rad": robot_yaw,
                         "goal_pos_xy": [float(x) for x in goal_pos[:2]],
                         "goal_yaw_rad": goal_yaw,
+                        # Object names the plan referenced that the scene does
+                        # not contain. Non-empty here means the episode ran on
+                        # a partly ungrounded plan (obstacles the model named
+                        # but that were never placed on the avoidance map) —
+                        # an ungrounded *goal* raises lmp_unresolved_target and
+                        # never reaches this record at all.
+                        "unresolved_queries": list(UNRESOLVED_QUERIES),
                     }
                     results.append({"task_info": task_info, "evaluation": evaluation})
                     _log_task_result(results)

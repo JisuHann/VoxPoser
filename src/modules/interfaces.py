@@ -12,6 +12,13 @@ from modules.controllers import NavigationController, ManipulationController
 from envs.robocasa_env import VoxPoserRobocasa, KITCHEN_GROUP_SUBNAMES
 from tqdm import tqdm
 from transforms3d.euler import quat2euler
+from utils.errors import LMPUnresolvedTarget
+
+# Names the LMP asked for that resolved to nothing this episode. Reset by
+# setup_LMP (once per episode) and read back by run_LMP for the result record,
+# so "the model referenced an object that does not exist" is a measurable
+# quantity instead of something you have to grep run.log for.
+UNRESOLVED_QUERIES = []
 
 logger = get_logger(__name__)
 
@@ -1043,6 +1050,17 @@ class NavigationLMPInterface():
                 )
                 return self._get_default_voxel_map(kind, task='navigation')()
         _affordance_map = _safe_map(affordance_map, 'target')
+        # An affordance map with no positive cell means the goal never resolved
+        # to anything — the model named an object the scene does not contain.
+        # There is nothing to navigate toward, so refuse rather than invent a
+        # destination; the episode is recorded as lmp_unresolved_target instead
+        # of masquerading as a navigation attempt that missed.
+        _aff_arr = np.asarray(getattr(_affordance_map, 'array', _affordance_map))
+        if not np.any(_aff_arr > 0):
+            raise LMPUnresolvedTarget(
+                "affordance map is empty — navigation goal resolved to no scene object"
+                + (f" (unresolved: {UNRESOLVED_QUERIES})" if UNRESOLVED_QUERIES else "")
+            )
         _avoidance_map = _safe_map(avoidance_map, 'obstacle')
         _rotation_map = _safe_map(rotation_map, 'rotation')
         _velocity_map = _safe_map(velocity_map, 'velocity')
@@ -2344,6 +2362,16 @@ class NavigationLMPInterface():
       logger.info(f"[set_pixel_by_radius] SKIP robot self-avoidance: name='{_name_lower}'")
       return pixel_map
 
+    # Unresolved query (see _SAFE_FALLBACK_OBS): its position is a sentinel,
+    # not a place. Painting it put a phantom goal — or a phantom obstacle —
+    # at the world origin, which is how layout8 RouteC sent the robot 7 m in
+    # the wrong direction while every log line still read "reachable=True".
+    # Paint nothing; execute_navigation raises if this leaves no goal.
+    if _name_lower == '_fallback':
+      logger.warning("[set_pixel_by_radius] SKIP unresolved query (no scene object) — "
+                     "not painting the origin")
+      return pixel_map
+
     # Duck-typed object detection. Supports Observation (dict subclass),
     # DynamicObservation, IterableDynamicObservation, and raw [x,y].
     occ = None
@@ -2464,6 +2492,11 @@ class NavigationLMPInterface():
     except (AttributeError, KeyError, TypeError):
       pos_world = None
 
+    if pos_world is not None and not np.all(np.isfinite(pos_world)):
+      logger.warning(f"[set_pixel_by_radius PT-MODE world] SKIP unresolved query "
+                     f"(non-finite coord — object not in scene) xy={pos_world.tolist()}")
+      return pixel_map
+
     if pos_world is not None:
       ws_min = self._env.workspace_bounds_min[:2]
       ws_max = self._env.workspace_bounds_max[:2]
@@ -2497,6 +2530,16 @@ class NavigationLMPInterface():
     if pixel_xy[0] is None or pixel_xy[1] is None:
       logger.warning(f"[set_pixel_by_radius PT-MODE raw] skipped (None coord — likely hallucinated obstacle) xy={pixel_xy} radius_cm={radius_cm}")
       return pixel_map
+    # NaN is the unresolved-query sentinel (see _SAFE_FALLBACK_OBS). int(nan)
+    # would raise ValueError and land in the generic branch below, which blames
+    # a "hallucinated obstacle" — wrong diagnosis for what is a missing goal.
+    try:
+      if not (np.isfinite(pixel_xy[0]) and np.isfinite(pixel_xy[1])):
+        logger.warning(f"[set_pixel_by_radius PT-MODE raw] SKIP unresolved query "
+                       f"(non-finite coord — object not in scene) xy={pixel_xy}")
+        return pixel_map
+    except (TypeError, ValueError):
+      pass
     try:
       _r, _c = int(pixel_xy[0]), int(pixel_xy[1])
     except (TypeError, ValueError):
@@ -3261,6 +3304,8 @@ class NavigationLMPInterface():
     return world_xy
 
 def setup_LMP(env, general_config, debug=False, output_dir=None):
+  # Called once per episode, so this is the per-episode reset point.
+  UNRESOLVED_QUERIES.clear()
   controller_config = general_config['controller']
   planner_config = general_config['planner']
   lmp_env_config = general_config['lmp_config']['env']
@@ -3306,14 +3351,25 @@ def setup_LMP(env, general_config, debug=False, output_dir=None):
   # Fallback carries every key a real detect() Observation has so LLM code paths
   # like `obj.occupancy_map` / `obj._point_cloud_world` don't KeyError on miss.
   _M = lmp_env._map_size
+  # Sentinel for "this query names nothing in the scene". The position is NaN,
+  # not zero, and that is load-bearing: the composer's affordance code writes
+  #     set_pixel_by_radius(affordance_map, goal.position, radius_cm=20, value=1)
+  # which passes a bare coordinate array, so the '_fallback' NAME never reaches
+  # set_pixel_by_radius and cannot be checked there. Zeros were indistinguishable
+  # from a real coordinate and got painted as pixel (0, 0) — the map corner, ~7 m
+  # from anywhere useful — which is how layout8 RouteC drove into a wall 36/36
+  # with every log line still reading "reachable=True". NaN is the one value no
+  # real detection produces, so it survives being stripped of its name.
+  # occupancy_map stays all-zero: "occupies nothing" is already correct there,
+  # and it is what makes the object-mode path paint nothing.
   _SAFE_FALLBACK_OBS = Observation({
       'name':                '_fallback',
-      'position':            np.array([0.0, 0.0, 0.0]),
+      'position':            np.full(3, np.nan),
       'normal':              np.array([0.0, 0.0, 1.0]),
-      'aabb':                np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]),
+      'aabb':                np.full((2, 3), np.nan),
       'occupancy_map':       np.zeros((_M, _M, _M), dtype=np.float32),
-      '_position_world':     np.array([0.0, 0.0, 0.0]),
-      '_point_cloud_world':  np.zeros((1, 3), dtype=np.float32),
+      '_position_world':     np.full(3, np.nan),
+      '_point_cloud_world':  np.full((1, 3), np.nan, dtype=np.float32),
   })
   _orig_parse_query_obj = variable_vars.get('parse_query_obj', lmp_env.detect)
   def _safe_parse_query_obj(query, *_args, **_kwargs):
@@ -3367,7 +3423,12 @@ def setup_LMP(env, general_config, debug=False, output_dir=None):
           if result is None:
               result = _direct_detect(query)
           if result is None:
-              logger.info(f"[parse_query_obj] None for '{query}' -> safe fallback obs")
+              # The fallback is positionless by design (see _SAFE_FALLBACK_OBS).
+              # Callers must treat it as "unresolved", never as an object at
+              # the origin — set_pixel_by_radius refuses to paint it.
+              if str(query) not in UNRESOLVED_QUERIES:
+                  UNRESOLVED_QUERIES.append(str(query))
+              logger.warning(f"[UNRESOLVED-QUERY] '{query}' resolves to no scene object")
               return _SAFE_FALLBACK_OBS
           return result
       except Exception as _e:
@@ -3375,6 +3436,9 @@ def setup_LMP(env, general_config, debug=False, output_dir=None):
           _r = _direct_detect(query)
           if _r is not None:
               return _r
+          if str(query) not in UNRESOLVED_QUERIES:
+              UNRESOLVED_QUERIES.append(str(query))
+          logger.warning(f"[UNRESOLVED-QUERY] '{query}' resolves to no scene object (after error)")
           return _SAFE_FALLBACK_OBS
   variable_vars['parse_query_obj'] = _safe_parse_query_obj
 
