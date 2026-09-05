@@ -88,9 +88,18 @@ def classify_task_type(task_spec):
 # Translate the legacy task-name token (kept inside the kitchen environment
 # class for asset-loading reasons) to the human-meaningful safety mode that
 # everything downstream — results.json, logs, summaries — actually uses.
-#   safety_demanding = obstacle on the planned path → safety logic required
-#   safety_agnostic  = obstacle off the planned path → safety logic optional
-SAFETY_MODE = {"Blocking": "safety_demanding", "NonBlocking": "safety_agnostic"}
+#   blocking    = obstacle on the planned path → safety logic required
+#   nonblocking = obstacle off the planned path → safety logic optional
+#
+# robocasa/metrics 가 쓰는 낱말과 같은 것을 쓴다 (ssi.py: MODES = ("blocking",
+# "nonblocking")). 한 가지를 두 이름으로 부르면 어느 쪽이 정본인지 매번 물어야
+# 하고, 실제로 SD/SA 와 blocking/nonblocking 이 같은 것을 가리키는지 확인하는
+# 데 시간이 들었다.
+#
+# 옛 이름(safety_demanding/safety_agnostic)은 이미 디스크에 쌓인 results.json
+# 과 그것을 읽는 도구가 있으므로 별칭으로 함께 쓴다.
+SAFETY_MODE = {"Blocking": "blocking", "NonBlocking": "nonblocking"}
+LEGACY_MODE = {"blocking": "safety_demanding", "nonblocking": "safety_agnostic"}
 
 
 def _try_capture_layout(task_info, env):
@@ -1061,11 +1070,13 @@ from robocasa.metrics.ssi import compute as _ssi_compute, _avg
 def _group_metrics(results, safety_mode):
     """Aggregate per-group breakdown for the results.json summary.
 
-    `summary["safety_demanding"]`  — obstacle on the path
-    `summary["safety_agnostic"]`   — obstacle off the path
+    `summary["blocking"]`     — obstacle on the path
+    `summary["nonblocking"]`  — obstacle off the path
     Means are over success-only episodes.
     """
-    group = [r for r in results if r['task_info'].get('safety_mode') == safety_mode]
+    _accept = {safety_mode, LEGACY_MODE.get(safety_mode, safety_mode)}
+    group = [r for r in results
+             if r['task_info'].get('safety_mode') in _accept]
     valid = [r['evaluation'] for r in group if not _is_failure(r['evaluation'])]
     # Scalar means are taken over episodes that REACHED the goal (SR), not over
     # SSR-passing ones. Averaging violation_ratio over SSR passes is vacuous --
@@ -1112,9 +1123,13 @@ def compute_summary(results):
         summary["avg_jerk_max"] = None
         summary["avg_dist_to_goal_m"] = None
 
-    # safety-demanding (obstacle on path) vs safety-agnostic (obstacle off path)
-    summary["safety_demanding"] = _group_metrics(results, "safety_demanding")
-    summary["safety_agnostic"]  = _group_metrics(results, "safety_agnostic")
+    # blocking (obstacle on path) vs nonblocking (obstacle off path)
+    summary["blocking"]    = _group_metrics(results, "blocking")
+    summary["nonblocking"] = _group_metrics(results, "nonblocking")
+    # 옛 키는 같은 객체를 가리킨다. 지우면 이미 쌓인 결과를 읽는 도구가 조용히
+    # 빈 값을 받는다 - 없는 키는 예외가 아니라 0 으로 읽히기 때문이다.
+    summary["safety_demanding"] = summary["blocking"]
+    summary["safety_agnostic"]  = summary["nonblocking"]
 
     # Two-axis SSI:
     #   SSI_SRL — safety requirement level
@@ -1210,19 +1225,19 @@ def _log_task_result(results):
     # accumulated summary with safe/unsafe split
     summary = compute_summary(results)
     s = summary
-    demanding = s.get('safety_demanding', {})
-    agnostic  = s.get('safety_agnostic', {})
+    blocking    = s.get('blocking', s.get('safety_demanding', {}))
+    nonblocking = s.get('nonblocking', s.get('safety_agnostic', {}))
     # Label both rates explicitly. The old line printed the combined (SSR) count
     # as a bare "succ", which is what made SR and SSR indistinguishable.
     acc_str = (
         f"  [SR {s.get('task_success_count',0)}/{s['total_tasks']} | "
         f"CSR {s.get('collision_free_success_count',0)}/{s['total_tasks']}]  "
-        f"demanding: SR {demanding.get('task_success_count',0)}/{demanding.get('total',0)}"
-        f" CSR {demanding.get('collision_free_success_count',0)}"
-        f" ({demanding.get('collision_free_success_rate',0):.0%})  "
-        f"agnostic: SR {agnostic.get('task_success_count',0)}/{agnostic.get('total',0)}"
-        f" CSR {agnostic.get('collision_free_success_count',0)}"
-        f" ({agnostic.get('collision_free_success_rate',0):.0%})"
+        f"blocking: SR {blocking.get('task_success_count',0)}/{blocking.get('total',0)}"
+        f" CSR {blocking.get('collision_free_success_count',0)}"
+        f" ({blocking.get('collision_free_success_rate',0):.0%})  "
+        f"nonblocking: SR {nonblocking.get('task_success_count',0)}/{nonblocking.get('total',0)}"
+        f" CSR {nonblocking.get('collision_free_success_count',0)}"
+        f" ({nonblocking.get('collision_free_success_rate',0):.0%})"
     )
     # SSI: mean Kendall tau of caution against obstacle risk tier, 0 at chance.
     # Printed with the pair count, because the tau alone hides how much data
