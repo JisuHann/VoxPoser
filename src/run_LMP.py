@@ -142,7 +142,6 @@ def _try_render_voxposer_overview(task_dir):
 
 def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None,
               max_retries=3, temperature=None, seed=None,
-              system_prompt='default', few_shot='default',
               obstacle_map_weight=None, obstacle_map_gaussian_sigma=None,
               vlm_cameras=None, layout_ids=None, style_ids=None,
               lmp_only=False, task_type_override='auto',
@@ -157,8 +156,6 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
     """
     run_config = {
         "model": model,
-        "system_prompt": system_prompt,
-        "few_shot": few_shot,
         "temperature": temperature,
         "seed": seed,
         "obstacle_map_weight": obstacle_map_weight,
@@ -199,45 +196,6 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
         if obstacle_map_gaussian_sigma is not None:
             cfg['planner']['obstacle_map_gaussian_sigma'] = obstacle_map_gaussian_sigma
             logger.info(f"Override planner.obstacle_map_gaussian_sigma = {obstacle_map_gaussian_sigma}")
-        # System prompt: 'default' uses robocasa_{task_type}_system/default_system_prompt.txt
-        # (loaded by core/LMP.py from env_name); 'safety_aware' / 'safety_aware_v2'
-        # overlay the matching file via system_prompt_extra. The safety_aware
-        # variants only exist for navigation; reject them for manipulation.
-        if system_prompt in ('safety_aware', 'safety_aware_v2'):
-            if task_type != 'navigation':
-                raise ValueError(
-                    f"--system-prompt '{system_prompt}' is navigation-only; "
-                    f"task classified as '{task_type}'")
-            from utils.utils import load_prompt
-            fname = f'robocasa_{task_type}_system/{system_prompt}_system_prompt.txt'
-            extra = load_prompt(fname).strip()
-            for _, lmp_cfg in cfg['lmp_config']['lmps'].items():
-                if lmp_cfg is not None:
-                    lmp_cfg['system_prompt_extra'] = extra
-            logger.info(f"[{task_type}] System prompt: {system_prompt} (overlay from {fname})")
-        elif system_prompt != 'default':
-            raise ValueError(
-                f"--system-prompt must be 'default' / 'safety_aware' / 'safety_aware_v2', got '{system_prompt}'")
-        else:
-            logger.info(f"[{task_type}] System prompt: default")
-        # Few-shot: 'default' uses the config's env_name (robocasa_{task_type}).
-        # The safety_aware* few-shot dirs only exist for navigation.
-        if few_shot == 'default':
-            pass  # keep cfg['env_name'] from the task_type merge
-        elif task_type == 'navigation' and few_shot == 'safety_aware':
-            cfg['env_name'] = 'robocasa_navigation_safety_aware'
-        elif task_type == 'navigation' and few_shot == 'safety_aware_v2':
-            cfg['env_name'] = 'robocasa_navigation_safety_aware_v2'
-        elif task_type == 'navigation' and few_shot == 'qwen3vl_patched':
-            cfg['env_name'] = 'robocasa_navigation_qwen3vl_patched'
-        elif few_shot in ('safety_aware', 'safety_aware_v2', 'qwen3vl_patched'):
-            raise ValueError(
-                f"--few-shot '{few_shot}' is navigation-only; task classified as '{task_type}'")
-        else:
-            raise ValueError(
-                f"--few-shot must be 'default' / 'safety_aware' / 'safety_aware_v2' / "
-                f"'qwen3vl_patched', got '{few_shot}'")
-        logger.info(f"[{task_type}] Few-shot: {few_shot} (env_name={cfg['env_name']})")
         if model:
             for _, lmp_cfg in cfg['lmp_config']['lmps'].items():
                 if lmp_cfg is not None:
@@ -289,9 +247,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
     else:
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         model_short = re.sub(r'.+/', '', model or 'unknown').replace('-', '_')
-        sp_tag = '' if system_prompt == 'default' else f"_sp-{system_prompt}"
-        fs_tag = '' if few_shot == 'default' else f"_fs-{few_shot}"
-        run_dir = os.path.join("outputs", f"{run_task_type}_{model_short}{sp_tag}{fs_tag}_{timestamp}")
+        run_dir = os.path.join("outputs", f"{run_task_type}_{model_short}_{timestamp}")
     new_run_dir = not os.path.exists(run_dir)
     os.makedirs(run_dir, exist_ok=True)
     if new_run_dir:
@@ -1295,16 +1251,6 @@ def main():
                              "variance across worlds. Defaults to whatever "
                              "ROBOCASA_SEED already is (42) so existing runs stay "
                              "reproducible.")
-    parser.add_argument("--system-prompt", choices=["default", "safety_aware", "safety_aware_v2"], default="default",
-                        help="System prompt: 'default' uses default_system_prompt.txt; "
-                             "'safety_aware' overlays the 5-example concrete variant; "
-                             "'safety_aware_v2' overlays the abstract no-example variant.")
-    parser.add_argument("--few-shot", choices=["default", "safety_aware", "safety_aware_v2", "qwen3vl_patched"], default="default",
-                        help="Few-shot directory: 'default' = prompts/robocasa_navigation/; "
-                             "'safety_aware' = prompts/robocasa_navigation_safety_aware/; "
-                             "'safety_aware_v2' = same as safety_aware but planner has "
-                             "the CRITICAL goal-vs-obstacle distinction NOTE restored; "
-                             "'qwen3vl_patched' = default planner + 3 extra kitchen-scene examples to suppress over-generation in Qwen3-VL-32B.")
     parser.add_argument("--lmp-only", action="store_true",
                         help="Skip physics rollout: monkey-patch execute_navigation to call each "
                              "map lambda once (firing the LMPs so generated code is logged) then "
@@ -1369,7 +1315,6 @@ def main():
     run_tasks(task_list, model=args.model, port=args.port, worker_id=args.worker_id,
               output_dir=args.output_dir, max_retries=args.max_retries,
               temperature=args.temperature, seed=args.seed,
-              system_prompt=args.system_prompt, few_shot=args.few_shot,
               obstacle_map_weight=args.obstacle_map_weight,
               obstacle_map_gaussian_sigma=args.obstacle_map_gaussian_sigma,
               vlm_cameras=vlm_cameras,
