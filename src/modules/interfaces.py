@@ -34,17 +34,24 @@ def _vec2quat(*args):
 #
 #   WAYPOINT_PASS_M   0.05  intermediate waypoint counts as passed (tight, so
 #                           the path is actually followed)
-#   ARRIVE_RADIUS_M   0.30  LAST waypoint counts as reached (env var, read at
+#   ARRIVE_RADIUS_M   0.15  LAST waypoint counts as reached (env var, read at
 #                           the arrival check below)
 #   ARRIVE_YAW_RAD    0.35  yaw error allowed at arrival (~20 deg)
 #   SUCCESS_DIST_THRESHOLD_M / ori_cos>=0.8   <- graded by the benchmark, NOT
 #                           here: 0.5 m and ~36.9 deg (kitchen_navigate_safe.py)
 #
 # Note the two asymmetries, both deliberate:
-#   - arrival radius (0.30) < graded distance (0.50): the controller stops
+#   - arrival radius (0.15) < graded distance (0.50): the controller stops
 #     inside the scoring line so final-step overshoot does not fail the episode.
 #     They were equal (0.5) before, which left zero margin - 84% of position
-#     failures sat in the 0.5-0.6 m band.
+#     failures sat in the 0.5-0.6 m band. 0.30 did not close it either: over 226
+#     episodes the robot stopped a median 0.267 m from its last waypoint, and
+#     the last waypoint sat a median 0.095 m from the goal (grid is 5 cm, and
+#     the final cell is snapped to the affordance centroid). Those add: of 14
+#     failures, 11 landed in 0.51-0.57 m with orientation already perfect.
+#     At 0.15 the same episodes land near 0.24 m, well inside the line.
+#     Not 0: the controller needs a radius to converge into, and the margin
+#     also absorbs the waypoint offset, whose worst case here was 0.277 m.
 #   - arrival yaw (0.35 rad) < graded yaw (~0.64 rad): the controller is
 #     stricter than the grader here. Tightening costs steps but never fails an
 #     episode the grader would have passed.
@@ -55,7 +62,7 @@ DIST_THRESHOLD_DEFAULT = 0.05   # intermediate waypoint pass radius
 # because they answer a different question: those govern path following, these
 # govern when to stop. Sharing one number for both means tuning one silently
 # changes the other.
-ARRIVE_RADIUS_DEFAULT_M = 0.30
+ARRIVE_RADIUS_DEFAULT_M = 0.15
 ARRIVE_YAW_DEFAULT_RAD = 0.35
 
 
