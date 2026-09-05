@@ -710,7 +710,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         except Exception as _te:
                             logger.debug(f"ee_trajectory dump skipped: {_te}")
                         evaluation = {
-                            "success": task_success,
+                            "task_success": task_success,
                             "num_steps": num_steps,
                             "path_length_m": metrics.get('path_length', 0.0),
                         }
@@ -880,11 +880,6 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                                     if trajectory_log["min_obstacle_distance"] else None)
 
                     evaluation = {
-                        # 'success' is reached AND collision-free. safety_success
-                        # and safe_success are gone: the first ANDed proximity
-                        # with collision, and the second was that AND repeated
-                        # under another name.
-                        "success": bool(task_success and collision_free_success),
                         "task_success": task_success,
                         "collision_free_success": collision_free_success,
                         # goal reaching
@@ -1145,30 +1140,27 @@ def _failure_text(ev):
 
 
 def _task_success(ev):
-    """SR only: reached the goal pose (pos AND ori). Falls back to the legacy
-    combined `success` key for results.json written before the axes were split.
-    Legacy files stored SSR under that key, so old runs read as SR == SSR."""
+    """Reached the goal pose: distance AND orientation."""
     if ev is None:
         return False
-    return bool(ev.get("task_success", ev.get("success", False)))
+    return bool(ev.get("task_success", False))
 
 
 def _collision_free_success(ev):
     """CSR: reached the goal pose AND never touched the obstacle.
 
-    Boundary proximity is deliberately not part of this. Older result files
-    carry safe_success, which ANDed proximity with contact; they are read
-    through the same fallback so a mixed directory still aggregates, but the
-    two are not the same quantity and a run should not mix them silently.
+    Boundary proximity is deliberately not part of this.
+
+    A record without collision_free_success is not collision-free, it is
+    unmeasured, and returns False. There is no fallback: the bare `success`
+    key this used to fall back to meant arrival in one writer and arrival AND
+    collision-free in the other, so reading it here scored episodes whose
+    contact was never checked as clean.
     """
     if ev is None:
         return False
-    if "collision_free_success" in ev:
-        return bool(ev["collision_free_success"]) and bool(
-            ev.get("task_success", ev.get("success", False)))
-    if "safe_success" in ev:
-        return bool(ev["safe_success"])          # legacy, different definition
-    return bool(ev.get("success", False))
+    return bool(ev.get("collision_free_success", False)) and bool(
+        ev.get("task_success", False))
 
 
 def _fmt(val, fmt=".3f"):
@@ -1183,16 +1175,15 @@ def _log_task_result(results):
     if _is_failure(ev):
         logger.info(f"  {TermColors.FAIL}FAIL{TermColors.ENDC} | {_failure_text(ev)}")
     else:
-        # Two independent axes, always both printed. The old line printed a bare
-        # SUCCESS/FAILURE that was really SSR, so "never reached the goal" and
-        # "reached it, then breached a boundary" were indistinguishable in the log.
-        # Fall back to the legacy 'success' key so old results.json still renders.
+        # Both numbers, always both printed. The old line printed a bare
+        # SUCCESS/FAILURE, so "never reached the goal" and "reached it, then
+        # hit someone" were indistinguishable in the log.
         task_ok = _task_success(ev)
-        # Contact only. Legacy files stored safe_success, which also folded in
-        # boundary proximity; _collision_free_success reads them through a
-        # fallback but the two are not the same quantity.
-        cfree_ok = bool(ev.get('collision_free_success',
-                               _collision_free_success(ev)))
+        # Read through the helper, not straight off the key. Taking the raw
+        # field printed NO_COLLISION for episodes that never arrived, which is
+        # the one case we decided is not collision-free: scoring it clean
+        # rewards giving up.
+        cfree_ok = _collision_free_success(ev)
         task_tok = (f"{TermColors.BOLD}{TermColors.OKGREEN}TASK_SUCCESS{TermColors.ENDC}"
                     if task_ok else
                     f"{TermColors.BOLD}{TermColors.FAIL}TASK_FAILURE{TermColors.ENDC}")
