@@ -1745,6 +1745,13 @@ class NavigationLMPInterface():
           continue   # skip the legacy wp-iteration loop below
         # === End PURE-PURSUIT mode ===
 
+        # Pass-advance, on by default. HOLO_PASS_ADVANCE=0 restores the
+        # radius-only test the 2026-09-14 A/B measured against; the corridor
+        # keeps its measured value. Logged because a knob that silently fails
+        # to be read looks exactly like a fix that did not work.
+        _pass_advance = os.environ.get('HOLO_PASS_ADVANCE', '1') == '1'
+        _pass_corridor = float(os.environ.get('HOLO_PASS_CORRIDOR_M', '0.15'))
+        logger.info(f'[holo] pass_advance={_pass_advance} corridor={_pass_corridor}')
         while i < len(traj_world):
           waypoint = traj_world[i]
           waypoint_reach = False
@@ -1949,6 +1956,21 @@ class NavigationLMPInterface():
                 waypoint_reach = True
                 break
             else:
+              if _pass_advance:
+                # (a) The P-controller aims 0.15 m past wp_i, so a base that
+                # misses the 5 cm disc parks on that aim point until the
+                # 100-step skip. Count the waypoint as passed instead.
+                _seg = np.asarray(traj_world[i + 1][0], float)[:2] - np.asarray(waypoint[0], float)[:2]
+                _seg_len = float(np.linalg.norm(_seg))
+                if _seg_len > 1e-6:
+                  _u = _seg / _seg_len
+                  _along = float(dxy[0] * _u[0] + dxy[1] * _u[1])
+                  _lateral = abs(float(dxy[0] * _u[1] - dxy[1] * _u[0]))
+                  if _along >= 0.0 and _lateral <= _pass_corridor:
+                    logger.info(f'[pass-advance] wp {i} at step {step_idx} '
+                                f'(along={_along:.3f} lateral={_lateral:.3f} dist={_dist_now:.3f})')
+                    waypoint_reach = True
+                    break
               if _dist_now <= dist_threshold:
                 waypoint_reach = True
                 break
@@ -1961,7 +1983,10 @@ class NavigationLMPInterface():
             # ~180 steps, exceeding the default 100).
             wp_max = self._max_steps_per_waypoint * (3 if is_last else 1)
             if wp_step >= wp_max:
-              logger.debug(f"waypoint {i} exceeded {wp_max} steps (dist={np.linalg.norm(dxy):.3f}), skipping")
+              # info, not debug: this is the hold the pass-advance test exists
+              # to remove, so its rate is the measurement of whether it worked.
+              logger.info(f"[wp-skip] wp {i} last={is_last} at step {step_idx} "
+                          f"after {wp_max} steps (dist={np.linalg.norm(dxy):.3f})")
               break
 
           # Outer while loop control: if replan reset i, don't increment
