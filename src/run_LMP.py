@@ -1,5 +1,6 @@
 import sys
 import os
+import subprocess
 import re
 import signal
 import faulthandler
@@ -147,6 +148,114 @@ def _try_render_voxposer_overview(task_dir):
         _viz_render(task_dir)
     except Exception as _viz_err:
         logger.warning(f"per-task viz failed: {_viz_err}")
+
+
+def _tree_commit(path):
+    """HEAD of a git tree, or None. The ledger refuses a run that cannot name
+    its simulator: robosuite a2d0d1ec swapped the base's collision box for its
+    real shell, so collision_free_success means different things either side."""
+    try:
+        # safe.directory: the eval containers run as root over a checkout owned
+        # by the host user, and git refuses that as "dubious ownership" — which
+        # is why every containerised run.json carried a null commit at first.
+        return subprocess.check_output(
+            ["git", "-c", "safe.directory=*", "-C", path, "rev-parse", "HEAD"],
+            stderr=subprocess.DEVNULL, text=True).strip()
+    except Exception:
+        return None
+
+
+def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
+                  model, seed, task_success, collision_free_success,
+                  dist_to_goal, ori_cos, contact_steps):
+    """Append this episode to the during-run ledger next to the run folder.
+
+    Best effort: a ledger that fails to write must not lose an episode the
+    simulator already paid for, so every error is logged and swallowed.
+    """
+    try:
+        from robocasa.logging import (LOG_INTERVAL, EpisodeLog, RunLog,
+                                      format_rates, write_live_rates)
+    except ImportError:
+        return
+    try:
+        ledger_dir = os.environ.get("ROBOCASA_LEDGER_DIR") or run_dir
+        inner = getattr(env, "env", env)
+        control_freq = float(getattr(inner, "control_freq", None)
+                             or getattr(env, "control_freq", None) or 20.0)
+        layout, style = task_info.get("layout_id"), task_info.get("style_id")
+
+        import robocasa
+        import robosuite
+        RunLog.start(
+            ledger_dir,
+            policy=policy,
+            model=model,
+            nav_mode=os.environ.get("NAV_MODE"),
+            control_freq=control_freq,
+            layouts=[layout], styles=[style], seed=seed,
+            env_commit=_tree_commit(os.path.dirname(robocasa.__file__)),
+            sim_commit=_tree_commit(os.path.dirname(robosuite.__file__)),
+        )
+
+        interval = int(trajectory_log.get("log_interval") or 1)
+        if interval % LOG_INTERVAL:
+            logger.warning("ledger: sample interval %d is not a multiple of %d — "
+                           "only every %dth sample is kept",
+                           interval, LOG_INTERVAL, LOG_INTERVAL)
+        ep = EpisodeLog(
+            ledger_dir,
+            task=task_info.get("task_name"),
+            layout=layout, style=style,
+            route=task_info.get("route"), seed=seed,
+            # Unique per cell. The default id is layout/style/route/seed, which
+            # collides between two obstacles on the same route.
+            episode_id=f"l{layout}_s{style}_{task_info.get('task_name')}_seed{seed}",
+            control_freq=control_freq,
+        )
+        pos = trajectory_log.get("sample_pos") or []
+        yaw = trajectory_log.get("sample_yaw") or []
+        dist = trajectory_log.get("min_obstacle_distance") or []
+        vel = trajectory_log.get("velocity") or []
+        acc = trajectory_log.get("accel") or []
+        jrk = trajectory_log.get("jerk") or []
+
+        def _at(series, i):
+            return series[i] if i < len(series) else None
+
+        for i, p in enumerate(pos):
+            d = _at(dist, i)
+            ep.step(
+                t=i * interval,
+                pos=p,
+                yaw=float(_at(yaw, i) or 0.0),
+                d=float("nan") if d is None else float(d),
+                # There is no per-sample contact flag anywhere upstream — only
+                # counts — so overlap with the obstacle surface stands in for
+                # it. contact_steps below is the authoritative count.
+                in_contact=bool(d is not None and d <= 0.0),
+                v=_at(vel, i), a=_at(acc, i), J=_at(jrk, i),
+            )
+        ep.finish(
+            task_success=task_success,
+            collision_free_success=collision_free_success,
+            dist_to_goal_m=dist_to_goal,
+            ori_cos=ori_cos,
+            n_steps=metrics.get("n_ctrl_samples") or len(trajectory_log.get("robot_pos") or []),
+            contact_steps=contact_steps,
+            # obstacle_contact_steps is one count over the task obstacle, not
+            # a per-object dict, so the names are only meaningful when it fired.
+            contact_objects=(list((trajectory_log.get("obstacle_poses") or {}).keys())
+                             if contact_steps else []),
+            obstacle=task_info.get("obstacle"),
+            safety_mode=task_info.get("safety_mode"),
+        )
+        logger.info("ledger: %s ← %s", ledger_dir, ep.id)
+        # The two rates, recomputed from the jsonl after every episode, so a
+        # sweep can be read while it runs without re-parsing any run.log.
+        logger.info("ledger rates: %s", format_rates(write_live_rates(ledger_dir)))
+    except Exception as exc:  # noqa: BLE001 — never lose an episode over logging
+        logger.warning("ledger write failed: %s", exc)
 
 
 def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None,
@@ -878,6 +987,21 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     }
                     with open(os.path.join(task_dir, "trajectory_log.json"), "w") as _ts_f:
                         json.dump(trajectory_log, _ts_f)
+
+                    # robocasa.logging 원장. trajectory_log.json 은 에피소드
+                    # 폴더당 하나라 비율을 보려면 상위 폴더가 필요하다:
+                    # ROBOCASA_LEDGER_DIR 로 스윕 전체를 한 폴더에 모으고,
+                    # 없으면 이 실행의 run_dir 을 쓴다. run.json 은 O_EXCL,
+                    # 줄은 O_APPEND 라 워커가 여럿이어도 안전하다.
+                    _write_ledger(
+                        run_dir, env, task_info, trajectory_log, metrics,
+                        policy=("pivot" if external_planner is not None else "voxposer"),
+                        model=model, seed=seed,
+                        task_success=task_success,
+                        collision_free_success=collision_free_success,
+                        dist_to_goal=dist_to_goal, ori_cos=ori_cos,
+                        contact_steps=contact_steps,
+                    )
                     obs_min_dist = (min(trajectory_log["min_obstacle_distance"])
                                     if trajectory_log["min_obstacle_distance"] else None)
 
