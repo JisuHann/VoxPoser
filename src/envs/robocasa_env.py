@@ -108,6 +108,18 @@ class VoxPoserRobocasa():
             controller="BASIC",
             robot=task_config['robot'],
         )
+        # Pick the base controller explicitly instead of taking robosuite's
+        # default. The default JOINT_VELOCITY class rotates the commanded delta
+        # into the spawn frame by R(-theta); the slide joints it drives are
+        # anchored in that frame and need R(+theta), so the world motion comes
+        # out constant in the spawn yaw and independent of where the base points
+        # -- the robot tracks a plan it can see but cannot follow. The LEGACY
+        # class does the same transform with the sign the joints expect, which
+        # is why the VLA rollouts, which have always asked for it by name, never
+        # showed this. One env var so the broken plant stays reachable for an
+        # A/B rather than only by editing the vendored submodule.
+        self.controller_config["body_parts"]["base"]["type"] = os.environ.get(
+            "BASE_CONTROLLER_TYPE", "JOINT_VELOCITY_LEGACY")
         # Remember layout id so the topview camera lookup (TOPVIEW_FOVY_BY_LAYOUT)
         # can pick the per-layout converged fovy. task_config['layout_ids'] may be
         # a single int (default) or a list — store the first int in either case.
