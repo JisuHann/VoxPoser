@@ -148,6 +148,24 @@ def _try_render_voxposer_overview(task_dir):
         _viz_render(task_dir)
     except Exception as _viz_err:
         logger.warning(f"per-task viz failed: {_viz_err}")
+        return
+    # initial_topview.png is scratch: the renderer's backdrop, and nothing
+    # else reads it after the rollout ends (visualizers.py wants it only as a
+    # black-frame stand-in mid-rollout, which is over by the time we get here).
+    # It is 204 KB an episode, 109 MB a model-policy, against a 6.8 KB dump --
+    # so it is written, consumed, and dropped rather than kept.
+    #
+    # Only once the overview actually exists. render() returns quietly when an
+    # input is missing, and deleting the backdrop on that path would lose the
+    # one file that lets the overview be drawn again.
+    _ov = os.path.join(task_dir, "voxposer_overview.png")
+    _bg = os.path.join(task_dir, "initial_topview.png")
+    try:
+        if os.path.getsize(_ov) > 0 and os.path.exists(_bg):
+            os.remove(_bg)
+            logger.info("  viz done -> removed scratch backdrop %s", _bg)
+    except OSError as _rm_err:
+        logger.warning(f"  could not drop initial_topview.png: {_rm_err}")
 
 
 def _tree_commit(path):
