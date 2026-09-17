@@ -192,8 +192,13 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
     simulator already paid for, so every error is logged and swallowed.
     """
     try:
-        from robocasa.logging import (LOG_INTERVAL, EpisodeLog, RunLog,
-                                      format_rates, write_live_rates)
+        from robocasa.logging import (
+            CONTROL_LOG_INTERVAL_STEPS,
+            EpisodeLog,
+            RunLog,
+            format_rates,
+            write_live_rates,
+        )
     except ImportError:
         return
     try:
@@ -216,11 +221,6 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
             sim_commit=_tree_commit(os.path.dirname(robosuite.__file__)),
         )
 
-        interval = int(trajectory_log.get("log_interval") or 1)
-        if interval % LOG_INTERVAL:
-            logger.warning("ledger: sample interval %d is not a multiple of %d — "
-                           "only every %dth sample is kept",
-                           interval, LOG_INTERVAL, LOG_INTERVAL)
         ep = EpisodeLog(
             ledger_dir,
             task=task_info.get("task_name"),
@@ -231,8 +231,11 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
             episode_id=f"l{layout}_s{style}_{task_info.get('task_name')}_seed{seed}",
             control_freq=control_freq,
         )
-        pos = trajectory_log.get("sample_pos") or []
-        yaw = trajectory_log.get("sample_yaw") or []
+        # The trajectory log is now on the control clock. ``sample_pos`` was
+        # the former downsampled series and may be empty even when the full
+        # robot trajectory is present, so never use it for the ledger.
+        pos = trajectory_log.get("robot_pos") or []
+        yaw = trajectory_log.get("robot_yaw") or []
         dist = trajectory_log.get("min_obstacle_distance") or []
         vel = trajectory_log.get("velocity") or []
         acc = trajectory_log.get("accel") or []
@@ -244,7 +247,7 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
         for i, p in enumerate(pos):
             d = _at(dist, i)
             ep.step(
-                t=i * interval,
+                t=i * CONTROL_LOG_INTERVAL_STEPS,
                 pos=p,
                 yaw=float(_at(yaw, i) or 0.0),
                 d=float("nan") if d is None else float(d),
@@ -261,6 +264,7 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
             ori_cos=ori_cos,
             n_steps=metrics.get("n_ctrl_samples") or len(trajectory_log.get("robot_pos") or []),
             contact_steps=contact_steps,
+            collision_steps=contact_steps,
             # obstacle_contact_steps is one count over the task obstacle, not
             # a per-object dict, so the names are only meaningful when it fired.
             contact_objects=(list((trajectory_log.get("obstacle_poses") or {}).keys())
@@ -269,8 +273,6 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
             safety_mode=task_info.get("safety_mode"),
         )
         logger.info("ledger: %s ← %s", ledger_dir, ep.id)
-        # The two rates, recomputed from the jsonl after every episode, so a
-        # sweep can be read while it runs without re-parsing any run.log.
         logger.info("ledger rates: %s", format_rates(write_live_rates(ledger_dir)))
     except Exception as exc:  # noqa: BLE001 — never lose an episode over logging
         logger.warning("ledger write failed: %s", exc)
@@ -929,7 +931,8 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     # trajectory_log_interval steps) and can miss a graze
                     # between samples.
                     contact_ever = bool(getattr(env.env, '_obstacle_contact_occurred', False))
-                    contact_steps = metrics.get('obstacle_contact_steps')
+                    contact_steps = metrics.get('collision_steps',
+                                                metrics.get('obstacle_contact_steps', 0))
                     contact_ratio = metrics.get('obstacle_contact_ratio')
 
                     # Per-interval timeseries are bulky — write to a sibling file
@@ -959,14 +962,17 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         # distance series — obstacles are physics
                         # objects the robot can and does push.
                         "obstacle_pose_series":  metrics.get('timeseries_obstacle_poses', []),
-                        # Robot pose sampled on the SAME clock as every series
-                        # above. robot_pos/robot_yaw below are every control
-                        # step instead, so the two rates differ by
-                        # trajectory_log_interval — indexing a series by the
-                        # other's index reads a different moment, which is a
-                        # mistake already made once in analysis.
-                        "sample_pos":            metrics.get('timeseries_robot_pos', []),
-                        "sample_yaw":            metrics.get('timeseries_robot_yaw', []),
+                        # No sample_pos/sample_yaw. They were the robot pose on
+                        # the series clock, kept because robot_pos/robot_yaw run
+                        # at every control step and indexing one series by the
+                        # other's index reads a different moment. With
+                        # log_interval == 1 the two clocks are the same, so they
+                        # were a second copy of robot_pos. The ledger reads the
+                        # env's timeseries_robot_pos directly instead.
+                        #
+                        # Still written, so a reader never has to guess: any log
+                        # with log_interval > 1 has series that do NOT align with
+                        # robot_pos, and must be strided before pairing them.
                         "log_interval":          metrics.get('trajectory_log_interval', 1),
                         # Collision evidence. The contact flag comes from
                         # contacts accumulated every physics substep, which is
@@ -980,6 +986,7 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         # so the outcome and the count that explains it come
                         # from one number.
                         "obstacle_contact_steps": metrics.get('obstacle_contact_steps'),
+                        "collision_steps": metrics.get('collision_steps', contact_steps),
                         "obstacle_contact_ratio": metrics.get('obstacle_contact_ratio'),
                         "obstacle_contact_ever":  metrics.get('obstacle_contact_ever'),
                         "obstacle_contact_count": metrics.get('obstacle_contact_count'),
@@ -1019,7 +1026,9 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         collision_free_success=collision_free_success,
                         dist_to_goal=dist_to_goal, ori_cos=ori_cos,
                         contact_steps=contact_steps,
+                        collision_steps=contact_steps,
                     )
+
                     obs_min_dist = (min(trajectory_log["min_obstacle_distance"])
                                     if trajectory_log["min_obstacle_distance"] else None)
 
@@ -1123,6 +1132,21 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     # rmtree below so the next resume gets another shot.
                     task_failed_permanent = not _is_retryable_category(category)
                     task_fail_entry = fail_entry
+                    if task_failed_permanent:
+                        # A planner/API failure happens before a trajectory
+                        # exists, but it is still a completed evaluation with
+                        # two false verdicts. Keep it in the shared ledger so
+                        # the total-task denominator matches results.json.
+                        _write_ledger(
+                            locals().get('task_dir_check', run_dir),
+                            locals().get('env'), task_info, {}, {},
+                            policy=("pivot" if external_planner is not None else "voxposer"),
+                            model=model, seed=seed,
+                            task_success=False,
+                            collision_free_success=False,
+                            dist_to_goal=None, ori_cos=None,
+                            contact_steps=0,
+                        )
                     break
                     results.append({"task_info": task_info, "evaluation": {"task_success": False, "collision_free_success": False, "error": error_msg}})
                     _log_task_result(results)
