@@ -185,7 +185,7 @@ def _tree_commit(path):
 
 def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
                   model, seed, task_success, collision_free_success,
-                  dist_to_goal, ori_cos, contact_steps):
+                  dist_to_goal, ori_cos, contact_steps, collision_steps=None):
     """Append this episode to the during-run ledger next to the run folder.
 
     Best effort: a ledger that fails to write must not lose an episode the
@@ -240,6 +240,7 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
         vel = trajectory_log.get("velocity") or []
         acc = trajectory_log.get("accel") or []
         jrk = trajectory_log.get("jerk") or []
+        contacts = trajectory_log.get("obstacle_contact_history") or []
 
         def _at(series, i):
             return series[i] if i < len(series) else None
@@ -251,10 +252,11 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
                 pos=p,
                 yaw=float(_at(yaw, i) or 0.0),
                 d=float("nan") if d is None else float(d),
-                # There is no per-sample contact flag anywhere upstream — only
-                # counts — so overlap with the obstacle surface stands in for
-                # it. contact_steps below is the authoritative count.
-                in_contact=bool(d is not None and d <= 0.0),
+                # Prefer the env's actual per-step contact dict. The distance
+                # proxy is retained only for old callers that do not provide
+                # contact history.
+                in_contact=(bool(any(contacts[i].values())) if i < len(contacts)
+                            else bool(d is not None and d <= 0.0)),
                 v=_at(vel, i), a=_at(acc, i), J=_at(jrk, i),
             )
         ep.finish(
@@ -264,7 +266,8 @@ def _write_ledger(run_dir, env, task_info, trajectory_log, metrics, *, policy,
             ori_cos=ori_cos,
             n_steps=metrics.get("n_ctrl_samples") or len(trajectory_log.get("robot_pos") or []),
             contact_steps=contact_steps,
-            collision_steps=contact_steps,
+            collision_steps=(collision_steps if collision_steps is not None
+                             else contact_steps),
             # obstacle_contact_steps is one count over the task obstacle, not
             # a per-object dict, so the names are only meaningful when it fired.
             contact_objects=(list((trajectory_log.get("obstacle_poses") or {}).keys())
@@ -962,6 +965,11 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                         # distance series — obstacles are physics
                         # objects the robot can and does push.
                         "obstacle_pose_series":  metrics.get('timeseries_obstacle_poses', []),
+                        # Actual contact bool per control step, supplied by the
+                        # navigation env. This is distinct from clearance.
+                        "obstacle_contact_history": list(
+                            getattr(getattr(env, 'env', env),
+                                    '_obstacle_contact_history', []) or []),
                         # No sample_pos/sample_yaw. They were the robot pose on
                         # the series clock, kept because robot_pos/robot_yaw run
                         # at every control step and indexing one series by the
