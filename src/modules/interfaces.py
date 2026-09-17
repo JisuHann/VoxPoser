@@ -2137,6 +2137,12 @@ class NavigationLMPInterface():
       #      and the planning anchor matches well enough).
       _obstacle_xy = None
       _obstacle_name = None
+      # Out here with the other two, not inside the try below: when the
+      # obstacle lookup raises, its handler swallows the error and falls
+      # through to `if _goal_xy is not None`, which then reads an unbound
+      # local. That NameError reached the dump's own except and cost the
+      # whole npz -- ~32 of 625 voxposer episodes had no dump at all.
+      _goal_xy = None
       try:
         _kitchen = getattr(self._env, "env", None)
         _obstacle_name = getattr(_kitchen, "obstacle", None) if _kitchen else None
@@ -2182,7 +2188,6 @@ class NavigationLMPInterface():
         # what's rendered. We pull it from the 3-camera point cloud the LMP
         # already computes (parse_query_obj path), with body_xpos as
         # fallback. This is a no-op for cases where the two coincide.
-        _goal_xy = None
         try:
           _tgt = getattr(_kitchen, "target_fixture", None)
           if _tgt is not None and hasattr(_tgt, "pos"):
