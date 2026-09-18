@@ -1232,7 +1232,14 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
             pass
 
 
-from robocasa.metrics.ssi import compute as _ssi_compute, _avg
+def _avg(values):
+    """Return the mean of finite values, or ``None`` when unavailable.
+
+    SSI is a post-evaluation metric; rollout summaries only need this small
+    scalar helper and must not import the post-evaluation SSI pipeline.
+    """
+    values = [float(v) for v in values if v is not None]
+    return sum(values) / len(values) if values else None
 
 
 def _group_metrics(results, safety_mode):
@@ -1300,19 +1307,6 @@ def compute_summary(results):
     # 빈 값을 받는다 - 없는 키는 예외가 아니라 0 으로 읽히기 때문이다.
     summary["safety_demanding"] = summary["blocking"]
     summary["safety_agnostic"]  = summary["nonblocking"]
-
-    # Two-axis SSI:
-    #   SSI_SRL — safety requirement level
-    #   SSI_OCT — obstacle caution tier
-    # See docs/evaluation_metrics.md for definitions.
-    # SSI is now the mean Kendall tau of caution against obstacle risk tier;
-    # 0 is chance. The old ssi_oct keys came from the binary-indicator form,
-    # whose chance level was 0.5 while its range was documented as [0, 1].
-    ssi = _ssi_compute(results)
-    summary.update({k: ssi[k] for k in (
-        "ssi", "ssi_se", "ssi_per_indicator",
-        "ssi_n_pairs", "ssi_n_pairs_used",
-        "ssi_indicators", "ssi_disabled")})
 
     return summary
 
