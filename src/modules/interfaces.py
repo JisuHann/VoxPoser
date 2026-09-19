@@ -2370,15 +2370,15 @@ class NavigationLMPInterface():
     if pixel_map is None or pixel_xy_or_obj is None:
         return pixel_map
 
-    # Infer gradient from value: full-value calls (value=1, used by affordance
-    # & avoidance composer code) keep gradient=True so planner is pulled toward
-    # centroid / soft obstacle boundary. Partial-value calls (value<1, only
-    # composer's velocity_map uses these — "30% speed in slow zone") use
-    # gradient=False so the slow zone is FLAT at `value` rather than a gradient
-    # 0→value (the gradient mode crawls robot at 5-10% near obstacles → stuck).
-    # Caller may still pass gradient=True/False to override.
+    # Velocity maps are piecewise-constant speed fields: regardless of whether
+    # the requested value is 0.5, 1.0, or 1.5, the affected halo must stay at
+    # that value.  The wrapper tag comes from _get_default_voxel_map and avoids
+    # guessing the map kind from the numeric value.  Other maps retain the
+    # historical value-based gradient default, and an explicit caller argument
+    # still wins for every map kind.
     if gradient is None:
-      gradient = (float(value) >= 0.999)
+      gradient = (getattr(pixel_map, 'map_kind', None) != 'velocity'
+                  and float(value) >= 0.999)
 
     # Skip robot self-avoidance: LLM-generated avoidance for the robot
     # itself produces a halo that traps the planner (start cell already
@@ -2760,6 +2760,7 @@ class NavigationLMPInterface():
         else:
           raise ValueError('Unknown voxel map type: {}'.format(type))
         voxel_map = VoxelIndexingWrapper(voxel_map)
+        voxel_map.map_kind = type
         return voxel_map
       # task == 'navigation'
       # Rectangular grid: (map_h, map_w) for isotropic 5cm cells per layout.
@@ -2779,6 +2780,10 @@ class NavigationLMPInterface():
       else:
         raise ValueError('Unknown voxel map type: {}'.format(type))
       voxel_map = VoxelIndexingWrapper(voxel_map)
+      # Preserve the semantic map kind so shared helpers can distinguish
+      # velocity maps from affordance/avoidance maps without guessing from
+      # the numeric value being painted.
+      voxel_map.map_kind = type
       return voxel_map
     return fn_wrapper
   
