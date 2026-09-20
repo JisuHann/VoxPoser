@@ -3008,9 +3008,11 @@ class NavigationLMPInterface():
     # but spread across the motion → robot makes path progress meanwhile.
     if os.environ.get('INCREMENTAL_ROTATE_ENABLED', '0') == '1':
       OMEGA_MAX = float(os.environ.get('INCREMENTAL_OMEGA_MAX', '0.05'))
+    # Translation is built WITHOUT goal_vel — the velocity map scales the
+    # command after it is clipped (see below), so the requested speed survives.
     action = np.zeros(3)
-    action[0] = v_x * goal_vel * kp
-    action[1] = v_y * goal_vel * kp
+    action[0] = v_x * kp
+    action[1] = v_y * kp
     action[2] = delta_yaw * KP_ROT
     # OMEGA_GATING=1: when |delta_yaw| > threshold, send rotation-only
     # ([0, 0, omega]); else translation-only ([v_x, v_y, 0]). Avoids
@@ -3044,7 +3046,10 @@ class NavigationLMPInterface():
         action[1] = 0.0
     # Asymmetric clip: translation can saturate at ±1.0 (25mm/step max),
     # but rotation capped at ±OMEGA_MAX to limit per-step lateral drift.
-    action[:2] = np.clip(action[:2], -1.0, 1.0)
+    # Clip first, then scale by goal_vel: clip(e*kp) * goal_vel. Scaling first
+    # loses the velocity map, because e*kp is already 3-5x the ±1 limit at the
+    # 25cm waypoint spacing — even goal_vel=0.25 still clips back to 1.0.
+    action[:2] = np.clip(np.clip(action[:2], -1.0, 1.0) * float(goal_vel), -1.0, 1.0)
     action[2] = float(np.clip(action[2], -OMEGA_MAX, OMEGA_MAX))
     return action, delta_yaw
 
