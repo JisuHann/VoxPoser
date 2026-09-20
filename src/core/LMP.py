@@ -592,6 +592,14 @@ class LMP:
             raise LMPEmptyOutput(
                 f'[LMP "{self._name}"] empty LLM output for query: {query[:100]}'
             )
+        # 3-step Modular: 맵 LMP 가 쓴 코드의 장애물 반경·값만 Step 1·2 값으로 바꾼다.
+        if (self._name in ('get_avoidance_map', 'get_velocity_map')
+                and os.environ.get('VOXPOSER_THREESTEP') == '1'):
+            try:
+                from core.decoupled_values import threestep_rewrite
+                code_str = threestep_rewrite(self._name, code_str)
+            except Exception as _tse:
+                logger.warning(f'[threestep] rewrite failed: {_tse!r}')
 
         if self._cfg['include_context']:
             assert self._context is not None, 'context is None'

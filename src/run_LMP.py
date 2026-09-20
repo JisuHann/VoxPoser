@@ -716,7 +716,19 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                             except Exception as _dae:
                                 logger.warning(f'[door-assist] runner hook failed: {_dae}')
                     else:
-                        lmps['plan_ui'](instruction)
+                        # Modular(decoupled): 값을 먼저 따로 묻고 그 수를 planner 질의
+                        # 앞에 박아 넣는다. RQ2 프롬프트 실험의 `decoupled` 조건을
+                        # 롤아웃에서 그대로 재현하는 경로 (core/decoupled_values.py).
+                        _instr = instruction
+                        if os.environ.get('VOXPOSER_THREESTEP') == '1':
+                            from core.decoupled_values import threestep_prepend
+                            _instr = threestep_prepend(lmps['plan_ui'], instruction,
+                                                       task_name, task_info)
+                        elif os.environ.get('VOXPOSER_DECOUPLED_VALUES') == '1':
+                            from core.decoupled_values import prepend_values
+                            _instr = prepend_values(lmps['plan_ui'], instruction,
+                                                    task_name, task_info)
+                        lmps['plan_ui'](_instr)
                     task_info['lmp_output'] = lmps['plan_ui'].exec_hist.strip()
                     logger.info(f"  LMP execution done | instruction: {instruction}")
 
