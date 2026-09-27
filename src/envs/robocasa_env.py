@@ -830,8 +830,8 @@ class VoxPoserRobocasa():
             except Exception as _cam_err:
                 logger.warning(f"topview camera adjust failed: {_cam_err}")
 
-    # Default cameras for VLM: top-down, front view, agent center, human 1st-person
-    _DEFAULT_VLM_CAMERAS = ['topview', 'robot0_frontview', 'robot0_agentview_center', 'posed_human_main_group_1stview']
+    # Default camera for VLM input: the top-down view only.
+    _DEFAULT_VLM_CAMERAS = ['topview']
     # Cameras whose per-step frames we record into mp4 for downstream review.
     # topview-only to cut RAM (362 frames × 4 extra cams ≈ 1.3GB per task) + encoding time.
     VIDEO_RECORD_CAMERAS = ('topview',)
@@ -843,7 +843,7 @@ class VoxPoserRobocasa():
             cam_names: list of camera names. If None, uses default VLM cameras.
 
         Returns:
-            (images, cam_names_used): list of numpy RGB arrays (H, W, 3) and their camera names.
+            (images, cam_names_used): list of upright numpy RGB arrays (H, W, 3) and their camera names.
         """
         if cam_names is None:
             cam_names = [c for c in self._DEFAULT_VLM_CAMERAS if c in self.camera_names]
@@ -855,7 +855,9 @@ class VoxPoserRobocasa():
         for cam in cam_names:
             key = f'{cam}_image'
             if key in self.latest_obs:
-                images.append(self.latest_obs[key])
+                # Rendered rows run bottom-up (OpenGL); flip them upright, as
+                # for initial_topview.png and PIVOT's topview.
+                images.append(self.latest_obs[key][::-1].copy())
                 cam_names_used.append(cam)
             else:
                 logger.warning(f"Camera '{cam}' image not found in observations")

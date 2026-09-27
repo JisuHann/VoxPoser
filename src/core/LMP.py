@@ -74,7 +74,11 @@ class DeferredMap:
             return DeferredMap(lambda: self() * other())
         return DeferredMap(lambda: self() * other)
 
-_VLM_PATTERNS = ['vl', 'vision', 'pixtral', 'llava', 'internvl', '4.6v', 'cosmos', 'mimo']
+# Model-name substrings of vision-language models; only these get camera
+# images.  gemma-4, qwen3.5, qwen3.6 and robobrain all have a vision tower but
+# were missing, so they silently ran text-only.
+_VLM_PATTERNS = ['vl', 'vision', 'pixtral', 'llava', 'internvl', '4.6v', 'cosmos', 'mimo',
+                 'gemma-4', 'qwen3.5', 'qwen3.6', 'robobrain']
 
 def is_vlm(model_name):
     """Check if a model name indicates a Vision-Language Model."""
@@ -165,15 +169,30 @@ class LMP:
         # Some models output literal \n instead of actual newlines
         result = result.replace('\\n', '\n').strip()
 
+        # Gemma occasionally inserts a bare ``thought`` line between valid
+        # statements.  It parses as a Python name but fails at execution with
+        # NameError, so syntax-based natural-language filtering cannot catch
+        # it.  A standalone marker has no semantics in an LMP program; remove
+        # only that exact marker and preserve all actual Python expressions.
+        result_lines = result.split('\n')
+        without_thought_markers = [
+            line for line in result_lines if line.strip().lower() != 'thought'
+        ]
+        if len(without_thought_markers) != len(result_lines):
+            logger.warning(f'[LMP "{self._name}"] removed stray thought marker(s)')
+            result = '\n'.join(without_thought_markers).strip()
+
         # Kimi-VL echoes few-shot context lines ('# Query: X.', 'objects = […]')
         # inside the markdown fence. The default stops trigger an immediate stop
         # after just '```python', leaving content empty — those stops are dropped
         # for kimi in __call__. Here we defensively strip the leading echo block:
         # skip the first 'objects = …' line and the first '# Query: …' line,
         # then break at any subsequent '# Query:' (would mark a new few-shot
-        # example which is not real model output).
+        # example which is not real model output).  Requests that carry an
+        # image get the same trim (see the stop handling in __call__).
         model_name_lc = (self._cfg.get('model') or '').lower()
-        if 'kimi-vl' in model_name_lc and ('# Query:' in result or result.lstrip().startswith('objects = ')):
+        echoes_query = 'kimi-vl' in model_name_lc or bool(self._images and is_vlm(model_name_lc))
+        if echoes_query and ('# Query:' in result or result.lstrip().startswith('objects = ')):
             cleaned, skipped_objects, skipped_query, seen_code = [], False, False, False
             for line in result.split('\n'):
                 s = line.strip()
@@ -378,16 +397,10 @@ class LMP:
                 "<think>\nyour reasoning\n</think>\n\n"
                 "<answer>\nyour answer\n</answer>"
             )
-        # Build the last user message: multimodal if model is VLM and images are available
+        # Build the last user message: multimodal if model is VLM and images are available.
+        # The text is left exactly as in a text-only run; the images are only added to it.
         attach_images = self._images and is_vlm(model_name)
         if attach_images:
-            # Add VLM image-usage instruction to the context prompt
-            vlm_instruction = (
-                "\n\nCamera images of the current kitchen scene are attached below. "
-                "Use them to understand the spatial layout, object locations, and potential hazards. "
-                "Output ONLY Python code — do NOT describe the images."
-            )
-            user1 += vlm_instruction
             # Llama-3.2-Vision requires images BEFORE text; other VLMs accept text-first
             images_first = 'llama-3.2' in model_name.lower() and 'vision' in model_name.lower()
             cam_labels = self._image_labels or [f"camera_{i}" for i in range(len(self._images))]
@@ -403,7 +416,9 @@ class LMP:
             image_blocks = []
             for img, label in zip(images_to_use, labels_to_use):
                 b64 = self._encode_image(img)
-                image_blocks.append({"type": "text", "text": f"[{label}]"})
+                # A camera-name label is only needed to tell several images apart.
+                if len(images_to_use) > 1:
+                    image_blocks.append({"type": "text", "text": f"[{label}]"})
                 image_blocks.append({
                     "type": "image_url",
                     "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
@@ -559,8 +574,12 @@ class LMP:
         # _extract_code's kimi branch trims the echoed lines. parse_query_obj
         # is the worst case because its few-shot has 9 examples each starting
         # with 'objects = [...]'.
+        # Requests that carry an image hit the same stop: with the topview
+        # attached, Qwen3.5-9B writes the imports, then restates
+        # '# Query: <the same query>' before its code, so the reply was cut to
+        # the imports alone (37% of cells failed with LMPEmptyOutput).
         stop_tokens = list(self._stop_tokens)
-        if 'kimi-vl' in model_name_lc:
+        if 'kimi-vl' in model_name_lc or (self._images and is_vlm(model_name_lc)):
             stop_tokens = [
                 s for s in stop_tokens
                 if s not in ("\n# Query: ", "\nobjects =", "\nobjects = ")

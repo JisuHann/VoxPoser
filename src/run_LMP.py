@@ -131,7 +131,10 @@ def _try_render_voxposer_overview(task_dir):
     # Rendering can dominate a failed episode (especially after a long
     # manipulation rollout).  Keep the artifact optional so diagnostics can
     # finish and report the actual task outcome deterministically.
-    if os.environ.get('VOX_SKIP_VIZ', '').lower() in ('1', 'true', 'yes'):
+    # Per-episode overview PNGs are diagnostic-only and add about 1--2 MB per
+    # rollout.  Keep them disabled for benchmark runs unless explicitly
+    # requested with VOX_SKIP_VIZ=0.
+    if os.environ.get('VOX_SKIP_VIZ', '1').lower() not in ('0', 'false', 'no'):
         return
     if not os.path.isdir(task_dir):
         return
@@ -295,13 +298,16 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
         판정문 기록을 여기와 **공유**하게 되므로, 두 정책이 같은 잣대로 채점된다.
         평가 코드를 복제하면 미묘한 차이가 비교를 오염시킨다.
     """
+    from core.LMP import configure_cache, is_vlm
     run_config = {
         "model": model,
         "temperature": temperature,
         "seed": seed,
         "obstacle_map_weight": obstacle_map_weight,
         "obstacle_map_gaussian_sigma": obstacle_map_gaussian_sigma,
-        "vlm_cameras": list(vlm_cameras) if vlm_cameras else None,
+        "vlm_cameras": list(vlm_cameras or VoxPoserRobocasa._DEFAULT_VLM_CAMERAS),
+        # Whether core/LMP.py attaches those images for this model name.
+        "vlm_images": is_vlm(model) if model else None,
         "layout_ids": layout_ids,
         "style_ids": style_ids,
         "max_retries": max_retries,
@@ -309,7 +315,6 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
         "worker_id": worker_id,
         "lmp_only": lmp_only,
     }
-    from core.LMP import configure_cache
 
     # OpenAI API (gpt-4o, gpt-5, etc.) bypasses local vLLM. Match 'gpt-4'/'gpt-5'/'gpt-o' but NOT 'gpt-oss'.
     is_openai_api = bool(model) and model.startswith('gpt-') and 'oss' not in model.lower()
@@ -1462,9 +1467,8 @@ def main():
     parser.add_argument("--obstacle-map-weight", type=float, default=None,
                         help="Override planner.obstacle_map_weight in config (ablation)")
     parser.add_argument("--vlm-cameras", default=None,
-        help="Comma-separated list of camera names for VLM input. Overrides default 4-camera set. "
-             "Example: --vlm-cameras topview,robot0_frontview,robot0_agentview_center "
-             "(omits posed_human_main_group_1stview)")
+        help="Comma-separated list of camera names for VLM input (default: topview). "
+             "Example: --vlm-cameras topview,robot0_frontview,robot0_agentview_center")
     parser.add_argument("--obstacle-map-gaussian-sigma", type=float, default=None,
                         help="Override planner.obstacle_map_gaussian_sigma (ablation)")
     parser.add_argument("--layout-ids", default=None,
@@ -1497,10 +1501,11 @@ def main():
     vlm_cameras = None
     if args.vlm_cameras:
         vlm_cameras = [c.strip() for c in args.vlm_cameras.split(',') if c.strip()]
-    # DEFAULT_LAYOUTS omits 4 (GALLEY) and 9 (WRAPAROUND) — posed_human
-    # placement is broken there. Layout 10 is out-of-range (LayoutType max=9).
-    print("[run_LMP] note: layouts 4, 9 are not considered (broken posed_human placement)")
-    DEFAULT_LAYOUTS = [0, 1, 2, 3, 5, 6, 7, 8]
+    # The evaluation set, mirroring NavigateKitchenWithObstacles.SUPPORTED_LAYOUTS
+    # (robocasa ff73c3c). The env refuses anything else at construction, so a wider
+    # default here only produced layouts that were silently dropped.
+    print("[run_LMP] note: evaluation layouts are 0, 2, 5, 7, 8 (env-enforced)")
+    DEFAULT_LAYOUTS = [0, 2, 5, 7, 8]
     def _parse_id_list(s, default):
         """Parse '0,1,2' or 'all' into a list of ints. None falls back to `default`."""
         if s is None or s.strip().lower() == 'all':
