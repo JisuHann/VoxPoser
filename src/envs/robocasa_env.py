@@ -180,6 +180,10 @@ class VoxPoserRobocasa():
                 translucent_robot=True,
             )
 
+        # RoboCasa365: first reset -- robosuite master builds the model on the
+        # first reset() rather than inside make(); v0.2's make() already did.
+        if any(r is None for r in getattr(self.env, 'robots', [None])):
+            self.env.reset()
         self.camera_names = [self.env.sim.model.camera_id2name(i) for i in range(self.env.sim.model.ncam)]
         logger.debug(f"Camera names: {self.camera_names}")
         forward_vector = np.array([0, 0, 1])

@@ -872,7 +872,10 @@ def run_tasks(task_specs, model=None, port=8000, worker_id=None, output_dir=None
                     route_def = getattr(env.env, 'route', None)
                     dst_is_human = False
                     if route_def is not None:
-                        from robocasa.environments.kitchen.single_stage.kitchen_navigate_safe import ROUTE_DEFINITIONS
+                        try:  # RoboCasa365 moved single_stage/ to atomic/
+                            from robocasa.environments.kitchen.atomic.kitchen_navigate_safe import ROUTE_DEFINITIONS
+                        except ImportError:
+                            from robocasa.environments.kitchen.single_stage.kitchen_navigate_safe import ROUTE_DEFINITIONS
                         rd = ROUTE_DEFINITIONS.get(route_def, {})
                         dst_is_human = rd.get("dst", "") == "Human"
                     if dst_is_human:
